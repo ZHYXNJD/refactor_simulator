@@ -11,7 +11,7 @@ import pymongo
 from math import radians, sin, atan2
 warnings.filterwarnings("ignore")
 exitFlag = 0
-from azureml.opendatasets import NycTlcYellow
+# from azureml.opendatasets import NycTlcYellow
 from math import cos,acos
 from datetime import datetime
 from dateutil import parser

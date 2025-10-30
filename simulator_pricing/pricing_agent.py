@@ -122,7 +122,7 @@ class PricingAgent(object):
 
     def save_parameters(self, epoch: int):
         # 修改保存路径为当前路径下的 models 文件夹
-        base_folder = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'models')
+        base_folder = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static_models')
         folder = os.path.join(base_folder, f'episode_{epoch}')
         
         # 如果文件夹不存在，则创建
@@ -139,3 +139,5 @@ class PricingAgent(object):
 
     def load_parameters(self, file_name):
         self.q_value_table = pickle.load(open(file_name, 'rb'))
+
+

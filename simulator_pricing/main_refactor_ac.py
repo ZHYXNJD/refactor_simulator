@@ -1,8 +1,7 @@
 import datetime
-import torch
 from torch.utils.tensorboard import SummaryWriter
-from simulator_pricing.agent_model.PPO_continuous.ppo_continuous import PPO_continuous
-from simulator_pricing.agent_model.PPO_continuous.replaybuffer import ReplayBuffer
+from simulator_pricing.agent_model.A2C import a2c_config
+from simulator_pricing.agent_model.A2C.A2C import A2C
 from utilities.utilities import *
 from simulator_env import Simulator
 import numpy as np
@@ -222,33 +221,21 @@ if __name__ == "__main__":
                             elif simulator.experiment_mode == 'train':
                                 print("training process")
 
-                                np.random.seed(ppo_env_seed)
-                                torch.manual_seed(ppo_env_seed)
+                                action_dim = a2c_config.A2C_ACTION_DIM
+                                state_dim = a2c_config.STATE_DIM
+                                action_mapping = a2c_config.A2C_ACTION_PRICE_MAPPING
+                                ac_env = a2c_config.ENV_NAME
+                                ac_number = a2c_config.ENV_NUMBER
+                                ac_seed = a2c_config.SEED
 
-                                ppo_configs.state_dim = simulator.observation_space_dim
-                                ppo_configs.action_dim = simulator.action_space_dim
-                                ppo_configs.max_action = simulator.max_action
-                                print("env={}".format(ppo_env_name))
-                                print("state_dim={}".format(ppo_configs.state_dim))
-                                print("action_dim={}".format(ppo_configs.action_dim))
-                                print("max_action={}".format(ppo_configs.max_action))
+                                ac_agent = A2C(state_dim, action_dim,action_mapping)
 
-                                # epsilons = get_exponential_epsilons(INIT_EPSILON, FINAL_EPSILON, 200, decay=DECAY,
-                                #                                     pre_steps=PRE_STEP)
-                                # epsilons = np.concatenate([epsilons, np.zeros(NUM_EPOCH - 200)])
-                                # epsilons = np.zeros(NUM_EPOCH)
+
                                 total_reward_record = np.zeros(NUM_EPOCH)
 
-                                # pricing_agent = PricingAgent(**pricing_params)
-
-                                replay_buffer = ReplayBuffer(ppo_configs)
-                                ppo_agent = PPO_continuous(ppo_configs)
-
-
                                 writer = SummaryWriter(
-                                    log_dir='./agent_model/PPO_continuous/runs/env_{}_{}_number_{}_seed_{}'.format(ppo_env_name,
-                                                                                                     ppo_configs.policy_dist,
-                                                                                                 ppo_env_number, ppo_env_seed))
+                                    log_dir='./agent_model/A2C/runs/env_{}_number_{}_seed_{}'.format(ac_env, ac_number,ac_seed))
+
                                 for epoch in range(NUM_EPOCH):
                                     date = TRAIN_DATE_LIST[epoch % len(TRAIN_DATE_LIST)]
                                     print(f"train on date:{date}")
@@ -256,7 +243,7 @@ if __name__ == "__main__":
                                     simulator.reset()
                                     start_time = time.time()
                                     for step in range(simulator.finish_run_step+1):
-                                        simulator.rl_step(pricing_agent=ppo_agent,replay_buffer=replay_buffer)
+                                        simulator.rl_step_a2c(pricing_agent=ac_agent)
                                     end_time = time.time()
                                     total_reward_record[epoch] = simulator.total_reward
                                     print('epoch:', epoch)
@@ -277,5 +264,5 @@ if __name__ == "__main__":
                                                       global_step=epoch)
 
                                     if epoch % 50 == 0:  # save the result every 200 epochs
-                                        ppo_agent.save_parameters(epoch)
+                                        ac_agent.save_parameters(epoch)
 

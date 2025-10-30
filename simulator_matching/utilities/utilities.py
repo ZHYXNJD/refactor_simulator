@@ -10,9 +10,9 @@ from random import choice
 from shapely.geometry import Point, Polygon
 from pymongo.errors import ConnectionFailure
 
-from Transportation_Simulator.simulator_matching.matching_algorithm.dispatch_alg import LD
+from simulator_matching.matching_algorithm.dispatch_alg import LD
 from math import radians, sin, atan2, cos, acos
-from config import *
+from simulator_reposition.config import *
 import math
 import pickle
 import osmnx as ox
@@ -26,9 +26,9 @@ import scipy.stats as st
 from scipy.stats import skewnorm
 from collections import defaultdict
 import networkx as nx
-from config import env_params
+from simulator_reposition.config import env_params
 import geopandas as gpd
-from path import *
+from simulator_reposition.path import *
 from math import sin, cos, sqrt, atan2, radians, degrees, asin, pi
 import os
 import sys
@@ -62,7 +62,8 @@ for index, row in result.iterrows():
 """
 Here, we build the connection to mongodb, which will be used to speed up access to road network information.
 """
-myclient = pymongo.MongoClient("mongodb://localhost:27017/") 
+# myclient = pymongo.MongoClient("mongodb://localhost:27017/")
+myclient = pymongo.MongoClient("mongodb://host.docker.internal:27017/")
 try:
     # The ismaster command is cheap and does not require auth.
     myclient.admin.command('ismaster')
@@ -519,7 +520,11 @@ def sample_all_drivers(driver_info, t_initial, t_end, driver_sample_ratio=1, dri
     """
     # 当前并无随机抽样司机；后期若需要，可设置抽样模块生成sampled_driver_info
     new_driver_info = deepcopy(driver_info)
-    sampled_driver_info = new_driver_info.sample(frac=driver_sample_ratio)
+    np.random.seed(42)
+    if driver_sample_ratio != 1:
+        sampled_driver_info = new_driver_info.sample(frac=driver_sample_ratio)
+    else:
+        sampled_driver_info = new_driver_info
     sampled_driver_info['status'] = 3
     loc_con = (sampled_driver_info['start_time'] >= t_initial) & (sampled_driver_info['start_time'] <= t_end)
     sampled_driver_info.loc[loc_con, 'status'] = 0
@@ -580,7 +585,6 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=950, dis
     :return: matched_pair_actual_indexs: order and driver pair, matched_itinerary: the itinerary of matched driver
     :rtype: tuple
     """
-    print("matching driver: ", len(driver_table)," matching orders: ",len(wait_requests))
     con_ready_to_dispatch = (driver_table['status'] == 0) | (driver_table['status'] == 4)
     idle_driver_table = driver_table[con_ready_to_dispatch]
     num_wait_request = wait_requests.shape[0]
@@ -596,18 +600,24 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=950, dis
             driver_loc_array_temp = idle_driver_table.loc[:, ['lng', 'lat', 'driver_id']]
             driver_loc_array = np.tile(driver_loc_array_temp.values, (num_wait_request, 1))
             dis_array = distance_array(request_array[:, :2], driver_loc_array[:, :2])
-            if method == "pickup_distance":
+            reward_array = request_array[:, -1]
+            if method in ['pickup_distance','d','d_rl']:
                 # weight转换为最大pickup distance - 当前pickup distance
                 request_array[:, -1] = maximal_pickup_distance - dis_array + 1
+
             flag = np.where(dis_array <= maximal_pickup_distance)[0]
-            print("flag length", len(flag))
             if len(flag) > 0:
-            # step 1: generate order driver pairs
-                order_driver_pair = np.vstack(
-                    [request_array[flag, 2], driver_loc_array[flag, 2], request_array[flag, 3], dis_array[flag]]).T
-                
+                # step 1: generate order driver pairs
+                if method in ['d_rl']:
+                    order_driver_pair = np.vstack(
+                        [request_array[flag, 2], driver_loc_array[flag, 2], request_array[flag, 3], reward_array[flag]]).T
+                else:
+                    order_driver_pair = np.vstack(
+                        [request_array[flag, 2], driver_loc_array[flag, 2], request_array[flag, 3], dis_array[flag]]).T
                 #Andrew: 二分图匹配函数入口
-                matched_pair_actual_indexs = LD(order_driver_pair.tolist())
+                # hong-yang:修改
+                matched_pair_actual_indexs = LD(order_driver_pair.tolist(),method)
+
             # step 2: generate itinerary
                 request_indexs = np.array(matched_pair_actual_indexs)[:, 0]
                 driver_indexs = np.array(matched_pair_actual_indexs)[:, 1]
@@ -646,6 +656,7 @@ def cruising(eligible_driver_table, mode):
 
     for grid_id in grid_id_list:
         if mode == "global-random":
+            np.random.seed(42)
             random_number = random.choice(df_neighbor_centroid['zone_id'].values)
         elif mode == 'random':
             target = [grid_id]

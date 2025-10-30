@@ -13,15 +13,16 @@ class ReplayBuffer:
         self.done = np.zeros((args.batch_size, 1))
         self.count = 0
 
-    def store(self, s, a, a_logprob, r, s_, dw, done):
+    def store(self, s, a, a_logprob, r, s_,done):
         self.s[self.count] = s
         self.a[self.count] = a
         self.a_logprob[self.count] = a_logprob
         self.r[self.count] = r
         self.s_[self.count] = s_
-        self.dw[self.count] = dw
+        # self.dw[self.count] = dw
         self.done[self.count] = done
         self.count += 1
+
 
     def numpy_to_tensor(self):
         s = torch.tensor(self.s, dtype=torch.float)
@@ -32,4 +33,4 @@ class ReplayBuffer:
         dw = torch.tensor(self.dw, dtype=torch.float)
         done = torch.tensor(self.done, dtype=torch.float)
 
-        return s, a, a_logprob, r, s_, dw, done
+        return s, a, a_logprob, r, s_,dw,done

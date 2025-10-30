@@ -1,23 +1,22 @@
 
-from simulator_env import Simulator
 import pickle
-import numpy as np
+import time
+import warnings
+import pandas as pd
+from tqdm import tqdm
+
 from config import *
 from path import *
-import time
-from tqdm import tqdm
-import warnings
+from simulator_env import Simulator
+from simulator_reposition.utilities.utilities import get_exponential_epsilons, df_available_directions, s2e
+
 warnings.filterwarnings("ignore")
-import os
-from utilities import *
-from sarsa import SarsaAgent
-from Transportation_Simulator.simulator_reposition.reposition_strategy_base.A2C import *
-from matplotlib import pyplot as plt
+# from sarsa import SarsaAgent
+# from Transportation_Simulator.simulator_reposition.reposition_strategy_base.A2C import *
+from reposition_strategy_base.A2C import *
 import logging
 import datetime
-import argparse
-from reposition_agent import RepositionAgent
-from simulator_trainer import RepositionTrainer
+from utilities import *
 
 if __name__ == "__main__":
     model_timestamp = datetime.datetime.today().strftime('%Y%m%d%H%M%S')
@@ -38,6 +37,7 @@ if __name__ == "__main__":
     loss_file_handler.setLevel(logging.DEBUG)
 
     # 创建一个控制台处理器，并设置日志级别为INFO
+    # 这两个内容不知道是在做什么
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
 
@@ -61,6 +61,7 @@ if __name__ == "__main__":
         len_time_binary = 18
         len_grid_binary = 7
         if simulator.experiment_mode == 'train':
+            print("train process")
             epsilons = get_exponential_epsilons(INIT_EPSILON, FINAL_EPSILON, NUM_EPOCH, decay=DECAY,
                                                 pre_steps=PRE_STEP)
             total_reward_record = np.zeros(NUM_EPOCH)

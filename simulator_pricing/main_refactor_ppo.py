@@ -1,17 +1,11 @@
 import datetime
-
-import pandas as pd
-from urllib3.filepost import writer
-
 import torch
 from torch.utils.tensorboard import SummaryWriter
-
-
 from simulator_pricing.agent_model.PPO_continuous.ppo_continuous import PPO_continuous
 from simulator_pricing.agent_model.PPO_continuous.replaybuffer import ReplayBuffer
+from simulator_pricing.agent_model.PPO_continuous.ppo_config import ppo_config
 from utilities.utilities import *
 from simulator_env import Simulator
-import pickle
 import numpy as np
 from config import *
 from path import *
@@ -24,7 +18,7 @@ from pricing_agent import PricingAgent
 
 if __name__ == "__main__":
     driver_num = [100]
-    max_distance_num = [1]
+    max_distance_num = [1.25]
 
     cruise_flag = [True]
     pickup_flag = ['rg']
@@ -46,45 +40,39 @@ if __name__ == "__main__":
                         track_record = []
                         t = time.time()
 
+                        ppo_dicts = ppo_config()
+                        ppo_configs = ppo_dicts['args']
+                        ppo_env_name = ppo_dicts['env_name']
+                        ppo_env_number = ppo_dicts['number']
+                        ppo_env_seed = ppo_dicts['seed']
+
                         if env_params['rl_mode'] == "pricing":
                             if simulator.experiment_mode == 'test':
 
-                                print('test process!')
-
-                                column_list = ['total_reward', 'matched_request_num',
-                                               'long_request_num',
-                                               'matched_long_request_num', 'matched_medium_request_num',
-                                               'medium_request_num',
-                                               'matched_short_request_num',
-                                               'short_request_num', 'total_request_num',
-                                               'waiting_time','pickup_time','occupancy_rate','occupancy_rate_no_pickup',
-                                               'matched_long_request_ratio', 'matched_medium_request_ratio',
-                                               'matched_short_request_ratio',
-                                               'matched_request_ratio']
+                                column_list = ['origin_grid_id',
+                                         'total_request_num','long_request_num','medium_request_num','short_request_num',
+                                         'total_reward','matched_request_num',
+                                         'matched_long_request_num','matched_medium_request_num','matched_short_request_num',
+                                         'waiting_time','pickup_time','matched_long_request_ratio','matched_medium_request_ratio',
+                                         'matched_short_request_ratio','matched_request_ratio']
+                                total_evaluate_columns = ['total_reward', 'matched_request_num', 'long_request_num',
+                                                          'matched_long_request_num',
+                                                          'matched_medium_request_num', 'medium_request_num',
+                                                          'matched_short_request_num', 'short_request_num',
+                                                          'total_request_num',
+                                                          'waiting_time', 'pickup_time', 'occupancy_rate',
+                                                          'occupancy_rate_no_pickup', 'matched_long_request_ratio',
+                                                          'matched_medium_request_ratio', 'matched_short_request_ratio',
+                                                          'matched_request_ratio']
                                 test_num = 1
-                                test_interval = 20
-                                threshold = 5
-                                df = pd.DataFrame(np.zeros([test_num, len(column_list)]), columns=column_list)
-                                # 为每一轮测试记录 时间 供给 需求 动作 奖励 随时间的变化
-                                all_record_array = np.zeros((test_num,simulator.finish_run_step,5))
-                                # df = pickle.load(open(load_path + 'performance_record_test_' + env_params['method'] + '.pickle', 'rb'))
-                                remaining_index_array = np.where(df['total_reward'].values == 0)[0]
-                                if len(remaining_index_array > 0):
-                                    last_stopping_index = remaining_index_array[0]
-                                ax,ay = [],[]
-                                
-                                epoch = 0
-                                for num in range(last_stopping_index, test_num):
-                                    print('num: ', num)
-                                    simulator = Simulator(**env_params)
-                                    # pricing_agent = {}
-                                    pricing_agent = PricingAgent(**pricing_params)
 
-                                    # 新建一个df去记录随时间变化的 供给 需求 动作 奖励；维度应该是时间步*4 即 300*4
-                                    temp_arr = np.zeros((simulator.finish_run_step,5))
-                                    if env_params['pricing_strategy']=='dynamic':
-                                        pricing_agent.load_parameters(
-                                            load_path + '/episode_300/pricing_q_table_epoch_300.pickle')
+                                detail_evaluate_array = [] # 每次测试的结果（维度:时间步*区域数量*评价指标）保存在这个列表里，最后算一个平均
+                                total_evaluate_array = [] # 每次测试的结果（维度:时间步*区域数量*评价指标）保存在这个列表里，最后算一个平均
+
+                                epoch = 0
+                                for num in range(test_num):
+                                    print('test num: ', num)
+                                    pricing_agent = {}
     
                                     total_reward = 0
                                     total_request_num = 0
@@ -99,23 +87,20 @@ if __name__ == "__main__":
                                     occupancy_rate_no_pickup = 0
                                     pickup_time = 0
                                     waiting_time = 0
+                                    evaluate_table = None
                                     for date in TEST_DATE_LIST:
                                         simulator.experiment_date = date
-                                        simulator.reset()
                                         start_time = time.time()
                                         for step in range(simulator.finish_run_step):
                                             print("step: ", step)
                                             print("----------------------")
-                                            dispatch_transitions = simulator.old_rl_step(pricing_agent=pricing_agent)
-                                            if len(dispatch_transitions[0]) >0:
-                                                print('time_slice', dispatch_transitions[0][0][0])
-                                                print('supply', dispatch_transitions[0][0][1])
-                                                print('demand', dispatch_transitions[0][0][2])
-                                                print('action/price', pricing_agent.price_options[dispatch_transitions[1][0]])
-                                                print('reward/revenue', dispatch_transitions[3][0])
-                                                temp_arr[step] += [dispatch_transitions[0][0][0],dispatch_transitions[0][0][1],dispatch_transitions[0][0][2],pricing_agent.price_options[dispatch_transitions[1][0]],dispatch_transitions[3][0]]
-                                            print("-----------------------")
+                                            simulator.old_step()
+                                        # 这里不需要每步输出 在仿真器内部每步进行更新
+                                        # 仿真结束输出一个表（时间步*区域数量*评价指标）
+                                        evaluate_table = simulator.evaluate_table
+
                                         end_time = time.time()
+                                        # 这是所有区域总的指标（所有区域 所有时间步）
                                         total_reward += simulator.total_reward
                                         total_request_num += simulator.total_request_num
                                         occupancy_rate += simulator.occupancy_rate
@@ -129,14 +114,9 @@ if __name__ == "__main__":
                                         occupancy_rate_no_pickup += simulator.occupancy_rate_no_pickup
                                         pickup_time += simulator.pickup_time / simulator.matched_requests_num
                                         waiting_time += simulator.waiting_time / simulator.matched_requests_num
-                                    
-                                    
+
                                     epoch += 1
                                     total_reward = total_reward / len(TEST_DATE_LIST)
-                                    ax.append(epoch)
-                                    ay.append(total_reward)
-                                    print("------------test after epoch",epoch)
-                                    print("total reward",total_reward)
                                     total_request_num = total_request_num / len(TEST_DATE_LIST)
                                     occupancy_rate = occupancy_rate / len(TEST_DATE_LIST)
                                     matched_request_num = matched_request_num / len(TEST_DATE_LIST)
@@ -149,69 +129,27 @@ if __name__ == "__main__":
                                     occupancy_rate_no_pickup = occupancy_rate_no_pickup / len(TEST_DATE_LIST)
                                     pickup_time = pickup_time / len(TEST_DATE_LIST)
                                     waiting_time = waiting_time / len(TEST_DATE_LIST)
-                                    print("pick",pickup_time)
-                                    print("wait",waiting_time)
-                                    print("matching ratio",matched_request_num/total_request_num)
-                                    print("ocu",occupancy_rate)
-                                    
-                                    record_array = np.array(
+                                    matched_long_request_ratio = matched_long_request_num / long_request_num
+                                    matched_medium_request_ratio = matched_medium_request_num / medium_request_num
+                                    matched_short_request_ratio = matched_short_request_num / short_request_num
+                                    matched_request_ratio = matched_request_num / total_request_num
+
+                                    # 单次仿真的总指标
+                                    total_evaluate_array.append(
                                         [total_reward, matched_request_num,
                                           long_request_num, matched_long_request_num,
                                          matched_medium_request_num, medium_request_num, matched_short_request_num,
-                                         short_request_num, total_request_num,waiting_time,pickup_time,occupancy_rate,occupancy_rate_no_pickup])
-                                    # record_array = np.array([total_reward])
-
-                                    temp_arr = temp_arr / len(TEST_DATE_LIST)
-
-                                    all_record_array[num] = temp_arr
-
-                                    if num == 0:
-                                        df.iloc[0, :13] = record_array
-                                    else:
-                                        df.iloc[num, :13] = (df.iloc[(num - 1), :13].values * num + record_array) / (
-                                                    num + 1)
-
-                                    # if num % 120 == 0:  # save the result every 10
-                                        # pickle.dump(df, open(
-                                        #     load_path + 'performance_record_test_' + env_params['method'] + '.pickle',
-                                        #     'wb'))
-
-                                    if num >= (test_interval - 1):
-                                        profit_array = df.loc[(num - test_interval):num, 'total_reward'].values
-                                        # print(profit_array)
-                                        error = np.abs(np.max(profit_array) - np.min(profit_array))
-                                        print('error: ', error)
-                                        if error < threshold:
-                                            index = num
-                                            print('converged at index ', index)
-                                            break
-
-                                all_record_df = pd.DataFrame(data=all_record_array.mean(axis=0),columns=['time_slice','supply','demand','action','reward'])
+                                         short_request_num, total_request_num,waiting_time,pickup_time,occupancy_rate,
+                                         occupancy_rate_no_pickup,matched_long_request_ratio,matched_medium_request_ratio,
+                                         matched_short_request_ratio,matched_request_ratio])
 
 
-                                df.loc[:(num), 'matched_long_request_ratio'] = df.loc[:(num),
-                                                                               'matched_long_request_num'].values / df.loc[
-                                                                                                                    :(num),
-                                                                                                                    'long_request_num'].values
-                                df.loc[:(num), 'matched_medium_request_ratio'] = df.loc[:(num),
-                                                                                 'matched_medium_request_num'].values / df.loc[
-                                                                                                                        :(
-                                                                                                                            num),
-                                                                                                                        'medium_request_num'].values
-                                df.loc[:(num), 'matched_short_request_ratio'] = df.loc[:(num),
-                                                                                'matched_short_request_num'].values / df.loc[
-                                                                                                                      :(
-                                                                                                                          num),
-                                                                                                                      'short_request_num'].values
-                                df.loc[:(num), 'matched_request_ratio'] = df.loc[:(num),
-                                                                          'matched_request_num'].values / df.loc[:(num),
-                                
-                                                                                                     'total_request_num'].values
-                                print(df.columns) 
-                                # pickle.dump(df,
-                                #             open(load_path + 'performance_record_test_' + env_params['method'] + '.pickle',
-                                #                  'wb'))
-                                print(df.iloc[test_num-1, :])
+                                    # 单次仿真的 时间步*区域数量 的分指标
+                                    detail_evaluate_array.append(evaluate_table / len(TEST_DATE_LIST))
+
+                                # 多次仿真的平均指标
+                                detail_evaluate_array = np.array(detail_evaluate_array).mean(axis=0)
+                                total_evaluate_array = pd.DataFrame(data=np.array(total_evaluate_array),columns=total_evaluate_columns)
 
                                 # 修改保存路径为当前路径下的 models 文件夹
                                 base_folder = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'static_models')
@@ -221,10 +159,9 @@ if __name__ == "__main__":
                                 if not os.path.exists(folder):
                                     os.makedirs(folder)
 
-                                df.to_csv(folder+f"/main_indicators_driver_{driver_num[0]}_grid_{env_params['grid_num']}.csv",index=False)
-                                all_record_df.to_csv(folder+f"/indictors_with_t_driver_{driver_num[0]}_grid_{env_params['grid_num']}.csv", index=False)
-
-                                # np.savetxt(load_path + "supply_dist_" + simulator.method + ".csv", simulator.driver_spatial_dist, delimiter=",")
+                                total_evaluate_array.to_csv(folder+f"/{env_params['method']}_total_driver_{driver_num[0]}_grid_{env_params['grid_num']}.csv",index=False)
+                                np.save(folder+f"/{env_params['method']}_detail_driver_{driver_num[0]}_grid_{env_params['grid_num']}.npy",detail_evaluate_array)
+                                # detail_evaluate_array.to_csv(folder+f"/{env_params['method']}_detail_driver_{driver_num[0]}_grid_{env_params['grid_num']}.csv", index=False)
 
                             elif simulator.experiment_mode == 'train':
                                 print("training process")
@@ -251,6 +188,7 @@ if __name__ == "__main__":
                                 replay_buffer = ReplayBuffer(ppo_configs)
                                 ppo_agent = PPO_continuous(ppo_configs)
 
+
                                 writer = SummaryWriter(
                                     log_dir='./agent_model/PPO_continuous/runs/env_{}_{}_number_{}_seed_{}'.format(ppo_env_name,
                                                                                                      ppo_configs.policy_dist,
@@ -262,7 +200,7 @@ if __name__ == "__main__":
                                     simulator.reset()
                                     start_time = time.time()
                                     for step in range(simulator.finish_run_step+1):
-                                        simulator.rl_step(pricing_agent=ppo_agent,replay_buffer=replay_buffer)
+                                        simulator.rl_step_ppo(pricing_agent=ppo_agent,replay_buffer=replay_buffer)
                                     end_time = time.time()
                                     total_reward_record[epoch] = simulator.total_reward
                                     print('epoch:', epoch)

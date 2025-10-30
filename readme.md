@@ -263,7 +263,7 @@ below is the reward curve of Dynamic Price strategy in training process
   ```bash
   # e.g. Matching module
   cd simulator_matching  
-  python main_refactor.py
+  python main_refactor_ppo.py
   ```
 - **Config (`config.py`)**:
   ```python

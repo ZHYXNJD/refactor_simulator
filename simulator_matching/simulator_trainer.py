@@ -1,4 +1,5 @@
 # 导入核心类
+from torch.utils.tensorboard import SummaryWriter
 from simulator_env import Simulator
 from pricing_agent import PricingAgent
 from matching_agent import MatchingAgent
@@ -6,15 +7,17 @@ from matching_agent import MatchingAgent
 # 导入工具库
 import numpy as np
 import pandas as pd
-from matplotlib import pyplot as plt
-from tqdm import tqdm
 import time
 import pickle
 import os
 import logging
 from datetime import datetime
-import wandb
-
+from simulator_matching.matching_strategy_base.DQN_torch import DQNAgent
+from simulator_matching.matching_strategy_base.Q_learning import QLearningAgent
+from simulator_matching.matching_strategy_base.sarsa import SarsaAgent
+# from simulator_matching.utilities.handle_raw_data import env_params
+# import wandb
+from config import *
 
 # SimulatorTrainer: Andrew
 class SimulatorTrainer:
@@ -24,7 +27,14 @@ class SimulatorTrainer:
         self.matching_agent = matching_agent
         
         # 指定日志文件夹
-        log_dir = 'matching_train_logs'
+        if isinstance(self.matching_agent, SarsaAgent):
+            log_dir = 'matching_train_logs_sarsa'
+        elif isinstance(self.matching_agent, DQNAgent):
+            log_dir = 'matching_train_logs_dqn'
+        elif isinstance(self.matching_agent, QLearningAgent):
+            log_dir = 'matching_train_logs_qlearning'
+        else:
+            log_dir = 'matching_train_logs'
         # 如果日志文件夹不存在，则创建
         if not os.path.exists(log_dir):
             os.makedirs(log_dir)
@@ -40,13 +50,15 @@ class SimulatorTrainer:
         self.logger = logging.getLogger(__name__)
 
         # 初始化 Weights & Biases
-        wandb.login()
-        self.matching_refactor = wandb.init(project="simulator_matching_refactor",
-                                       config={"method": "sarsa_no_subway",
-                                               "driver_num": 200,
-                                               "EPOCH":4001},)
+        # wandb.login()
+        # self.matching_refactor = wandb.init(project="simulator_matching_refactor",
+        #                                config={"method": "sarsa_no_subway",
+        #                                        "driver_num": 200,
+        #                                        "EPOCH":4001},)
 
-
+        self.total_step = 0
+        self.evaluate_table = None
+        self.driver_num = None
 
     def log_epoch_metrics(self, epoch, duration, simulator: Simulator):
         """
@@ -73,20 +85,19 @@ class SimulatorTrainer:
         self.logger.info(f"Matching rate: {simulator.matched_requests_num / simulator.total_request_num}")  
 
         # 记录到 Weights & Biases
-        self.matching_refactor.log({"Total reward": simulator.total_reward})
-        self.matching_refactor.log({"Occupancy rate": simulator.occupancy_rate})
-        self.matching_refactor.log({"Matching rate": simulator.matched_requests_num / simulator.total_request_num}) 
+        # self.matching_refactor.log({"Total reward": simulator.total_reward})
+        # self.matching_refactor.log({"Occupancy rate": simulator.occupancy_rate})
+        # self.matching_refactor.log({"Matching rate": simulator.matched_requests_num / simulator.total_request_num})
 
 
 
-    def run_training_epoch(self, simulator: Simulator, epoch, epsilon, train_config):
+    def run_training_epoch(self,epoch, train_config, writer):
         """
         Run a single training epoch.
-        :param simulator: Simulator instance.
-        :param agent: MatchingAgent or other RL agent.
         :param epoch: Current epoch number.
         :param epsilon: Exploration rate for this epoch.
         :param train_config: Training configuration dictionary.
+        :param writer: TensorBoard writer.
         :return: Dictionary containing metrics for this epoch.
         """
         # Initialize metrics
@@ -96,22 +107,29 @@ class SimulatorTrainer:
         }
 
         # Set up simulator for this epoch
-        simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
-        simulator.reset()
+        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        self.simulator.reset()
 
         # Run the simulation
         start_time = time.time()
-        for step in range(simulator.finish_run_step):
+        for step in range(self.simulator.finish_run_step):
             # TODO: Implement RL agent logic here
-            dispatch_transitions = simulator.rl_step_train(epsilon)
+            step_loss = self.simulator.rl_step_train()
+            if step_loss is not None:
+                writer.add_scalar(
+                    tag='loss/Step',
+                    scalar_value=step_loss,
+                    global_step=self.total_step
+                )
+                self.total_step += 1
         end_time = time.time()
 
         # Collect metrics
-        metrics['total_reward'] = simulator.total_reward
+        metrics['total_reward'] = self.simulator.total_reward
         metrics['epoch_duration'] = end_time - start_time
 
         # Log metrics
-        self.log_epoch_metrics(epoch, metrics['epoch_duration'], simulator)
+        # self.log_epoch_metrics(epoch, metrics['epoch_duration'], self.simulator)
         return metrics
 
     def save_training_results(self, simulator_record, total_reward_record, output_path, epoch, save_interval=200):
@@ -140,55 +158,69 @@ class SimulatorTrainer:
             print(f"Training reward record saved to {reward_file}")
 
 
-    
-    def train(self, simulator: Simulator, train_config):
+    def train(self, train_config):
         """
         Full training logic for the simulator.
         :param simulator: Simulator instance.
         :param train_config: Training configuration (e.g., number of epochs, save intervals).
         """
         total_reward_record = np.zeros(train_config['num_epochs'])
-        epsilons = train_config['epsilons']
-    
+        self.driver_num = train_config['driver_num']
+        write_path = train_config['output_path'] + '/' + str(self.driver_num)
+        if not os.path.exists(write_path):
+            os.makedirs(write_path)
+        writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
+        writer = SummaryWriter(log_dir=writer_filename)
+
         for epoch in range(train_config['num_epochs']):
             # Run a single training epoch
-            metrics = self.run_training_epoch(simulator, epoch, epsilons[epoch], train_config)
-
+            metrics = self.run_training_epoch(epoch, train_config,writer)
             # Record total reward
             total_reward_record[epoch] = metrics['total_reward']
 
-            # Save results periodically
-            self.save_training_results(simulator.record, total_reward_record, train_config['output_path'], epoch,
-                                       save_interval=train_config['save_interval'])
-            
-            if epoch % 200 == 0:
-                simulator.matching_agent.strategy.save_parameters(epoch)
+            # <<< 3. 将每个 epoch 的 total_reward 记录到 TensorBoard
+            writer.add_scalar(
+                    tag='Reward/Epoch',
+                    scalar_value=metrics['total_reward'],
+                    global_step=epoch
+                )
 
-        self.matching_refactor.finish()
+            # 打印一些日志方便在终端查看进度
+            # if (epoch + 1) % train_config.get('log_interval', 10) == 0:
+            print(f"Epoch {epoch + 1}/{train_config['num_epochs']} | Total Reward: {metrics['total_reward']:.2f}")
+
+            if epoch % 50 == 0:
+                if self.simulator.matching_agent.strategy =='new_dqn':
+                    self.simulator.matching_agent.strategy.agent.save_model(train_config['output_path'], epoch)
+                else:
+                    self.simulator.matching_agent.strategy.save_parameters(train_config['output_path'], epoch,self.driver_num)
 
 
-    def accumulate_metrics(self, simulator: Simulator, metrics):
+    def accumulate_metrics(self, simulator: Simulator):
         """
         Accumulate metrics for one test run.
         :param simulator: Simulator instance after one test run.
         :param metrics: Dictionary to store cumulative metrics.
         """
-        metrics['total_reward'] += simulator.total_reward
-        metrics['total_request_num'] += simulator.total_request_num
-        metrics['transfer_request_num'] += simulator.transfer_request_num
-        metrics['occupancy_rate'] += simulator.occupancy_rate
-        metrics['matched_request_num'] += simulator.matched_requests_num
-        metrics['long_request_num'] += simulator.long_requests_num
-        metrics['medium_request_num'] += simulator.medium_requests_num
-        metrics['short_request_num'] += simulator.short_requests_num
-        metrics['matched_long_request_num'] += simulator.matched_long_requests_num
-        metrics['matched_medium_request_num'] += simulator.matched_medium_requests_num
-        metrics['matched_short_request_num'] += simulator.matched_short_requests_num
-        metrics['occupancy_rate_no_pickup'] += simulator.occupancy_rate_no_pickup
-        metrics['pickup_time'] += simulator.pickup_time / simulator.matched_requests_num
-        metrics['waiting_time'] += simulator.waiting_time / simulator.matched_requests_num
+        metrics = {'test_date': simulator.experiment_date, 'total_reward': simulator.total_reward,
+                   'matched_transfer_request_num': 0, 'total_request_num': simulator.total_request_num,
+                   'transfer_request_num': simulator.transfer_request_num, 'occupancy_rate': simulator.occupancy_rate,
+                   'matched_request_num': simulator.matched_requests_num,
+                   'long_request_num': simulator.long_requests_num, 'medium_request_num': simulator.medium_requests_num,
+                   'short_request_num': simulator.short_requests_num,
+                   'matched_long_request_num': simulator.matched_long_requests_num,
+                   'matched_medium_request_num': simulator.matched_medium_requests_num,
+                   'matched_short_request_num': simulator.matched_short_requests_num,
+                   'occupancy_rate_no_pickup': simulator.occupancy_rate_no_pickup,
+                   'pickup_time': simulator.pickup_time / simulator.matched_requests_num,
+                   'waiting_time': simulator.waiting_time / simulator.matched_requests_num,
+                   'matched_long_request_ratio': simulator.matched_long_requests_num / simulator.long_requests_num,
+                   'matched_medium_request_ratio': simulator.matched_medium_requests_num / simulator.medium_requests_num,
+                   'matched_short_request_ratio': simulator.matched_short_requests_num / simulator.short_requests_num,
+                   'matched_request_ratio': simulator.matched_requests_num / simulator.total_request_num}
+        return metrics
 
-    def run_test_episode(self, simulator: Simulator, agent, dates):
+    def run_test_episode(self, simulator: Simulator, dates):
         """
         Run a test episode over multiple dates.
         :param simulator: Simulator instance.
@@ -196,21 +228,24 @@ class SimulatorTrainer:
         :param dates: List of test dates.
         :return: Accumulated metrics.
         """
-        metrics = {
-            'total_reward': 0, 'matched_transfer_request_num': 0, 'total_request_num': 0, 'transfer_request_num': 0,
-            'occupancy_rate': 0, 'matched_request_num': 0,
-            'long_request_num': 0, 'medium_request_num': 0, 'short_request_num': 0,
-            'matched_long_request_num': 0, 'matched_medium_request_num': 0,
-            'matched_short_request_num': 0, 'occupancy_rate_no_pickup': 0,
-            'pickup_time': 0, 'waiting_time': 0
-        }
+        self.evaluate_table = None
+
+        total_metrics = []
         for date in dates:
-            simulator.experiment_date = date
+            print(f"method:{simulator.method},test date: {date},driver_num: {env_params['driver_num']},order sample ratio:{env_params['order_sample_ratio']},")
             simulator.reset()
+            simulator.experiment_date = date
             for step in range(simulator.finish_run_step):
-                simulator.rl_step(agent)
-            self.accumulate_metrics(simulator, metrics)
-        return metrics
+                simulator.rl_step()
+            metrics = self.accumulate_metrics(simulator)
+            for k,v in metrics.items():
+                print(f"{k}:{v}")
+            total_metrics.append(self.accumulate_metrics(simulator))
+            if self.evaluate_table is None:
+                self.evaluate_table = simulator.evaluate_table
+            else:
+                self.evaluate_table += simulator.evaluate_table
+        return total_metrics,self.evaluate_table
 
     def initialize_test_dataframe(self, test_num, column_list):
         """
@@ -312,42 +347,23 @@ class SimulatorTrainer:
         :param agent: MatchingAgent or other RL agent.
         :param test_config: Test configuration (e.g., test_num, intervals).
         """
-        df, last_stopping_index = self.initialize_test_dataframe(test_config['test_num'], test_config['column_list'])
-        ax, ay = [], []
+        metrics,evaluate_table = self.run_test_episode(simulator,test_config['test_dates'])
+        evaluate_table /= len(test_config['test_dates'])
+        total_evaluate_df = pd.DataFrame(metrics)
 
-        for num in range(last_stopping_index, test_config['test_num']):
-            print('Test number: ', num)
-            metrics = self.run_test_episode(simulator, self.matching_agent, test_config['test_dates'])
-            metrics = {k: v / len(test_config['test_dates']) for k, v in metrics.items()}  # Normalize by test dates
+        # 修改保存路径为当前路径下的 models 文件夹
+        base_folder = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'evaluate_results')
+        folder = os.path.join(base_folder, f'{datetime.now().strftime("%Y%m%d-%H%M%S")}')
 
-            # Record metrics
-            ax.append(num + 1)
-            ay.append(metrics['total_reward'])
-            print("total_reward: ", metrics['total_reward'])
-            print("pickup_time: ", metrics['pickup_time'])
-            print("matching_rate: ", metrics['matched_request_num'] / metrics['total_request_num'])
-            print("occupancy_rate: ", metrics['occupancy_rate'])
-            record_array = [
-                metrics['total_reward'], metrics['matched_transfer_request_num'], metrics['matched_request_num'],
-                metrics['transfer_request_num'], metrics['long_request_num'], metrics['matched_long_request_num'],
-                metrics['matched_medium_request_num'], metrics['medium_request_num'], metrics['matched_short_request_num'],
-                metrics['short_request_num'], metrics['total_request_num'], metrics['waiting_time'], metrics['pickup_time'],
-                metrics['occupancy_rate'], metrics['occupancy_rate_no_pickup']
-            ]
-            if num == 0:
-                df.iloc[0, :15] = record_array
-            else:
-                df.iloc[num, :15] = (df.iloc[(num - 1), : 1].values * num + record_array) / (num + 1)
+        # 如果文件夹不存在，则创建
+        if not os.path.exists(folder):
+            os.makedirs(folder)
 
-            if num % test_config['save_interval'] == 0:
-                self.save_results(df, test_config['output_path'], num, simulator.method)
-                
-            # Convergence check
-            converged, index = self.check_convergence(df, num, test_config['interval'], test_config['threshold'])
-            if converged:
-                break
-        # 最终保存并计算比率
-        self.save_and_calculate_ratios(df, test_config['output_path'], test_config['test_num'] - 1, test_config['method'])        
+        total_evaluate_df.to_csv(
+            folder + f"/{test_config['method']}_driver_{test_config['driver_num']}_order_{test_config['order_sample_ratio']}.csv",
+            index=False)
+        np.save(folder + f"/{test_config['method']}_detail_driver_{test_config['driver_num']}_order_{test_config['order_sample_ratio']}.npy",
+                evaluate_table)
 
     def render(self):
         """

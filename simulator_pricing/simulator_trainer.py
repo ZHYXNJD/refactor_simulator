@@ -8,6 +8,7 @@ from reposition_agent import RepositionAgent
 from utilities import *
 import wandb
 
+
 class RepositionTrainer:
     def __init__(self, simulator: Simulator, reposition_agent: RepositionAgent, train_config):
         """
@@ -27,9 +28,9 @@ class RepositionTrainer:
         # 初始化 Weights & Biases
         wandb.login()
         self.reposition_refactor = wandb.init(project="simulator_reposition_refactor",
-                                       config={"repo_method": "A2C",
-                                               "driver_num": 200,
-                                               "EPOCH":601},)        
+                                              config={"repo_method": "A2C",
+                                                      "driver_num": 200,
+                                                      "EPOCH": 601}, )
 
     def log_epoch_metrics(self, epoch, duration):
         """

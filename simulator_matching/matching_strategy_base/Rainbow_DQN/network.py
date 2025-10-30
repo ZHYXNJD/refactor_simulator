@@ -31,9 +31,9 @@ class Net(nn.Module):
         self.fc1 = nn.Linear(args.state_dim, args.hidden_dim)
         self.fc2 = nn.Linear(args.hidden_dim, args.hidden_dim)
         if args.use_noisy:
-            self.fc3 = NoisyLinear(args.hidden_dim, args.action_dim)
+            self.fc3 = NoisyLinear(args.hidden_dim, 1)
         else:
-            self.fc3 = nn.Linear(args.hidden_dim, args.action_dim)
+            self.fc3 = nn.Linear(args.hidden_dim, 1)
 
     def forward(self, s):
         s = torch.relu(self.fc1(s))

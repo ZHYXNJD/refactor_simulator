@@ -3,9 +3,10 @@ import pandas as pd
 import pickle
 from copy import deepcopy
 
-def LD(dispatch_observ):
-    columns_name = ['order_id', 'driver_id', 'reward_units','order_driver_flag']
-    #dic_dispatch_observ = dispatch_observ.copy()
+
+def LD(dispatch_observ,method):
+    columns_name = ['order_id', 'driver_id', 'reward_units', 'order_driver_flag']
+    # dic_dispatch_observ = dispatch_observ.copy()
     dispatch_observ = pd.DataFrame(dispatch_observ, columns=columns_name)
     dispatch_observ['reward_units'] = 0. + dispatch_observ['reward_units'].values
     dic_dispatch_observ = dispatch_observ.to_dict(orient='records')
@@ -14,14 +15,15 @@ def LD(dispatch_observ):
 
     # get orders and drivers
     l_orders = dispatch_observ['order_id'].unique()  # df: order id
-    l_drivers = dispatch_observ['driver_id'].unique() # df: driver id
+    l_drivers = dispatch_observ['driver_id'].unique()  # df: driver id
 
     M = len(l_orders)  # the number of orders
     N = len(l_drivers)  # the number of drivers
 
     # coefficients and parameters, formulated as M * N matrix
     non_exist_link_value = 0.
-    matrix_reward = non_exist_link_value + np.zeros([M, N])  # reward     # this value should be smaller than any possible weights
+    matrix_reward = non_exist_link_value + np.zeros(
+        [M, N])  # reward     # this value should be smaller than any possible weights
     matrix_flag = np.zeros([M, N])  # pick up distance
     matrix_x_variables = np.zeros([M, N])  # 1 means there is potential match. otherwise, 0
 
@@ -36,7 +38,14 @@ def LD(dispatch_observ):
     # initialize lower bound of the solution
     initial_best_reward = 0
     initial_best_solution = np.zeros([M, N])
-    dic_dispatch_observ.sort(key=lambda od_info: od_info['reward_units'], reverse=True)
+    if method in ['ir','rl']:
+        dic_dispatch_observ.sort(key=lambda od_info: -od_info['reward_units'])
+    elif method in ['ir_d','rl_d']:
+        dic_dispatch_observ.sort(key=lambda od_info: (-od_info['reward_units'], od_info['order_driver_flag']))
+    elif method in ['d','d_rl']:
+        dic_dispatch_observ.sort(key=lambda od_info: (-od_info['reward_units'],-od_info['order_driver_flag']))
+    # print(dic_dispatch_observ)
+
     assigned_order = set()
     assigned_driver = set()
     initial_dispatch_action = []
@@ -62,7 +71,7 @@ def LD(dispatch_observ):
 
     # ---------------------------------------------Start iteration--------------------------------------------------
     for t in range(1, max_iterations + 1):
-        matrix_x = np.zeros([M,N])
+        matrix_x = np.zeros([M, N])
         QI = matrix_reward - u
         QI_masked = np.ma.masked_where(matrix_x_variables != 1, QI)
         idx_col_array = np.argmax(QI_masked, axis=1)
@@ -70,13 +79,13 @@ def LD(dispatch_observ):
         matrix_x[idx_row_array, idx_col_array] = 1
 
         # calculate Z_UP and Z_D
-        Z_D = np.sum(u) +  np.sum(matrix_reward * matrix_x)
+        Z_D = np.sum(u) + np.sum(matrix_reward * matrix_x)
         Z_UP = Z_D if Z_D < Z_UP else Z_UP
 
-        #stage 1
-        copy_matrix_reward = non_exist_link_value + np.zeros([M,N])
+        # stage 1
+        copy_matrix_reward = non_exist_link_value + np.zeros([M, N])
         copy_matrix_reward[idx_row_array, idx_col_array] = matrix_reward[idx_row_array, idx_col_array]
-        copy_matrix_x = np.zeros([M,N])
+        copy_matrix_x = np.zeros([M, N])
         idx_col_array = np.array(range(N))
         idx_row_array = np.argmax(copy_matrix_reward, axis=0)
         con = copy_matrix_reward[idx_row_array, idx_col_array] > non_exist_link_value
@@ -85,7 +94,7 @@ def LD(dispatch_observ):
         if len(idx_row_array) > 0:
             copy_matrix_x[idx_row_array, idx_col_array] = 1
 
-        #stage 2
+        # stage 2
         index_existed_pair = np.where(copy_matrix_x == 1)
         index_drivers_with_order = np.unique(index_existed_pair[1])
         index_drivers_without_order = np.setdiff1d(np.array(range(N)), index_drivers_with_order)
@@ -107,7 +116,7 @@ def LD(dispatch_observ):
                         second_allocated_driver.append(index_driver)
                         copy_matrix_x[m][index_driver] = 1
 
-        #stage 3
+        # stage 3
         new_Z_LB = np.sum(copy_matrix_x * matrix_reward)
         if new_Z_LB > Z_LB:
             Z_LB = new_Z_LB
@@ -123,7 +132,7 @@ def LD(dispatch_observ):
         k_t = theta * (Z_D - Z_LB) / sum
 
         u = u + k_t * (sum_m - 1) / t
-        u[u<0] = 0
+        u[u < 0] = 0
 
         if (Z_UP == 0) or ((Z_UP - Z_LB) / Z_UP <= gap):
             matrix_x = initial_best_solution
@@ -139,3 +148,30 @@ def LD(dispatch_observ):
                                 matrix_flag[m][index_driver]])
 
     return dispatch_action
+
+if __name__ == '__main__':
+
+    # 写一个脚本测试一下新的LD
+    for method in ['ir','ir_d','d','d_rl']:
+        test_dt = [['a', 1, 120, 0],
+                   ['a', 2, 120, 15],
+                   ['a', 3, 120, 0],
+                   ['b', 1, 110, 20],
+                   ['b', 4, 110, 0],
+                   ['c', 1, 130, 25],
+                   ]
+        if method == 'd_rl':
+            # 交换 reward_units 和 order_driver_flag
+            for row in test_dt:
+                row[2], row[3] = row[3], row[2]
+            # 再把 reward_units 取相反数
+            for row in test_dt:
+                row[2] = -row[2]
+
+        elif method == 'd':
+            # 只对 order_driver_flag 取相反数
+            for row in test_dt:
+                row[3] = -row[3]
+        dispatch_action = LD(test_dt, method)
+        print(f"{method}:{dispatch_action}")
+

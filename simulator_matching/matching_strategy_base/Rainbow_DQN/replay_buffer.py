@@ -1,8 +1,31 @@
 import torch
 import numpy as np
 from collections import deque
-from sum_tree import SumTree
+from .sum_tree import SumTree
 
+START_TIMESTAMP = 18000
+LEN_TIME_SLICE = 300
+
+
+def _convert_state(raw_state):
+    """将原始状态转换为PyTorch张量"""
+    if not isinstance(raw_state, (list, np.ndarray)):
+        raise TypeError(f"Expected list/array for raw_state, got {type(raw_state)}: {raw_state}")
+    if len(raw_state) != 2:
+        raise ValueError(f"State must have 2 elements [timestamp, grid_id], got: {raw_state}")
+
+    t = int((raw_state[0] - START_TIMESTAMP - 1) / LEN_TIME_SLICE)
+    g = int(raw_state[1])
+    # 5. 返回PyTorch张量并移动到指定设备
+    return torch.tensor([t, g], dtype=torch.float32)
+
+
+def _is_terminal_state(state_tensor):
+    """检查是否为终止状态"""
+    # state_tensor 是 [t, g]
+    t = int(state_tensor[0].item())
+    max_slice = int(6 * 60 * 60 / LEN_TIME_SLICE)
+    return t >= max_slice
 
 class ReplayBuffer(object):
     def __init__(self, args):
@@ -17,7 +40,27 @@ class ReplayBuffer(object):
                        'terminal': np.zeros(self.buffer_capacity),
                        }
 
-    def store_transition(self, state, action, reward, next_state, terminal, done):
+    def perceive(self, transitions: list):
+        """感知并存储经验"""
+        state_array = transitions[0]
+        action_array = transitions[1]
+        next_state_array = transitions[2]
+        reward_array = transitions[3]
+
+        for i in range(len(state_array)):
+            try:
+                s = _convert_state(state_array[i])
+                s_ = _convert_state(next_state_array[i])
+            except Exception as e:
+                print(f"[DQN perceive] Skipping index {i} due to state conversion error: {e}")
+                continue
+
+            r = reward_array[i]
+            a = action_array[i]
+            done = _is_terminal_state(s_)
+            self.store_transition(s, a, r, s_, done)
+
+    def store_transition(self, state, action, reward, next_state, terminal):
         self.buffer['state'][self.count] = state
         self.buffer['action'][self.count] = action
         self.buffer['reward'][self.count] = reward
@@ -53,6 +96,25 @@ class N_Steps_ReplayBuffer(object):
                        'next_state': np.zeros((self.buffer_capacity, args.state_dim)),
                        'terminal': np.zeros(self.buffer_capacity),
                        }
+    def perceive(self, transitions: list):
+        """感知并存储经验"""
+        state_array = transitions[0]
+        action_array = transitions[1]
+        next_state_array = transitions[2]
+        reward_array = transitions[3]
+
+        for i in range(len(state_array)):
+            try:
+                s = _convert_state(state_array[i])
+                s_ = _convert_state(next_state_array[i])
+            except Exception as e:
+                print(f"[DQN perceive] Skipping index {i} due to state conversion error: {e}")
+                continue
+
+            r = reward_array[i]
+            a = action_array[i]
+            done = _is_terminal_state(s_)
+            self.store_transition(s, a, r, s_, done)
 
     def store_transition(self, state, action, reward, next_state, terminal, done):
         transition = (state, action, reward, next_state, terminal, done)
@@ -109,6 +171,26 @@ class Prioritized_ReplayBuffer(object):
                        'terminal': np.zeros(self.buffer_capacity),
                        }
 
+    def perceive(self, transitions: list):
+        """感知并存储经验"""
+        state_array = transitions[0]
+        action_array = transitions[1]
+        next_state_array = transitions[2]
+        reward_array = transitions[3]
+
+        for i in range(len(state_array)):
+            try:
+                s = _convert_state(state_array[i])
+                s_ = _convert_state(next_state_array[i])
+            except Exception as e:
+                print(f"[DQN perceive] Skipping index {i} due to state conversion error: {e}")
+                continue
+
+            r = reward_array[i]
+            a = action_array[i]
+            done = _is_terminal_state(s_)
+            self.store_transition(s, a, r, s_, done)
+
     def store_transition(self, state, action, reward, next_state, terminal, done):
         self.buffer['state'][self.count] = state
         self.buffer['action'][self.count] = action
@@ -160,6 +242,25 @@ class N_Steps_Prioritized_ReplayBuffer(object):
         self.current_size = 0
         self.count = 0
 
+    def perceive(self, transitions: list):
+        """感知并存储经验"""
+        state_array = transitions[0]
+        action_array = transitions[1]
+        next_state_array = transitions[2]
+        reward_array = transitions[3]
+
+        for i in range(len(state_array)):
+            try:
+                s = _convert_state(state_array[i])
+                s_ = _convert_state(next_state_array[i])
+            except Exception as e:
+                print(f"[DQN perceive] Skipping index {i} due to state conversion error: {e}")
+                continue
+
+            r = reward_array[i]
+            a = action_array[i]
+            done = _is_terminal_state(s_)
+            self.store_transition(s, a, r, s_, done)
     def store_transition(self, state, action, reward, next_state, terminal, done):
         transition = (state, action, reward, next_state, terminal, done)
         self.n_steps_deque.append(transition)

@@ -44,23 +44,23 @@ class Critic(nn.Module):
 
 
 class A2C(object):
-    def __init__(self, state_dim, action_dim,action_mapping):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.action_mapping = action_mapping
-        self.hidden_width = 64  # The number of neurons in hidden layers of the neural network
-        self.lr = 5e-5  # learning rate   # 调大学习率就需要把entropy_beta调大
-        self.GAMMA = 0.99  # discount factor
+    def __init__(self, args):
+        self.state_dim = args.state_dim
+        self.action_dim = args.action_dim
+        self.action_mapping = args.action_mapping
+        self.hidden_width = args.hidden_width  #64  # The number of neurons in hidden layers of the neural network
+        self.lr = args.lr # 5e-5  # learning rate   # 调大学习率就需要把entropy_beta调大
+        self.GAMMA = args.gamma # 0.99  # discount factor
         self.I = 1
 
         # *** 关键修改 (2) ***
         # 增加熵奖励的系数 (entropy coefficient)
-        self.entropy_beta = 0.05  # 这是一个超参数，0.01是一个常见的起始值
+        self.entropy_beta = args.entropy_beta # 0.05  # 这是一个超参数，0.01是一个常见的起始值
 
-        self.actor = Actor(state_dim, action_dim, self.hidden_width)
+        self.actor = Actor(self.state_dim, self.action_dim, self.hidden_width)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.lr)
 
-        self.critic = Critic(state_dim, self.hidden_width)
+        self.critic = Critic(self.state_dim, self.hidden_width)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=self.lr)
 
     def choose_action(self, s, deterministic):

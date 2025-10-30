@@ -7,6 +7,9 @@ from path import *
 import time
 from tqdm import tqdm
 import warnings
+
+from simulator_reposition.utilities.utilities import s2e
+
 warnings.filterwarnings("ignore")
 import os
 from utilities import *

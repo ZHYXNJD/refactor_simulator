@@ -1,17 +1,23 @@
-name: simulator
+name: my_torch_env
 channels:
+  - pytorch
+  - nvidia
   - defaults
 dependencies:
+  # --- 在这里添加 PyTorch 相关的包 ---
+  - torchvision
+  - torchaudio
+  # 关键：指定 CUDA 版本。11.8 是一个稳定且广泛支持的版本。
+  # 你也可以根据你的NVIDIA驱动选择 12.1 (pytorch-cuda=12.1)。
+  - pytorch-cuda=11.8
+  # --- PyTorch 包添加完毕 ---
   - _libgcc_mutex=0.1=main
   - _openmp_mutex=5.1=1_gnu
-  - _tflow_select=2.3.0=mkl
   - abseil-cpp=20211102.0=hd4dd3e8_0
   - absl-py=1.4.0=py38h06a4308_0
   - aiohttp=3.8.3=py38h5eee18b_0
   - aiosignal=1.2.0=pyhd3eb1b0_0
   - appdirs=1.4.4=pyhd3eb1b0_0
-  - astor=0.8.1=py38h06a4308_0
-  - astunparse=1.6.3=py_0
   - async-timeout=4.0.2=py38h06a4308_0
   - blas=1.0=mkl
   - blinker=1.4=py38h06a4308_0
@@ -24,7 +30,6 @@ dependencies:
   - cffi=1.15.1=py38h5eee18b_3
   - cryptography=41.0.2=py38h22a60cf_0
   - frozenlist=1.3.3=py38h5eee18b_0
-  - gast=0.4.0=pyhd3eb1b0_0
   - google-auth=2.6.0=pyhd3eb1b0_0
   - google-auth-oauthlib=0.5.2=py38h06a4308_0
   - google-pasta=0.2.0=pyhd3eb1b0_0
@@ -35,9 +40,6 @@ dependencies:
   - idna=3.4=py38h06a4308_0
   - intel-openmp=2023.1.0=hdb19cb5_46305
   - joblib=1.2.0=py38h06a4308_0
-  - keras=2.4.3=hd3eb1b0_0
-  - keras-base=2.4.3=pyhd3eb1b0_0
-  - keras-preprocessing=1.1.2=pyhd3eb1b0_0
   - ld_impl_linux-64=2.38=h1181459_1
   - libffi=3.4.4=h6a678d5_0
   - libgcc-ng=11.2.0=h1234567_1
@@ -83,16 +85,13 @@ dependencies:
   - rsa=4.7.2=pyhd3eb1b0_1
   - scikit-learn=1.3.0=py38h1128e8f_0
   - scipy=1.10.1=py38hf6e8229_1
-  - setuptools=68.0.0=py38h06a4308_0
+  - setuptools=65.5.0=py38h06a4308_0
   - six=1.16.0=pyhd3eb1b0_1
   - sqlite=3.41.2=h5eee18b_0
   - tbb=2021.8.0=hdb19cb5_0
   - tensorboard=2.12.1=py38h06a4308_0
   - tensorboard-data-server=0.7.0=py38h52d8a92_0
   - tensorboard-plugin-wit=1.8.1=py38h06a4308_0
-  - tensorflow=2.4.1=mkl_py38hb2083e0_0
-  - tensorflow-base=2.4.1=mkl_py38h43e0292_0
-  - tensorflow-estimator=2.6.0=pyh7b7c402_0
   - termcolor=2.1.0=py38h06a4308_0
   - threadpoolctl=2.2.0=pyh0d69192_0
   - tk=8.6.12=h1ccaba5_0
@@ -103,7 +102,8 @@ dependencies:
   - xz=5.4.2=h5eee18b_0
   - yaml=0.2.5=h7b6447c_0
   - yarl=1.8.1=py38h5eee18b_0
-  - zlib=1.2.13=h5eee18b_0
+#  - zlib=1.2.13=h5eee18b
+  - zlib
   - pip:
       - attrs==23.1.0
       - chardet==5.1.0
@@ -130,4 +130,3 @@ dependencies:
       - shapely==1.8.5.post1
       - urllib3==2.0.2
       - zipp==3.15.0
-prefix: /home/ctj/anaconda3/envs/simulator

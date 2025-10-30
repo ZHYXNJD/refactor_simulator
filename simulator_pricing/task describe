@@ -8,3 +8,27 @@ Operation主要考虑repositioning，机场附近区域每15分钟repo一次，�
 若供大于求，则无需调整；若供小于求，则调度当前15-20分钟内能够到达机场的车辆，repo其到机场等待接客，调度期间暂时不让其接其他订单。
 
 通过仿真观察机场区域需求等待时间、匹配成功率、该区域匹配收益、司机等待时间等指标随着预测效果变化而产生的变化。
+
+
+step:
+
+1. check wait list
+2. order dispatch (新状态的veh不能接单)
+3. update info after matching multi process ()
+4. bootstrap new orders
+5. cruise and reposition
+ (这里要做两件事情，
+ 第一：就在此修改cruise的规则;
+ 第二：repo至机场附近的veh另外新增一个状态 该状态表示cruise状态但是不能接单;)
+6. update state
+7. driver online offline update
+8. update time
+
+需要改的数据：
+utilties里的network
+simulator pattern里的request和driver table
+
+
+查看一下reward为什么不变化
+看一下调度到机场的车辆是否接客
+

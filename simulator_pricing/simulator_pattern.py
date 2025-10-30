@@ -38,13 +38,20 @@ class SimulatorPattern(object):
             self.request_all = pickle.load(f)
         with open(self.driver_file_name, 'rb') as f:
             self.driver_info = pickle.load(f)
-        self.driver_info = self.driver_info.sample(n=env_params['driver_num'],replace=False, random_state=42)
-        print("driver number: ",len(self.driver_info))
+        self.driver_info = self.driver_info.sample(n=env_params['driver_num'], replace=False, random_state=42)
+
+        # with open('Queens_data/Queens_request_20241203.pkl', 'rb') as f:
+        #     self.request_all = pickle.load(f)
+        # self.driver_info = pd. read_csv('Queens_data/queens_drivers_1000.csv')
+        # self.driver_info = self.driver_info.sample(n=1000, replace=False, random_state=42)
+        #
+        # self.pred_demand = pd.read_csv('Queens_data/demand_pred_20241203.csv')
+
+        print("driver number: ", len(self.driver_info))
 
 
-
-
-
+if __name__=='__main__':
+    SimulatorPattern()
 
 
 

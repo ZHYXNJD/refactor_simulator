@@ -1,8 +1,14 @@
+import datetime
+import json
+import os
+from .ppo_config import *
 import torch
 import torch.nn.functional as F
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
 import torch.nn as nn
 from torch.distributions import Beta, Normal
+from simulator_pricing.config import env_params
+from simulator_pricing.agent_model.PPO_continuous import ppo_config
 
 
 # Trick 8: orthogonal initialization
@@ -53,7 +59,9 @@ class Actor_Gaussian(nn.Module):
         self.fc1 = nn.Linear(args.state_dim, args.hidden_width)
         self.fc2 = nn.Linear(args.hidden_width, args.hidden_width)
         self.mean_layer = nn.Linear(args.hidden_width, args.action_dim)
-        self.log_std = nn.Parameter(torch.zeros(1, args.action_dim))  # We use 'nn.Parameter' to train log_std automatically
+        # self.log_std = nn.Parameter(torch.zeros(1, args.action_dim))  # We use 'nn.Parameter' to train log_std automatically
+        # 修改: 初始化为更小的值，例如 -1.0 (std ≈ 0.37)，以减少早期方差
+        self.log_std = nn.Parameter(torch.ones(1, args.action_dim)*-1.0)  # We use 'nn.Parameter' to train log_std automatically
         self.activate_func = [nn.ReLU(), nn.Tanh()][args.use_tanh]  # Trick10: use tanh
 
         if args.use_orthogonal_init:
@@ -62,10 +70,26 @@ class Actor_Gaussian(nn.Module):
             orthogonal_init(self.fc2)
             orthogonal_init(self.mean_layer, gain=0.01)
 
+        # a. 计算 sigmoid 的目标输出 [0, 1]
+        target_sigmoid_output = torch.tensor((env_params['price_per_km'] / 10)/ self.max_action)
+
+        # b. 计算 sigmoid 所需的输入 (logit)
+        # logit(y) = log(y / (1 - y))
+        target_logit_output = torch.log(
+            target_sigmoid_output / (1.0 - target_sigmoid_output)
+        )
+
+        # c. 将这个 logit 值设置为 mean_layer 的偏置
+        self.mean_layer.bias.data.fill_(target_logit_output)
+
     def forward(self, s):
         s = self.activate_func(self.fc1(s))
         s = self.activate_func(self.fc2(s))
-        mean = self.max_action * torch.tanh(self.mean_layer(s))  # [-1,1]->[-max_action,max_action]
+        # mean = self.max_action * torch.tanh(self.mean_layer(s))  # [-1,1]->[-max_action,max_action]  # 这里需要修改为最小值为0.1
+
+        # mean_layer(s) 的输出在初始时会接近 target_logit_output
+        # sigmoid(mean_layer(s)) 会接近 target_sigmoid_output
+        mean = self.max_action * torch.sigmoid(self.mean_layer(s))
         return mean
 
     def get_dist(self, s):
@@ -115,6 +139,9 @@ class PPO_continuous():
         self.use_grad_clip = args.use_grad_clip
         self.use_lr_decay = args.use_lr_decay
         self.use_adv_norm = args.use_adv_norm
+        self.use_state_norm = args.use_state_norm
+        self.use_reward_norm = args.use_reward_norm
+        self.use_reward_scaling = args.use_reward_scaling
 
         if self.policy_dist == "Beta":
             self.actor = Actor_Beta(args)
@@ -148,13 +175,56 @@ class PPO_continuous():
             with torch.no_grad():
                 dist = self.actor.get_dist(s)
                 a = dist.sample()  # Sample the action according to the probability distribution
-                a = torch.clamp(a, -self.max_action, self.max_action)  # [-max,max]
+                a = torch.clamp(a, 0, self.max_action)
                 a_logprob = dist.log_prob(a)  # The log probability density of the action
 
         return a.numpy().flatten(), a_logprob.numpy().flatten()
 
+    def get_action(self,pricing_state,state_norm_func):
+        """
+        输入 pricing_state，输出每个订单的 designed_reward（价格）。
+        """
+        trip_distances = pricing_state["trip_distances"]  # Series
+        idle_vehicle = pricing_state["idle_vehicle"]
+        # occupied_vehicle = pricing_state["occupied_vehicle"]
+        demand = pricing_state["demand"]
+        time_slice = pricing_state["time_slice"]
+
+        if env_params['pricing_strategy'] == "static":
+            if demand == 0:
+                return 0
+            else:
+                # 基于距离线性定价
+                return 1, 2.5 + 0.5 * ((1000 * trip_distances - 322).clip(lower=0) / 322)
+
+        elif env_params['pricing_strategy'] == "dynamic":
+            state_key = [time_slice,idle_vehicle,demand]
+
+            if self.use_state_norm:
+                state_key = state_norm_func(state_key)
+
+            a, a_logprob = self.choose_action(state_key)
+
+            if self.policy_dist == "Beta":
+                # 这里存疑 可能还需要修改
+                action = 2 * (a - 0.5) * self.max_action  # [0,1]->[-max,max]
+            else: # normal distribution
+                action = a
+
+            # 返回每个订单的价格（按距离映射）
+            if demand == 0:
+                price_array = 0
+            else:
+                price_array = 2.5 + action * ((1000 * trip_distances - 322).clip(lower=0) / 322)
+
+            return action, a_logprob,price_array
+
+        else:
+            raise ValueError("Unsupported pricing strategy")
+
     def update(self, replay_buffer, total_steps):
         s, a, a_logprob, r, s_, dw, done = replay_buffer.numpy_to_tensor()  # Get training data
+        # s, a, a_logprob, r, s_ = replay_buffer.numpy_to_tensor()  # Get training data
         """
             Calculate the advantage using GAE
             'dw=True' means dead or win, there is no next state s'
@@ -213,3 +283,31 @@ class PPO_continuous():
             p['lr'] = lr_a_now
         for p in self.optimizer_critic.param_groups:
             p['lr'] = lr_c_now
+
+    def save_parameters(self, epoch: int):
+        # 修改保存路径为当前路径下的 models 文件夹
+        base_folder = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'model_weights')
+        running_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        folder_1 = os.path.join(base_folder, running_time)
+
+        # 如果文件夹不存在，则创建
+        if not os.path.exists(folder_1):
+            os.makedirs(folder_1)
+
+        # 保存ppo参数文件路径
+        file_path_1 = os.path.join(folder_1, f'ppo_parameters.txt')
+        with open(file_path_1, 'w') as f:
+            json.dump(vars(ppo_configs),f, indent=4)
+
+        folder_2 = os.path.join(folder_1, f'epoch_{epoch}')
+        # 如果文件夹不存在，则创建
+        if not os.path.exists(folder_2):
+            os.makedirs(folder_2)
+
+        # 保存ppo模型文件路径
+        file_path_2 = os.path.join(folder_2, f'model_actor_weights.pth')
+        file_path_3 = os.path.join(folder_2, f'model_critic_weights.pth')
+        # # TO DO:
+        # 这里要保存模型
+        torch.save(self.actor.state_dict(), file_path_2)
+        torch.save(self.actor.state_dict(), file_path_3)

@@ -1,6 +1,6 @@
 import os
 import pickle
-from utilities import State
+from simulator_matching.utilities.utilities import State
 from config import env_params, LEN_TIME, LEN_TIME_SLICE, START_TIMESTAMP
 
 class QLearningAgent:

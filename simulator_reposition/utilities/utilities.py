@@ -10,7 +10,7 @@ from random import choice
 from shapely.geometry import Point, Polygon
 from pymongo.errors import ConnectionFailure
 
-from dispatch_alg import LD
+from simulator_reposition.utilities.dispatch_alg import LD
 from math import radians, sin, atan2, cos, acos
 from config import *
 import math
@@ -63,7 +63,8 @@ for index, row in result.iterrows():
 """
 Here, we build the connection to mongodb, which will be used to speed up access to road network information.
 """
-myclient = pymongo.MongoClient("mongodb://localhost:27017/") 
+# myclient = pymongo.MongoClient("mongodb://localhost:27017/")
+myclient = pymongo.MongoClient("mongodb://host.docker.internal:27017/")
 try:
     # The ismaster command is cheap and does not require auth.
     myclient.admin.command('ismaster')

@@ -32,7 +32,7 @@ env_params = {
     'dispatch_method': 'LD',  # LD: lagarange decomposition method designed by Peibo Duan
     # 'method': 'instant_reward_no_subway',
     # 'simulator_mode': 'toy_mode',
-    'experiment_mode': 'test',  # train / test
+    'experiment_mode': 'train',  # train / test
     'driver_num': 200, # TODO
     'price_per_km': 5,  # $ / km
     'road_information_mode': 'load',
@@ -40,7 +40,7 @@ env_params = {
     'rl_mode': 'reposition',  # reposition and matching
     'method': 'instant_reward_no_subway',
     # 'sarsa_no_subway' / 'pickup_distance' / 'instant_reward_no_subway'   #  rl for matching
-    'reposition_method': 'random_cruise',  # A2C, A2C_global_aware, random_cruise, stay  # rl for repositioning
+    'reposition_method': 'A2C',  # A2C, A2C_global_aware, random_cruise, stay  # rl for repositioning
     'repo2any': False,#True,
     'dayparting': False,
     # if true, simulator_env will compute information based on time periods in a day, e.g. 'morning', 'afternoon'

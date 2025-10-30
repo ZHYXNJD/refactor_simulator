@@ -10,6 +10,9 @@ import pickle
 from utilities import *
 from config import *
 
+from simulator_matching.config import LEN_TIME, LEN_TIME_SLICE, env_params
+from simulator_matching.utilities.utilities import State
+
 # rl for matching
 # Andrew: Only one rl method is used in the simulator, which is sarsa_no_subway
 class SarsaAgent(object):
@@ -60,11 +63,13 @@ class SarsaAgent(object):
                 s = State(time_slice, grid_id)
                 self.q_value_table[s] = q_table[time_slice][grid_id]
 
-    def save_parameters(self, epoch: int):
+    def save_parameters(self, path,epoch,driver_num):
 
         # file path
-        root_file_path = os.path.abspath(os.path.dirname(__file__))
-        folder_path = os.path.join(root_file_path, 'episode_' + str(epoch))
+        # root_file_path = os.path.abspath(os.path.dirname(__file__))
+        # folder_path = os.path.join(root_file_path, 'episode_' + str(epoch))
+
+        folder_path = path+'/'+str(driver_num)
         if not os.path.exists(folder_path):
             os.makedirs(folder_path)  # create a folder
         file_path = os.path.join(folder_path, 'sarsa_q_value_table_epoch_' + str(epoch) + '.pickle')

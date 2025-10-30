@@ -1,10 +1,12 @@
+from simulator_pricing.agent_model.PPO_continuous.ppo_config import ppo_config
+
 env_params = {
     't_initial': 18000,
     't_end': 36000,
     'delta_t': 60,  # note: need to be the same as 'request_interval'
     'vehicle_speed': 22.788,  # km / h
     'repo_speed': 22.788,  # need to be the same as vehicl speed
-    'order_sample_ratio': 0.1, # TODO 
+    'order_sample_ratio': 0.05, # TODO
     'order_generation_mode': 'sample_from_base',
     'driver_sample_ratio': 1,
     'maximum_wait_time_mean': 300,
@@ -12,14 +14,17 @@ env_params = {
     "maximum_pickup_time_passenger_can_tolerate_mean": float('inf'),  # s
     "maximum_pickup_time_passenger_can_tolerate_std": 0,  # s
     "maximum_price_passenger_can_tolerate_mean": float('inf'),  # $
+    # 新增参数
+    "highest_price": 10,  # $
+    # ------
     "maximum_price_passenger_can_tolerate_std": 0,  # $
     'maximal_pickup_distance': 1.25,  # km TODO
     'request_interval': 60,  #note: need to be the same as 'delta_t'
-    'cruise_flag': False,
+    'cruise_flag': True,
     'delivery_mode': 'rg',
     'pickup_mode': 'rg',
     'max_idle_time': 300,
-    'cruise_mode': 'random',
+    'cruise_mode': 'global-random',
     'reposition_flag': False,
     'eligible_time_for_reposition': 300,  # s
     'reposition_mode': '',
@@ -38,14 +43,15 @@ env_params = {
     'road_information_mode': 'load',
     'price_increasing_percentage': 0,
     'rl_mode': 'pricing',  # reposition, matching and pricing
-    'pricing_strategy': 'dynamic',  # static / dynamic
-    'method': 'instant_reward_no_subway',
+    'pricing_strategy': 'static',  # static / dynamic / spatial-temporal
+    'method': 'instant_reward',
     # 'sarsa_no_subway' / 'pickup_distance' / 'instant_reward_no_subway'   #  rl for matching
     'reposition_method': 'random_cruise',  # A2C, A2C_global_aware, random_cruise, stay  # rl for repositioning
-    'repo2any': False,#True,
+    'repo2any': True,#True,
     'dayparting': False,
     # if true, simulator_env will compute information based on time periods in a day, e.g. 'morning', 'afternoon'
     'MCTS_Flag': False,
+    'rl_algorithm':'A2C' # 'PPO'
 }
 
 #  rl for matching
@@ -60,7 +66,8 @@ pricing_params = dict(learning_rate=0.005, discount_rate=0.95, strategy=env_para
 
 # rl for repositioning
 # hyperparameters for rl
-NUM_EPOCH = 601
+# NUM_EPOCH = 601
+NUM_EPOCH = 301
 STOP_EPOCH = 600
 DISCOUNT_FACTOR = 0.95
 ACTOR_LR = 0.001
@@ -83,8 +90,8 @@ PRE_STEP = 0
 #                    '2015-07-13', '2015-07-14', '2015-07-15', '2015-07-16', '2015-07-17'
 #                    ]
 #                    ]
-TRAIN_DATE_LIST = ['2015-05-04']
-# TRAIN_DATE_LIST = ['2015-05-04', '2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08', ]
+# TRAIN_DATE_LIST = ['2015-05-04']
+TRAIN_DATE_LIST = ['2015-05-04', '2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08']
 
 TEST_DATE_LIST = ['2015-05-04']
 # TEST_DATE_LIST = ['2015-05-11', '2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15']
