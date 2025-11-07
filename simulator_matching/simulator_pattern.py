@@ -27,11 +27,11 @@ class SimulatorPattern(object):
             self.request_file_name = os.path.join(data_path, f"orders_grid{env_params['grid_num']}_{env_params['date']}.pickle")
             print(f"load default date from docker: {env_params['date']}")
         else:
-            self.request_file_name = f"my_data/orders_grid{env_params['grid_num']}_{date}.pkl"
-            print(f"load date from my disk: {date}")
+            self.request_file_name = f"my_data/cleaned_orders_pickle/orders_grid{env_params['grid_num']}_{date}.pkl"
+            # print(f"load date from my disk: {date}")
         self.driver_file_name = os.path.join(data_path, f"drivers_grid{env_params['grid_num']}_1000.pickle")
         with open(self.request_file_name, 'rb') as f:
-            print(f"load docker request file: {self.request_file_name}")
+            print(f"load request file: {self.request_file_name}")
             self.request_all = pickle.load(f)
         # with open(f"my_data/orders_grid{env_params['grid_num']}_2015-05-04.pkl", 'rb') as f:
         #     print(f"load my request file:my_data/orders_grid{env_params['grid_num']}_2015-05-04.pkl")

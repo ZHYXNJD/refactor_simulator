@@ -1,5 +1,6 @@
-load_path = "output_sarsa_cruiseFalse_driver200_lr0005/200/"
-output_path = "output_sarsa_final_multi_driver"
+load_path = "output_sarsa_final_multi_driver/100/"
+# output_path = "output_sarsa_final_multi_driver"
+output_path = "output_dynamic_match"
 data_path =  "/manhattan/data/"
 
 

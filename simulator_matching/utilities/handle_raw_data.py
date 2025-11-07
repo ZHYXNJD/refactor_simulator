@@ -25,7 +25,8 @@ env_params = {
 
 
 
-G = ox.load_graphml('./input/graph.graphml')
+# G = ox.load_graphml('./input/graph.graphml')
+G = ox.load_graphml('/manhattan/data/manhattan.graphml')
 gdf_nodes, gdf_edges = ox.graph_to_gdfs(G)
 lat_list = gdf_nodes['y'].tolist()
 lng_list = gdf_nodes['x'].tolist()

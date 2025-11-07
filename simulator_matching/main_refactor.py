@@ -1,4 +1,5 @@
 from simulator_env import Simulator
+from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import *
 from simulator_matching.utilities.utilities import *
 from simulator_trainer import SimulatorTrainer 
 from pricing_agent import PricingAgent
@@ -13,8 +14,10 @@ warnings.filterwarnings("ignore")
 if __name__ == "__main__":
     # Andrew: set up logger
 
-    driver_num = [100,500,1000]
-    order_sample_ratio = [0.1,0.5,1]
+    # driver_num = [100,500,1000]
+    driver_num = [100]
+    # order_sample_ratio = [0.1,0.5,1]
+    order_sample_ratio = [0.1]
     max_distance_num = [1.25]
 
     # cruise_flag = [True if env_params['rl_mode'] == 'matching' else False]
@@ -39,29 +42,39 @@ if __name__ == "__main__":
                         
                         # Andrew: initialize RL agents and simulator
                         matching_agent_params = {
-                            'strategy_type': env_params['method'],
+                            # 'strategy_type': env_params['method'],
+                            'strategy_type': 'sarsa',
                             'strategy_params': qTable_params,
-                            'load_path': None,
-                            # 'load_path': load_path+'sarsa_q_value_table_epoch_300.pickle',
-                            'flag_load': FLAG_LOAD  # 新增 FLAG_LOAD 参数
+                            # 'load_path': None,
+                            'load_path': 'output_sarsa_final_multi_driver/100/sarsa_q_value_table_epoch_250.pickle',
+                            'flag_load': True  # 新增 FLAG_LOAD 参数
                         }
                         pricing_agent = PricingAgent(strategy="static")
                         matching_agent = MatchingAgent(**matching_agent_params)
-                        simulator = Simulator(**env_params, matching_agent=matching_agent, pricing_agent=pricing_agent)
 
-                        # Comment simulator.reset() below if you are not running matching with instant_reward_no_subway
-                        # simulator.reset() # 每次循环都重置simulator的状态
-                        # track_record = []
-                        # t = time.time()
+                        # 注册dynamic matching agent
+                        if env_params['rl_mode'] == 'dynamic_matching':
+                            M = env_params['grid_num']  # grid 数量
+                            state_dim = M * 3 + 2
+                            obs_dim_per_agent = state_dim + M  # 加上 grid ID one-hot
+                            obs_dims = [obs_dim_per_agent for _ in range(M)]
+                            n_actions = [3 for _ in range(M)]
+                            maddpg = MADDPG(obs_dims=obs_dims, n_actions=n_actions)
+
+                            simulator = Simulator(**env_params, matching_agent=matching_agent, pricing_agent=pricing_agent,dynamic_matching_agent=maddpg)
+
+                        else:
+                            simulator = Simulator(**env_params, matching_agent=matching_agent,
+                                                  pricing_agent=pricing_agent,dynamic_matching_agent=None)
 
                         # if env_params['rl_mode'] == "matching":
                         if simulator.experiment_mode == 'test':
-
                             # Initialize SimulatorTrainer
                             trainer = SimulatorTrainer(
                                 simulator=simulator,
                                 matching_agent=matching_agent,
-                                pricing_agent=pricing_agent
+                                pricing_agent=pricing_agent,
+                                dynamic_matching_agent=maddpg
                             )
 
 
@@ -82,71 +95,54 @@ if __name__ == "__main__":
                             trainer = SimulatorTrainer(
                                 simulator=simulator,
                                 matching_agent=matching_agent,
-                                pricing_agent=pricing_agent
+                                pricing_agent=pricing_agent,
+                                dynamic_matching_agent=None
                             )
                             trainer.train(
                                 train_config={
-                                    'num_epochs': 300,
+                                    'num_epochs': 301,
                                     'train_dates': TRAIN_DATE_LIST,
                                     'driver_num':single_driver_num,
                                     'save_interval': 50,
-                                    'output_path': output_path,
-                                    'flag_load': FLAG_LOAD,
+                                    'output_path': "learned_value",
+                                    'flag_load': True, # 这里的load是加载之前的matching agent
                                 }
                             )
 
-                                # agent = None
-                                # if simulator.method in ['sarsa', 'sarsa_no_subway', 'sarsa_travel_time',
-                                #                         'sarsa_travel_time_no_subway', 'sarsa_total_travel_time',
-                                #                         'sarsa_total_travel_time_no_subway','dqn']:
-                                #     agent = SarsaAgent(**qTable_params)
-                                #     if FLAG_LOAD:
-                                #         agent.load_parameters(
-                                #             load_path + 'episode_1800\\sarsa_q_value_table_epoch_1800.pickle')
-                                # for epoch in range(NUM_EPOCH):
-                                #     date = TRAIN_DATE_LIST[epoch % len(TRAIN_DATE_LIST)]
-                                #     simulator.experiment_date = date
-                                #     simulator.reset()
-                                #     start_time = time.time()
-                                #     for step in range(simulator.finish_run_step):
-                                #         dispatch_transitions = simulator.rl_step(agent, epsilons[epoch])
-                                #         if agent is not None:
-                                #             agent.perceive(dispatch_transitions)
-                                #     end_time = time.time()
-                                #     total_reward_record[epoch] = simulator.total_reward
-                                    # pickle.dump(simulator.order_status_all_time,open("1106a-order.pkl","wb"))
-                                    # pickle.dump(simulator.driver_status_all_time,open("1106a-driver.pkl","wb"))
-                                    # pickle.dump(simulator.used_driver_status_all_time,open("1106a-used-driver.pkl","wb"))
-                                    # print('epoch:', epoch)
-                                    # print('epoch running time: ', end_time - start_time)
-                                    # print('epoch total reward: ', simulator.total_reward)
-                                    # print("total orders",simulator.total_request_num)
-                                    # print("matched orders",simulator.matched_requests_num)
-                                    # print("step1:order dispatching:",simulator.time_step1)
-                                    # print("step2:reaction",simulator.time_step2)
-                                    # print("step3:bootstrap new orders:",simulator.step3)
-                                    # print("step4:cruise:", simulator.step4)
-                                    # print("step4_1:track_recording",simulator.step4_1)
-                                    # print("step5:update state",simulator.step5)
-                                    # print("step6:offline update",simulator.step6)
-                                    # print("step7: update time",simulator.step7)
-                                    # pickle.dump(simulator.record,open("output/order_record-1103.pickle","wb"))
-                                    # if epoch % 200 == 0:  # save the result every 200 epochs
-                                    #     agent.save_parameters(epoch)
+                        elif simulator.experiment_mode == 'train_dynamic_matching':
+                            # Initialize SimulatorTrainer
+                            trainer = SimulatorTrainer(
+                                simulator=simulator,
+                                matching_agent=matching_agent,
+                                pricing_agent=pricing_agent,
+                                dynamic_matching_agent=maddpg
+                            )
+                            trainer.dynamic_matching_train(
+                                train_config={
+                                    'num_epochs': 301,
+                                    'train_dates': TRAIN_DATE_LIST,
+                                    'driver_num': single_driver_num,
+                                    'save_interval': 50,
+                                    'output_path': output_path,
+                                    'flag_load': FLAG_LOAD,  # 这里的load是加载之前的matching agent
+                                }
+                            )
 
-                            # for step in tqdm(range(simulator.finish_run_step)):
-                            #     new_tracks = simulator.rl_step()
-                            #     track_record.append(new_tracks)
-
-                            # output3:    
-                            # match_and_cancel_track_list = simulator.match_and_cancel_track
-                            # file_path = 'output3' + pc_flag + "_" + dl_flag + "_" + "cruise="+str(cr_flag)
-                            # if not os.path.exists(file_path):
-                            #     os.makedirs(file_path)
-                            # pickle.dump(track_record, open(file_path + '/records_driver_num_'+str(single_driver_num)+'.pickle', 'wb'))
-                            # pickle.dump(simulator.requests, open(file_path + '/passenger_records_driver_num_'+str(single_driver_num)+'.pickle', 'wb'))
-                            #
-                            # pickle.dump(match_and_cancel_track_list,open(file_path+'/match_and_cacel_'+str(single_driver_num)+'.pickle','wb'))
-                            # file = open(file_path + '/time_statistic.txt', 'a')
-                            # file.write(str(time.time()-t)+'\n')
-                            # file.close()
+                        elif simulator.experiment_mode == 'generate_warmup_data':
+                            # Initialize SimulatorTrainer
+                            trainer = SimulatorTrainer(
+                                simulator=simulator,
+                                matching_agent=matching_agent,
+                                pricing_agent=pricing_agent,
+                                dynamic_matching_agent=maddpg
+                            )
+                            trainer.generate_warmup_data(
+                                train_config={
+                                    'num_epochs': 301,
+                                    'train_dates': TRAIN_DATE_LIST,
+                                    'driver_num': single_driver_num,
+                                    'save_interval': 50,
+                                    'output_path': output_path,
+                                    'flag_load': FLAG_LOAD,  # 这里的load是加载之前的matching agent
+                                }
+                            )

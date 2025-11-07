@@ -1,37 +1,28 @@
-# from re import I
-# from socket import if_indextoname
-import json
-import os
+import pickle
 
+from joblib import Parallel, delayed
+from tqdm import tqdm
 import numpy as np
 from copy import deepcopy
 import random
 from random import choice
-from shapely.geometry import Point, Polygon
+from multiprocessing import Pool, cpu_count
+from matplotlib import pyplot as plt
 from pymongo.errors import ConnectionFailure
-
 from simulator_matching.matching_algorithm.dispatch_alg import LD
-from math import radians, sin, atan2, cos, acos
-from simulator_reposition.config import *
+from math import acos
 import math
-import pickle
 import osmnx as ox
-from tqdm import tqdm
 import pandas as pd
-import sys
-from collections import Counter
 import pymongo
-import time
-import scipy.stats as st
 from scipy.stats import skewnorm
 from collections import defaultdict
-import networkx as nx
-from simulator_reposition.config import env_params
+# from simulator_reposition.config import env_params
+from simulator_matching.config import env_params
 import geopandas as gpd
 from simulator_reposition.path import *
-from math import sin, cos, sqrt, atan2, radians, degrees, asin, pi
+from math import sin, cos, atan2, radians, degrees, asin, pi
 import os
-import sys
 
 """
 Here, we load the information of graph network from graphml file.
@@ -63,16 +54,22 @@ for index, row in result.iterrows():
 Here, we build the connection to mongodb, which will be used to speed up access to road network information.
 """
 # myclient = pymongo.MongoClient("mongodb://localhost:27017/")
-myclient = pymongo.MongoClient("mongodb://host.docker.internal:27017/")
-try:
-    # The ismaster command is cheap and does not require auth.
-    myclient.admin.command('ismaster')
-    print("MongoDB is connected!")
-except ConnectionFailure:
-    print("Server not available")
-mydb = myclient["manhattan_island"]
-mycollection = mydb['od_shortest_path']
+# myclient = pymongo.MongoClient("mongodb://host.docker.internal:27017/")
+# try:
+#     # The ismaster command is cheap and does not require auth.
+#     myclient.admin.command('ismaster')
+#     print("MongoDB is connected!")
+# except ConnectionFailure:
+#     print("Server not available")
+# mydb = myclient["manhattan_island"]
+# mycollection = mydb['od_shortest_path']
 
+# 这里直接放弃使用pymongo
+# 加载pickle即可
+# 在本地跑可以关掉 直接启用在线搜索
+# 因为加载到内存要消耗10GB
+# with open ('my_data/master_path_cache.pkl', 'rb') as f:
+#     master_path_cache = pickle.load(f)
 
 df_neighbor_centroid = pd.DataFrame()
 zone_id = []
@@ -101,7 +98,7 @@ else:
         down = [2, 3, 4, 5, 6, 7, 6, 7]
         left = [0, 2, 4, 6, 0, 2, 4, 6]
         right = [1, 3, 5, 7, 1, 3, 5, 7]
-    elif env_params['grid_num'] == 35:    
+    elif env_params['grid_num'] == 35:
         up = [1, 3, 4, 6, 7, 8, 9, 10, 13, 14, 12, 12, 15, 16, 20, 21, 17, 18, 24, 25, 23, 22, 23, 26, 27, 29, 29, 28, 30, 31, 32, 34, 33, 33, 34]
         down = [0, 0, 0, 1, 2, 3, 3, 4, 5, 6, 7, 7, 10, 8, 9, 12, 13, 16, 17, 14, 14, 15, 21, 20, 18, 18, 23, 24, 27, 25, 28, 29, 30, 32, 31]
         left = [0, 1, 1, 3, 3, 5, 5, 6, 8, 8, 9, 10, 14, 13, 13, 14, 16, 17, 18, 17, 20, 20, 20, 25, 24, 24, 25, 27, 28, 27, 30, 30, 32, 33, 33]
@@ -372,36 +369,59 @@ def route_generation_array(origin_coord_array, dest_coord_array, reposition=Fals
             dis_array.append(dis)
         return itinerary_node_list, itinerary_segment_dis_list, np.array(dis_array)
     
+    # elif mode == 'rg':
+    #     # 返回完整itinerary
+    #     for origin, dest in zip(origin_node_list, dest_node_list):
+    #         origin = int(origin)
+    #         dest = int(dest)
+    #         query = {
+    #             'origin': origin,
+    #             'destination': dest
+    #         }
+    #         re = mycollection.find_one(query)
+    #         if re:
+    #             ite = re['itinerary_node_list']
+    #         else:
+    #             ite = ox.distance.shortest_path(G, origin, dest, weight='length', cpus=16)
+    #             if ite is None:
+    #                 ite = [origin, dest]
+    #             content = {
+    #                 'origin': origin,
+    #                 'destination': dest,
+    #                 'itinerary_node_list': ite
+    #             }
+    #             try:
+    #                 mycollection.insert_one(content)
+    #             except Exception as e:
+    #                 print(f"Error inserting data for origin: {origin}, destination: {dest}: {e}")
+    #         if ite is not None and len(ite) > 1:
+    #             itinerary_node_list.append(ite)
+    #         else:
+    #             itinerary_node_list.append([origin, dest])
+    #
+    #     for itinerary_node in itinerary_node_list:
+    #         if itinerary_node is not None:
+    #             itinerary_segment_dis = []
+    #             for i in range(len(itinerary_node) - 1):
+    #                 dis = distance(node_id_to_coord[itinerary_node[i]], node_id_to_coord[itinerary_node[i + 1]])
+    #                 itinerary_segment_dis.append(dis)
+    #             dis_array.append(sum(itinerary_segment_dis))
+    #             itinerary_segment_dis_list.append(itinerary_segment_dis)
+    #         if not reposition:
+    #             itinerary_node.pop()
+
     elif mode == 'rg':
         # 返回完整itinerary
         for origin, dest in zip(origin_node_list, dest_node_list):
             origin = int(origin)
             dest = int(dest)
-            query = {
-                'origin': origin,
-                'destination': dest
-            }
-            re = mycollection.find_one(query)
-            if re:
-                ite = re['itinerary_node_list']
-            else:
-                ite = ox.distance.shortest_path(G, origin, dest, weight='length', cpus=16)
-                if ite is None:
-                    ite = [origin, dest]
-                content = {
-                    'origin': origin,
-                    'destination': dest,
-                    'itinerary_node_list': ite
-                }
-                try:
-                    mycollection.insert_one(content)
-                except Exception as e:
-                    print(f"Error inserting data for origin: {origin}, destination: {dest}: {e}")
+            ite = ox.distance.shortest_path(G, origin, dest, weight='length')
+
             if ite is not None and len(ite) > 1:
                 itinerary_node_list.append(ite)
             else:
                 itinerary_node_list.append([origin, dest])
-      
+
         for itinerary_node in itinerary_node_list:
             if itinerary_node is not None:
                 itinerary_segment_dis = []
@@ -410,12 +430,11 @@ def route_generation_array(origin_coord_array, dest_coord_array, reposition=Fals
                     itinerary_segment_dis.append(dis)
                 dis_array.append(sum(itinerary_segment_dis))
                 itinerary_segment_dis_list.append(itinerary_segment_dis)
-            if not reposition: 
+            if not reposition:
                 itinerary_node.pop()
-    
-    dis_array = np.array(dis_array)
-    return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
+        dis_array = np.array(dis_array)
+        return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
 def get_closed_lng_lat(current_lng_lat_array, target_lng_lat_array):
     ret = []
@@ -520,7 +539,7 @@ def sample_all_drivers(driver_info, t_initial, t_end, driver_sample_ratio=1, dri
     """
     # 当前并无随机抽样司机；后期若需要，可设置抽样模块生成sampled_driver_info
     new_driver_info = deepcopy(driver_info)
-    np.random.seed(42)
+    # np.random.seed(42)
     if driver_sample_ratio != 1:
         sampled_driver_info = new_driver_info.sample(frac=driver_sample_ratio)
     else:
@@ -600,15 +619,14 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=950, dis
             driver_loc_array_temp = idle_driver_table.loc[:, ['lng', 'lat', 'driver_id']]
             driver_loc_array = np.tile(driver_loc_array_temp.values, (num_wait_request, 1))
             dis_array = distance_array(request_array[:, :2], driver_loc_array[:, :2])
-            reward_array = request_array[:, -1]
-            if method in ['pickup_distance','d','d_rl']:
+            reward_array = request_array[:, -1].copy()
+            if method in ['pickup_distance','d','d_rl','d_tt']:
                 # weight转换为最大pickup distance - 当前pickup distance
                 request_array[:, -1] = maximal_pickup_distance - dis_array + 1
-
             flag = np.where(dis_array <= maximal_pickup_distance)[0]
             if len(flag) > 0:
                 # step 1: generate order driver pairs
-                if method in ['d_rl']:
+                if method in ['d_rl','d_tt']:
                     order_driver_pair = np.vstack(
                         [request_array[flag, 2], driver_loc_array[flag, 2], request_array[flag, 3], reward_array[flag]]).T
                 else:
@@ -631,6 +649,61 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=950, dis
                         driver_loc_array_temp[driver_loc_array_temp['driver_id'] == index].index.tolist()[0])
                 request_array_new = np.array(request_array_temp.loc[request_indexs_new])[:, :2]
                 driver_loc_array_new = np.array(driver_loc_array_temp.loc[driver_indexs_new])[:, :2]
+                itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(
+                    driver_loc_array_new, request_array_new, mode=env_params['pickup_mode'])
+
+                matched_itinerary = [itinerary_node_list, itinerary_segment_dis_list, dis_array]
+
+        # TODO: ADD NEW dispatch method
+    return matched_pair_actual_indexs, np.array(matched_itinerary)
+
+def order_dynamic_dispatch(wait_requests, driver_table, maximal_pickup_distance=950, dispatch_method='LD',
+                   method='dynamic matching'):
+
+    con_ready_to_dispatch = (driver_table['status'] == 0) | (driver_table['status'] == 4)
+    idle_driver_table = driver_table[con_ready_to_dispatch]
+    num_wait_request = wait_requests.shape[0]
+    num_idle_driver = idle_driver_table.shape[0]
+    matched_pair_actual_indexs = []
+    matched_itinerary = []
+
+    if num_wait_request > 0 and num_idle_driver > 0:
+        if dispatch_method == 'LD':
+            # generate order driver pairs and corresponding itinerary
+            request_array_temp = wait_requests.loc[:, ['origin_lng', 'origin_lat', 'order_id', 'weight']]
+            request_array = np.repeat(request_array_temp.values, num_idle_driver, axis=0)
+            driver_loc_array_temp = idle_driver_table.loc[:, ['lng', 'lat', 'driver_id']]
+            driver_loc_array = np.tile(driver_loc_array_temp.values, (num_wait_request, 1))
+            dis_array = distance_array(request_array[:, :2], driver_loc_array[:, :2])
+            # 这里需要找到权重为1的order 并将权重替换为相应的distance
+            distance_based_order_flag = request_array[:, -1] == 1
+            # 按照之前的分析 还需要用一个大数减去distance
+            request_array[distance_based_order_flag,-1] = 5000 - dis_array[distance_based_order_flag]
+
+            flag = np.where(dis_array <= maximal_pickup_distance)[0]
+            if len(flag) > 0:
+                # step 1: generate order driver pairs
+                order_driver_pair = np.vstack(
+                        [request_array[flag, 2], driver_loc_array[flag, 2], request_array[flag, 3], dis_array[flag]]).T
+                #Andrew: 二分图匹配函数入口
+                # hong-yang:修改
+                matched_pair_actual_indexs = LD(order_driver_pair.tolist(),method)
+
+            # step 2: generate itinerary
+                request_indexs = np.array(matched_pair_actual_indexs)[:, 0]
+                driver_indexs = np.array(matched_pair_actual_indexs)[:, 1]
+                request_indexs_new = []
+                driver_indexs_new = []
+                for index in request_indexs:
+                    request_indexs_new.append(
+                        request_array_temp[request_array_temp['order_id'] == int(index)].index.tolist()[0])
+                for index in driver_indexs:
+                    driver_indexs_new.append(
+                        driver_loc_array_temp[driver_loc_array_temp['driver_id'] == index].index.tolist()[0])
+                request_array_new = np.array(request_array_temp.loc[request_indexs_new])[:, :2]
+                driver_loc_array_new = np.array(driver_loc_array_temp.loc[driver_indexs_new])[:, :2]
+                # 注意：如果想要加速，那么距离计算可以换一种方法
+                # 现在方法是rg，换成ma会加速
                 itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(
                     driver_loc_array_new, request_array_new, mode=env_params['pickup_mode'])
 
@@ -674,6 +747,8 @@ def cruising(eligible_driver_table, mode):
             dest_array.append([df_neighbor_centroid.iloc[0]['centroid_lng'], df_neighbor_centroid.iloc[0]['centroid_lat']])
     
     coord_array = eligible_driver_table.loc[:, ['lng', 'lat']].values
+    # 注意：如果想要加速，那么距离计算可以换一种方法
+    # 现在方法是rg，换成ma会加速
     itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array, np.array(dest_array))
     return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
@@ -732,7 +807,6 @@ def random_actions(possible_directions):
     action = random.sample(possible_directions, 1)[0]
     return action
 
-
 # rl for matching
 # state for sarsa
 class State:
@@ -747,3 +821,43 @@ class State:
         if self.grid_id == other.grid_id and self.time_slice == other.time_slice:
             return True
         return False
+
+# 在每轮仿真结束后调用，并传入 MetricsLogger.log_rl_metrics()。
+def compute_action_counts(actions, num_agents, num_actions):
+    """
+    actions: list of int, len = num_agents
+    returns: list of list, shape = [num_agents, num_actions]
+    """
+    action_counts = [[0] * num_actions for _ in range(num_agents)]
+    for i in range(num_agents):
+        action = actions[i]
+        action_counts[i][action] += 1
+    return action_counts
+
+# 每次 agent 决策后调用 tracker.update(actions)，每轮结束后记录 tracker.get_switch_counts()。
+class StrategyTracker:
+    def __init__(self, num_agents):
+        self.num_agents = num_agents
+        self.last_actions = [None] * num_agents
+        self.switch_counts = [0] * num_agents
+
+    def update(self, current_actions):
+        for i in range(self.num_agents):
+            if self.last_actions[i] is not None and self.last_actions[i] != current_actions[i]:
+                self.switch_counts[i] += 1
+            self.last_actions[i] = current_actions[i]
+
+    def get_switch_counts(self):
+        return self.switch_counts
+
+# 每轮仿真结束后调用一次，保存为图片或记录数值。
+def plot_grid_rewards(grid_rewards, episode):
+    plt.figure(figsize=(10, 4))
+    plt.plot(range(len(grid_rewards)), grid_rewards, marker='o')
+    plt.title(f'Grid Reward Distribution - Episode {episode}')
+    plt.xlabel('Grid ID')
+    plt.ylabel('Cumulative Reward')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'reward_plot_episode_{episode}.png')
+    plt.close()

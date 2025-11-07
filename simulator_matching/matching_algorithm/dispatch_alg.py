@@ -1,7 +1,5 @@
 import numpy as np
 import pandas as pd
-import pickle
-from copy import deepcopy
 
 
 def LD(dispatch_observ,method):
@@ -40,11 +38,16 @@ def LD(dispatch_observ,method):
     initial_best_solution = np.zeros([M, N])
     if method in ['ir','rl']:
         dic_dispatch_observ.sort(key=lambda od_info: -od_info['reward_units'])
-    elif method in ['ir_d','rl_d']:
+    elif method in ['ir_d','rl_d','d_tt']:
         dic_dispatch_observ.sort(key=lambda od_info: (-od_info['reward_units'], od_info['order_driver_flag']))
     elif method in ['d','d_rl']:
         dic_dispatch_observ.sort(key=lambda od_info: (-od_info['reward_units'],-od_info['order_driver_flag']))
-    # print(dic_dispatch_observ)
+    elif method in ['tt']:
+        dic_dispatch_observ.sort(key=lambda od_info: od_info['reward_units'])
+    elif method in ['tt_d']:
+        dic_dispatch_observ.sort(key=lambda od_info: (od_info['reward_units'], od_info['order_driver_flag']))
+    elif method == 'dynamic_matching':
+        dic_dispatch_observ.sort(key=lambda od_info: -od_info['reward_units'])
 
     assigned_order = set()
     assigned_driver = set()

@@ -891,47 +891,6 @@ def airport_cruising(airport_eligible_driver_index,airport_num, driver_table,mod
                                                                                         np.array(dest_array))
     return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
-def calculate_evaluate_table_no_matched(wait_requests):
-    # 假设 env_params 已定义
-    grid_num = env_params['grid_num']  # 35
-
-    # -------------------
-    # Step 1: 分类函数
-    # -------------------
-    def classify_request(row):
-        if row['trip_time'] >= 600:
-            return 'long_req'
-        elif row['trip_time'] <= 300:
-            return 'short_req'
-        else:
-            return 'medium_req'
-
-    for df in wait_requests:
-        df['req_type'] = df.apply(classify_request, axis=1)
-
-    wait_group = wait_requests.groupby('origin_grid_id').agg(
-        total_request_num=('order_id', 'count'),
-        long_request_num=('req_type', lambda x: (x == 'long_req').sum()),
-        medium_request_num=('req_type', lambda x: (x == 'medium_req').sum()),
-        short_request_num=('req_type', lambda x: (x == 'short_req').sum())
-    ).reset_index()
-
-    wait_group['matched_long_request_num'] = 0
-    wait_group['matched_long_request_ratio'] = 0
-    wait_group['matched_medium_request_num'] = 0
-    wait_group['matched_medium_request_ratio'] = 0
-    wait_group['matched_short_request_num'] = 0
-    wait_group['matched_short_request_ratio'] = 0
-    wait_group['matched_request_ratio'] = 0
-    wait_group['matched_request_num'] = 0
-    wait_group['designed_reward'] = 0
-    wait_group['wait_time'] = 0
-    wait_group['pickup_time'] = 0
-
-    all_grids = pd.DataFrame({'origin_grid_id': range(grid_num)})
-    final_df = pd.merge(all_grids, all_grids, on='origin_grid_id', how='left').fillna(0)
-    return final_df
-
 def calculate_evaluate_table(wait_requests,df_new_matched_requests):
     # 假设 env_params 已定义
     grid_num = env_params['grid_num']  # 35

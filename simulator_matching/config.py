@@ -28,19 +28,19 @@ env_params = {
     # 'request_file_name': 'orders_grid35_2015-05-04',  
     'grid_num': 35, # 8 or 35, need to be consistent with 'request_file_name'
     'repo2any': True,#True,
-    'date': '2015-05-04',
+    'date': '2015-05-11',
     # 'driver_file_name': 'drivers_100',
     'dispatch_method': 'LD',  # LD: lagarange decomposition method designed by Peibo Duan
     # 'simulator_mode': 'toy_mode',
-    'experiment_mode': 'train',
+    'experiment_mode': 'train',# train_dynamic_matching, generate_warmup_data,train,test
     'driver_num': 200, # TODO
     'price_per_km': 5,  # $ / km
     'road_information_mode': 'load',
     'price_increasing_percentage': 0,
-    'rl_mode': 'matching',  # reposition and matching
+    'rl_mode': 'matching',  # reposition and matching,dynamic_matching
     # 'method': 'instant_reward', # 'q_learning','sarsa_no_subway','instant_reward_no_subway','dqn'   #  rl for matching
     # 我设计的method hong-yang
-    'method': 'rl', # 'ir(instant reward)','rl(reinforcement learning reward)','d(pick up distance)','ir_d','rl_d','d_rl
+    'method': 'sarsa', # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
     'reposition_method': 'random_cruise',  # A2C, A2C_global_aware, random_cruise, stay  # rl for repositioning
     'dayparting': False,
     # if true, simulator_env will compute information based on time periods in a day, e.g. 'morning', 'afternoon'
@@ -56,7 +56,7 @@ LEN_TIME_SLICE = 300  # the length of a time slice, 5 minute (300 seconds) in th
 LEN_TIME = 5 * 60 * 60  # 3 hours
 NUM_EPOCH = 3000  # 4001 / 3001
 
-FLAG_LOAD = False
+FLAG_LOAD = True
 qTable_params = dict(learning_rate=0.005, discount_rate=0.95)  # parameters in sarsa/q-learning algorithm
 #  rl for matching
 
@@ -84,12 +84,12 @@ PRE_STEP = 0
 #                    '2015-07-13', '2015-07-14', '2015-07-15', '2015-07-16', '2015-07-17'
 #                    ]
 #                    ]
-TRAIN_DATE_LIST = ['2015-05-04']
+# TRAIN_DATE_LIST = ['2015-05-04']
 # TRAIN_DATE_LIST = ['2015-05-05']
-# TRAIN_DATE_LIST = ['2015-05-04', '2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08']
+TRAIN_DATE_LIST = ['2015-05-04', '2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08']
 # TRAIN_DATE_LIST = ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08']
 
 # TEST_DATE_LIST = ['2015-05-04']
-TEST_DATE_LIST = ['2015-05-04']
+TEST_DATE_LIST = ['2015-05-11']
 # TEST_DATE_LIST = ['2015-05-11', '2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15']
 #  rl for matching

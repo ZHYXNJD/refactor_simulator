@@ -29,7 +29,7 @@ class MatchingAgent:
             self.strategy = SarsaAgent(**strategy_params)
             if flag_load and load_path:
                 self.strategy.load_parameters(load_path)
-        if strategy_type == 'rl':
+        if strategy_type in ['rl','rl_d','rl_tt','d_rl','tt_rl']:
             self.strategy = SarsaAgent(**strategy_params)
             if flag_load and load_path:
                 self.strategy.load_parameters(load_path)

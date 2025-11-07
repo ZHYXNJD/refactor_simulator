@@ -1,4 +1,7 @@
 # 导入核心类
+from copy import deepcopy
+import joblib
+from sklearn.preprocessing import StandardScaler
 from torch.utils.tensorboard import SummaryWriter
 from simulator_env import Simulator
 from pricing_agent import PricingAgent
@@ -12,19 +15,78 @@ import pickle
 import os
 import logging
 from datetime import datetime
+
+from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import MADDPG
 from simulator_matching.matching_strategy_base.DQN_torch import DQNAgent
 from simulator_matching.matching_strategy_base.Q_learning import QLearningAgent
 from simulator_matching.matching_strategy_base.sarsa import SarsaAgent
 # from simulator_matching.utilities.handle_raw_data import env_params
 # import wandb
 from config import *
+from simulator_matching.utilities import utilities
+
+
+class MetricsLogger:
+    def __init__(self, log_dir='runs/maddpg_train', num_agents=env_params['grid_num'], num_actions=3):
+        self.writer = SummaryWriter(log_dir=log_dir)
+        self.num_agents = num_agents
+        self.num_actions = num_actions
+        self.writer_dir = log_dir
+
+    def log_rl_metrics(self, total_step,episode, step_actor_losses, step_critic1_loss, step_critic2_loss,step_action_counts,step_q_pi,step_entropy):
+        """
+        记录强化学习相关指标
+        """
+        actor_losses_episode = [np.mean(step_actor_losses[i]) if step_actor_losses[i] else 0.0 for i in range(35)]
+        critic1_loss_episode = np.mean(step_critic1_loss) if step_critic1_loss else 0.0
+        critic2_loss_episode = np.mean(step_critic2_loss) if step_critic2_loss else 0.0
+        q_pi_histoty = np.mean(step_q_pi) if step_q_pi else 0.0
+        entropy_history = [np.mean(step_entropy[i]) if step_entropy[i] else 0.0 for i in range(35)]
+        action_counts = [[cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in range(35)]
+
+        self.writer.add_scalar('Critic/Critic1_Loss', critic1_loss_episode, episode)
+        self.writer.add_scalar('Critic/Critic2_Loss', critic2_loss_episode, episode)
+        self.writer.add_scalar(f'Q_pi/Q_pi', q_pi_histoty, episode)
+
+        for i in range(self.num_agents):
+            # try:
+            #     for step_index, actor_loss in enumerate(step_actor_losses[i]):
+            #         self.writer.add_scalar(f'Actor_{i}/Step_Loss', actor_loss, global_step=total_step+step_index)
+            #     for step_index, Q_pi in enumerate(step_q_pi[i]):
+            #         self.writer.add_scalar(f'Actor_{i}/Step_Loss', Q_pi,
+            #                                global_step=total_step + step_index)
+            #     for step_index, entropy in enumerate(step_entropy[i]):
+            #         self.writer.add_scalar(f'Actor_{i}/Step_Loss', entropy,
+            #                                global_step=total_step + step_index)
+            # except TypeError:
+            #     pass
+
+            self.writer.add_scalar(f'Actor_{i}/Episode_Loss', actor_losses_episode[i], episode)
+            self.writer.add_scalar(f'Actor_{i}/Episode_Entropy', entropy_history[i], episode)
+
+            for a in range(self.num_actions):
+                self.writer.add_scalar(f'Actor_{i}/Episode_Action_{a}_Freq', action_counts[i][a], episode)
+
+
+    def log_env_metrics(self, episode, total_reward):
+        """
+        记录环境反馈指标
+        """
+        self.writer.add_scalar('Env/Total_Reward', total_reward, episode)
+        # self.writer.add_scalar('Env/Match_Rate', match_rate, episode)
+        # self.writer.add_scalar('Env/Avg_Wait_Time', avg_wait_time, episode)
+        # self.writer.add_scalar('Env/Occupancy_Rate', occupancy_rate, episode)
+
+    def close(self):
+        self.writer.close()
 
 # SimulatorTrainer: Andrew
 class SimulatorTrainer:
-    def __init__(self, simulator: Simulator, pricing_agent: PricingAgent, matching_agent: MatchingAgent):
+    def __init__(self, simulator: Simulator, pricing_agent: PricingAgent, matching_agent: MatchingAgent,dynamic_matching_agent: MADDPG,):
         self.simulator = simulator
         self.pricing_agent = pricing_agent
         self.matching_agent = matching_agent
+        self.dynamic_matching_agent = dynamic_matching_agent
         
         # 指定日志文件夹
         if isinstance(self.matching_agent, SarsaAgent):
@@ -60,6 +122,7 @@ class SimulatorTrainer:
         self.evaluate_table = None
         self.driver_num = None
 
+
     def log_epoch_metrics(self, epoch, duration, simulator: Simulator):
         """
         Log the metrics for a given epoch.
@@ -88,8 +151,6 @@ class SimulatorTrainer:
         # self.matching_refactor.log({"Total reward": simulator.total_reward})
         # self.matching_refactor.log({"Occupancy rate": simulator.occupancy_rate})
         # self.matching_refactor.log({"Matching rate": simulator.matched_requests_num / simulator.total_request_num})
-
-
 
     def run_training_epoch(self,epoch, train_config, writer):
         """
@@ -131,6 +192,69 @@ class SimulatorTrainer:
         # Log metrics
         # self.log_epoch_metrics(epoch, metrics['epoch_duration'], self.simulator)
         return metrics
+
+    def run_training_epoch_match_method(self,epoch, train_config,logger):
+        """
+        Run a single training epoch.
+        :param epoch: Current epoch number.
+        :param train_config: Training configuration dictionary.
+        :logger: personalized logger.
+        """
+
+
+        # Set up simulator for this epoch
+        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        self.simulator.reset()
+        # Run the simulation
+
+        self.simulator.dynamic_matching_agent.actor_losses_history = [[] for _ in range(35)]  # per-agent step-level list
+        self.simulator.dynamic_matching_agent.critic_losses_history = []  # step-level list
+
+        self.simulator.dynamic_matching_agent.q_pi_history = []
+        self.simulator.dynamic_matching_agent.entropy_history = [[] for _ in range(35)]
+
+        self.simulator.dynamic_matching_agent.critic1_losses_history = []
+        self.simulator.dynamic_matching_agent.critic2_losses_history = []
+
+        self.simulator.dynamic_matching_agent.actor_counts = [[0] * 3 for _ in range(35)]
+
+
+        for step in range(self.simulator.finish_run_step+1):
+            # TODO: Implement RL agent logic here
+            self.simulator.rl_step_train_matching_method()
+
+        self.simulator.dynamic_matching_agent.current_episode += 1
+
+        print(f"Epoch: {epoch}/{train_config['num_epochs']} | Total Reward: {self.simulator.total_reward}")
+
+        step_actor_losses = self.simulator.dynamic_matching_agent.actor_losses_history
+        # step_critic_loss = self.simulator.dynamic_matching_agent.critic_losses_history
+        step_critic1_loss = self.simulator.dynamic_matching_agent.critic1_losses_history
+        step_critic2_loss = self.simulator.dynamic_matching_agent.critic2_losses_history
+        step_q_pi = self.simulator.dynamic_matching_agent.q_pi_history
+        step_entropy = self.simulator.dynamic_matching_agent.entropy_history
+
+        # compute action frequencies (normalize)
+        step_action_counts = self.simulator.dynamic_matching_agent.actor_counts
+        # record this episode's action frequency
+        self.simulator.dynamic_matching_agent.last_action_freq = [[cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in range(35)]
+
+        # strategy switch counts
+        switch_counts = self.simulator.dynamic_matching_agent.strategy_tracker.get_switch_counts()
+
+        # log to TensorBoard via logger
+
+        logger.log_rl_metrics(self.total_step,epoch, step_actor_losses, step_critic1_loss,step_critic2_loss, step_action_counts,step_q_pi,step_entropy)
+        logger.log_env_metrics(epoch, self.simulator.total_reward)
+
+        self.total_step += len(step_actor_losses[0])
+
+
+        # log strategy switches and grid_rewards
+
+        for i in range(env_params['grid_num']):
+            logger.writer.add_scalar(f'Strategy/Agent_{i}_Switches', switch_counts[i], epoch)
+        # logger.writer.add_histogram('Grid/Rewards', np.array(self.simulator.total_reward_by_grid.values), epoch)  # or log values per grid
 
     def save_training_results(self, simulator_record, total_reward_record, output_path, epoch, save_interval=200):
         """
@@ -186,7 +310,6 @@ class SimulatorTrainer:
                 )
 
             # 打印一些日志方便在终端查看进度
-            # if (epoch + 1) % train_config.get('log_interval', 10) == 0:
             print(f"Epoch {epoch + 1}/{train_config['num_epochs']} | Total Reward: {metrics['total_reward']:.2f}")
 
             if epoch % 50 == 0:
@@ -195,7 +318,20 @@ class SimulatorTrainer:
                 else:
                     self.simulator.matching_agent.strategy.save_parameters(train_config['output_path'], epoch,self.driver_num)
 
+    def dynamic_matching_train(self, train_config):
+        self.driver_num = train_config['driver_num']
+        write_path = train_config['output_path'] + '/' + str(self.driver_num)
+        if not os.path.exists(write_path):
+            os.makedirs(write_path)
+        writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
+        logger = MetricsLogger(log_dir=writer_filename,num_agents=env_params['grid_num'], num_actions=3)
 
+        for epoch in range(train_config['num_epochs']):
+            # Run a single training epoch
+            self.run_training_epoch_match_method(epoch, train_config,logger)
+            if epoch % 50 == 0:
+                self.simulator.dynamic_matching_agent.save(train_config['output_path'], epoch,
+                                                                           self.driver_num)
     def accumulate_metrics(self, simulator: Simulator):
         """
         Accumulate metrics for one test run.
@@ -235,8 +371,13 @@ class SimulatorTrainer:
             print(f"method:{simulator.method},test date: {date},driver_num: {env_params['driver_num']},order sample ratio:{env_params['order_sample_ratio']},")
             simulator.reset()
             simulator.experiment_date = date
-            for step in range(simulator.finish_run_step):
-                simulator.rl_step()
+            if simulator.method != 'dynamic_matching':
+                for step in range(simulator.finish_run_step):
+                    simulator.rl_step()
+            else:
+                simulator.dynamic_matching_agent.load(path='./output_dynamic_match/100/epoch_300.pt')
+                for step in range(simulator.finish_run_step):
+                    simulator.rl_step_test_dynamic()
             metrics = self.accumulate_metrics(simulator)
             for k,v in metrics.items():
                 print(f"{k}:{v}")
@@ -370,3 +511,133 @@ class SimulatorTrainer:
         可视化
         """
         self.simulator.render()
+
+    def generate_warmup_data(self,train_config):
+
+        # --- 1. 设置 ---
+        N_WARMUP_EPOCHS = 70
+        N_WARMUP_TRANSITIONS = N_WARMUP_EPOCHS*int((self.simulator.t_end-self.simulator.t_initial)/self.simulator.AGENT_DECISION_FREQUENCY)
+        warmup_states = []  # 用于拟合 Scaler
+        self.driver_num = train_config['driver_num']
+        write_path = 'dynamic_matching_algorithm/warmup_transitions'
+        if not os.path.exists(write_path):
+            os.makedirs(write_path)
+
+        for epoch in range(N_WARMUP_EPOCHS):
+            self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+            self.simulator.reset()
+            simulator = self.simulator
+            buffer = simulator.dynamic_matching_agent.buffer
+            # Run the simulation
+            for step in range(simulator.finish_run_step + 1):
+                # --- 1. Agent 决策与数据存储 (每 15 分钟执行一次) ---
+                # self.time为仿真的时间； AGENT_DECISION_FREQUENCY为rl的决策间隔
+                if simulator.time % simulator.AGENT_DECISION_FREQUENCY == 0:
+                    # --- A. 存储上一个 15 分钟的 (S_k, A_k, R_sum, S_k+1) ---
+                    # (跳过第一次, 因为那时还没有 S_k)
+                    if simulator.state_at_decision_time is not None:
+                        s0 = simulator.state_at_decision_time
+                        # 获取 S_k+1 (当前状态)
+                        s1 = simulator.get_global_state()
+
+                        reward = (simulator.reward_by_grid_df / 100).values.tolist()
+
+                        # 存储15分钟的聚合数据
+                        simulator.dynamic_matching_agent.buffer.push(s0,
+                                                                simulator.held_action_tuple[0],  # a
+                                                                simulator.held_action_tuple[1],  # log_a
+                                                                reward,
+                                                                s1,
+                                                                [1 if simulator.time == simulator.t_end else 0] * env_params['grid_num'])
+
+                        warmup_states.append(s0)
+
+                        if simulator.time == simulator.t_end:
+                            break
+
+                    # --- B. 为下一个 15 分钟获取新动作 A_k+1 ---
+
+                    # 获取 S_k (当前状态)
+                    matching_state_current = simulator.get_global_state()
+
+                    # print(f"--- Agent 决策 (decision interval {self.calculate_current_time_slice()}) ---")
+
+                    # 存储 S_k, 用于 15 分钟后
+                    simulator.state_at_decision_time = matching_state_current
+
+                    actions = np.random.choice([0, 1, 2], size=35, replace=True)
+                    log_probs = [-1.098612 for _ in range(35)]
+
+                    simulator.held_action_tuple = (actions, log_probs)
+
+                    # 重置 5 分钟的奖励累加器
+                    simulator.reward_by_grid_df = pd.Series(data=np.zeros(env_params['grid_num']))
+
+                # Step 1: order dispatching
+                wait_requests = deepcopy(simulator.wait_requests)
+                # print("--------------------wait_requests----------------:",wait_requests.shape[0])
+                driver_table = deepcopy(simulator.driver_table)
+
+                # use RL's decision as the input
+                # 应该在抽取新订单时做修改
+                matched_pair_actual_indexes, matched_itinerary = utilities.order_dynamic_dispatch(wait_requests, driver_table,
+                                                                                        simulator.maximal_pickup_distance,
+                                                                                        simulator.dispatch_method,
+                                                                                        simulator.method)
+                # Step 2: driver/passenger reaction after dispatching
+                df_new_matched_requests, df_update_wait_requests = simulator.update_info_after_matching_multi_process(
+                    matched_pair_actual_indexes, matched_itinerary)
+
+                if len(df_new_matched_requests) != 0:
+                    # TODO: pricing
+                    simulator.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
+                else:
+                    simulator.total_reward += 0
+                    # Update matched requests count
+
+                # RL agent reward
+                matched_requests_by_grid = df_new_matched_requests.groupby('origin_grid_id')['designed_reward'].sum()
+                matched_requests_li = matched_requests_by_grid.reindex([i for i in range(env_params['grid_num'])],
+                                                                       fill_value=0)
+                simulator.total_reward_by_grid += matched_requests_li  # 不清零 作为平台的累计收益
+                simulator.reward_by_grid_df += matched_requests_li
+
+                simulator.matched_requests_num += len(df_new_matched_requests)
+
+                # TJ
+                if simulator.end_of_episode == 0:
+                    simulator.matched_requests = pd.concat([simulator.matched_requests, df_new_matched_requests], axis=0)
+                    simulator.matched_requests = simulator.matched_requests.reset_index(drop=True)
+                    simulator.wait_requests = df_update_wait_requests.reset_index(drop=True)
+                    simulator.step_bootstrap_new_orders(self.matching_agent)
+
+                # Step 5: update next state for drivers
+                simulator.update_state()
+                # Step 6： online/offline update()
+                simulator.driver_online_offline_update()
+                # Step 7: update time
+                simulator.update_time()
+            print(f"Epoch: {epoch}/{N_WARMUP_EPOCHS} | Total Reward: {self.simulator.total_reward}")
+
+            print(f"--- 当前收集状态: {len(buffer)} | {N_WARMUP_TRANSITIONS} 热启动数据... ---")
+
+
+        # --- 3. 拟合 Scaler ---
+        print("--- 正在拟合 StandardScaler... ---")
+        scaler = StandardScaler()
+        scaler.fit(np.array(warmup_states))
+        print("--- Scaler 拟合完毕 ---")
+
+        # --- 4. 保存到文件 ---
+        # (可选) 保存 Buffer 数据
+        # (如果你的 Buffer 易于 pickle，可以直接保存)
+        # with open('warmup_buffer.pkl', 'wb') as f:
+        #     pickle.dump(buffer, f)
+        # (更通用的方法是保存 transitions 列表，在主代码中加载)
+        with open(write_path+f'/driver_{self.driver_num}_data_{N_WARMUP_TRANSITIONS}.pkl', 'wb') as f:
+            pickle.dump(list(buffer.buffer), f)  # 假设 buffer.buffer 是你的deque
+
+        # **(关键)** 保存拟合好的 Scaler
+        joblib.dump(scaler, write_path+f'/driver_{self.driver_num}_data_{N_WARMUP_TRANSITIONS}_state_scaler.pkl')
+
+        print("--- 热启动数据和 Scaler 已保存！ ---")
