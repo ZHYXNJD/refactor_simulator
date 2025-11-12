@@ -12,9 +12,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
-
 from simulator_matching.utilities.utilities import StrategyTracker
-
 # -----------------------
 # Utilities / Replay
 # -----------------------
@@ -109,6 +107,8 @@ class MADDPG:
         self,
         obs_dims,            # list of obs dims per agent
         n_actions,           # list of action counts per agent
+        date,
+        driver_num,
         actor_hidden=[32,32],
         critic_hidden=[64,64],
         lr_actor=1e-4,
@@ -119,10 +119,11 @@ class MADDPG:
         batch_size=256,
         device=None,
         seed = 42,
-        load_offline_warmup = False,  # <-- 新增一个控制开关
-        warmup_data_file = './dynamic_matching_algorithm/warmup_transitions/driver_100_data_2100.pkl',
-        scaler_file = './dynamic_matching_algorithm/warmup_transitions/driver_100_data_2100_state_scaler.pkl'
+        # 必须热启动 以节约时间
+        load_offline_warmup = True,  # <-- 新增一个控制开关
     ):
+        warmup_data_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data.pkl"
+        scaler_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data_state_scaler.pkl"
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.n = len(obs_dims)
         self.n_actions = n_actions
@@ -233,15 +234,19 @@ class MADDPG:
         Stochastic: if true, it means we use this function to generate random actions
         returns: actions (list of int), log_probs (list of float)
         """
+        device = self.device
         actions = []
         log_probs = []
-        # Convert global_state to tensor
+
+        # Convert global_state to tensor on correct device
         if not isinstance(global_state, torch.Tensor):
-            global_state = torch.tensor(global_state, dtype=torch.float32, device=self.device)
+            global_state = torch.as_tensor(global_state, dtype=torch.float32, device=device)
+        else:
+            global_state = global_state.to(device)
 
         for i in range(self.n):
             # One-hot encode grid ID
-            grid_onehot = F.one_hot(torch.tensor(i), num_classes=self.n).float().to(self.device)  # [n]
+            grid_onehot = F.one_hot(torch.tensor(i, device=device), num_classes=self.n).float()
 
             # 拼接 global_state + grid_onehot
             agent_input = torch.cat([global_state, grid_onehot], dim=-1).unsqueeze(0)  # [1, state_dim + n]
@@ -251,11 +256,12 @@ class MADDPG:
 
             if deterministic:
                 act = int(torch.argmax(logits).item())
-                logp = torch.tensor(0)
+                logp = 0.0
             else:
                 dist = torch.distributions.Categorical(logits=logits)
                 act = int(dist.sample().item())
-                logp = float(dist.log_prob(torch.tensor(act)).item())
+                act_tensor = torch.as_tensor(act, device=device)  # 保证 act 在 GPU
+                logp = float(dist.log_prob(act_tensor).item())
 
             # update per-step accumulators
             self.actor_counts[i][act] += 1
@@ -263,6 +269,7 @@ class MADDPG:
 
             actions.append(act)
             log_probs.append(logp)
+
         # update strategy tracker (track switches immediately)
         self.strategy_tracker.update(actions)
 
@@ -439,7 +446,8 @@ class MADDPG:
 
         state = {
             'actors': [a.state_dict() for a in self.actors],
-            'crit': self.critic1.state_dict()
+            'crit1': self.critic1.state_dict(),
+            'crit2': self.critic1.state_dict()
 
         }
         torch.save(state, file_path)
@@ -448,13 +456,13 @@ class MADDPG:
         state = torch.load(path, map_location=self.device)
         for a, st in zip(self.actors, state['actors']):
             a.load_state_dict(st)
-        self.critic1.load_state_dict(state['crit'])
-        self.critic2.load_state_dict(state['crit'])
+        self.critic1.load_state_dict(state['crit1'])
+        self.critic2.load_state_dict(state['crit2'])
         # update targets
         for i in range(self.n):
             self.target_actors[i].load_state_dict(self.actors[i].state_dict())
         self.target_critic2.load_state_dict(self.critic1.state_dict())
-        self.target_critic1.load_state_dict(self.critic1.state_dict())
+        self.target_critic1.load_state_dict(self.critic2.state_dict())
 
     def compute_actor_loss(self, i, logp, entropy, advantage, episode,max_episode=301):
         """

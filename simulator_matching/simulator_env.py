@@ -1,17 +1,12 @@
 from copy import deepcopy
-
-import numpy as np
 import pandas as pd
-from pymongo.message import update
-
 from pricing_agent import PricingAgent
 from matching_agent import MatchingAgent
 from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import *
 from simulator_matching.utilities.utilities import road_network, sample_all_drivers, route_generation_array, State, \
-    cruising, order_dispatch, order_dynamic_dispatch
+    cruising, order_dispatch
 from simulator_pattern import *
-from simulator_pricing.utilities.utilities import driver_online_offline_decision, calculate_evaluate_table
-np.warnings.filterwarnings('ignore', category=np.VisibleDeprecationWarning)
+from simulator_matching.utilities.utilities import driver_online_offline_decision, calculate_evaluate_table
 from config import qTable_params
 
 class Simulator:
@@ -117,17 +112,15 @@ class Simulator:
             self.reposition_method = kwargs['reposition_method']  # rl for repositioning
 
         self.AGENT_DECISION_FREQUENCY = 10 * 60  # 后期把这个参数改为可以调整的
+        pattern = SimulatorPattern(kwargs['date'])
+        self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
+        self.driver_info = pattern.driver_info
 
     def initial_base_tables(self):
         """
         This function used to initial the driver table and order table
         :return: None
         """
-        pattern = SimulatorPattern(self.experiment_date)
-        self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
-        self.driver_info = pattern.driver_info
-        self.driver_info['grid_id'] = self.driver_info['grid_id'].values.astype(int)
-
         self.time = deepcopy(self.t_initial)
         self.current_step = int((self.time - self.t_initial) // self.delta_t)
         self.grid_value = {}
@@ -147,9 +140,9 @@ class Simulator:
         # request_list = []
         # for i in range(env_params['t_initial'], env_params['t_end']):
         #     request_list.extend(self.request_databases[i])
-        request_columns = ['order_id', 'origin_id', 'origin_lat', 'origin_lng', 'dest_id', 'dest_lat', 'dest_lng',
-                          'trip_distance', 'start_time', 'origin_grid_id', 'dest_grid_id', 'itinerary_node_list',
-                          'itinerary_segment_dis_list', 'trip_time', 'designed_reward', 'cancel_prob']
+        # request_columns = ['order_id', 'origin_id', 'origin_lat', 'origin_lng', 'dest_id', 'dest_lat', 'dest_lng',
+        #                   'trip_distance', 'start_time', 'origin_grid_id', 'dest_grid_id', 'itinerary_node_list',
+        #                   'itinerary_segment_dis_list', 'trip_time', 'designed_reward', 'cancel_prob']
         # self.requests = pd.DataFrame(request_list, columns=request_columns)
         # self.requests = pd.DataFrame(request_list, columns=request_columns+['col1','col2'])
         # self.requests = pd.DataFrame(request_list, columns=request_columns+['col1','col2'])
@@ -218,7 +211,7 @@ class Simulator:
         self.reward_by_grid_df = pd.Series(data=np.zeros((env_params['grid_num'])))
         # 初始化为instant method
         # 0 instant | 1 pickup distance | 2 RL
-        self.held_action_tuple = ([0 for i in range(env_params['grid_num'])],[0 for i in range(env_params['grid_num'])])
+        self.held_action_tuple = ([0]* int(env_params['grid_num']),[0] * int(env_params['grid_num']))
 
 
     def reset(self):
@@ -453,23 +446,26 @@ class Simulator:
                 # 假如训练集比较小 只有一天的数据  那么就不固定随机种子
                 # 假如训练集比较大 可以抽取多天的数据  那么这里就固定随机种子
                 # lol
-                np.random.seed(42)
+                # np.random.seed(42)
                 sampled_request_index = np.random.choice(database_size, num_request, replace=False).tolist()
-                sampled_requests = [temp_request[index] for index in sampled_request_index if temp_request[index][0]!=167124]
+                sampled_requests = [temp_request[index] for index in sampled_request_index]
             else:
                 sampled_requests = temp_request
             weight_array = np.ones(len(sampled_requests))  # rl for matching
             column_name = ['order_id', 'origin_id', 'origin_lat', 'origin_lng', 'dest_id', 'dest_lat', 'dest_lng',
                            'trip_distance', 'start_time', 'origin_grid_id', 'dest_grid_id', 'itinerary_node_list',
-                           'itinerary_segment_dis_list', 'trip_time', 'designed_reward', 'cancel_prob','total_distance']
+                           'itinerary_segment_dis_list', 'trip_time', 'designed_reward', 'cancel_prob']
             if len(sampled_requests) > 0:
                 wait_info = pd.DataFrame(sampled_requests, columns=column_name)
                 # wait_info['itinerary_node_list'] = list(map(lambda x: x[0], sampled_requests_array[:, 11]))
                 # wait_info['itinerary_segment_dis_list'] = list(map(lambda x: x[0], sampled_requests_array[:, 12]))
-                wait_info['itinerary_node_list'] = np.array(sampled_requests)[:, 11]
-                wait_info['itinerary_segment_dis_list'] = np.array(sampled_requests)[:, 12]
+                # wait_info['itinerary_node_list'] = np.array(sampled_requests)[:, 11]
+                wait_info['itinerary_node_list'] = [req[11] for req in sampled_requests]
+                # wait_info['itinerary_segment_dis_list'] = np.array(sampled_requests)[:, 12]
+                wait_info['itinerary_segment_dis_list'] = [req[12] for req in sampled_requests]
                 wait_info['start_time'] = self.time
-                wait_info['trip_distance'] = np.array(sampled_requests)[:, 7]
+                # wait_info['trip_distance'] = np.array(sampled_requests)[:, 7]
+                wait_info['trip_distance'] = [req[7] for req in sampled_requests]
                 wait_info['trip_time'] = wait_info['trip_distance'] / self.vehicle_speed * 3600
                 wait_info['designed_reward'] = 2.5 + 0.5 * (
                         (wait_info['trip_distance'] * 1000 - 322).clip(lower=0) / 322
@@ -556,15 +552,12 @@ class Simulator:
 
                 elif self.rl_mode == 'dynamic_matching':
 
-                    current_time_slice = int((self.time - self.t_initial - 1) / LEN_TIME_SLICE)
-                    num_slices = int(LEN_TIME / LEN_TIME_SLICE)
-
                     for i, (travel_time, reward, dest_grid_id,origin_grid_id) in enumerate(zip(
                             wait_info['trip_time'].values.tolist(),
                             wait_info['designed_reward'].values.tolist(),
                             wait_info['dest_grid_id'].values.tolist(),
                             wait_info['origin_grid_id'])):
-                        matching_method = self.held_action_tuple[0][origin_grid_id]
+                        matching_method = self.held_action_tuple[0][int(origin_grid_id)]
                         if matching_method == 0: # instant reward
                             weight_array[i] = reward
                         elif matching_method == 1: # pickup distance
@@ -573,9 +566,9 @@ class Simulator:
                             # 需要在order dynamic dispatch中找到这些order 并将权重替换为相应的distance
                             pass
                         else: # RL
-
+                            current_time_slice = int((self.time - self.t_initial - 1) / LEN_TIME_SLICE)
+                            num_slices = int(LEN_TIME / LEN_TIME_SLICE)
                             end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / LEN_TIME_SLICE)
-
                             if end_time_slice >= num_slices:
                                 original_trip_score = reward
                             else:
@@ -590,7 +583,6 @@ class Simulator:
                 wait_info['status'] = 0
                 # Andrew: 司机和乘客最大等待时间
                 wait_info['maximum_wait_time'] = self.maximum_wait_time_mean
-                np.random.seed(42)
                 wait_info['maximum_price_passenger_can_tolerate'] = np.random.normal(
                     env_params['maximum_price_passenger_can_tolerate_mean'],
                     env_params['maximum_price_passenger_can_tolerate_std'],
@@ -598,7 +590,6 @@ class Simulator:
                 wait_info = wait_info[
                     wait_info['maximum_price_passenger_can_tolerate'] >= wait_info['trip_distance'] * env_params[
                         'price_per_km']]
-                np.random.seed(42)
                 wait_info['maximum_pickup_time_passenger_can_tolerate'] = np.random.normal(
                     env_params['maximum_pickup_time_passenger_can_tolerate_mean'],
                     env_params['maximum_pickup_time_passenger_can_tolerate_std'],
@@ -832,13 +823,19 @@ class Simulator:
             int)
         self.driver_table.loc[
             road_node_transfer_list, 'remaining_time_for_current_node'] = new_remaining_time_for_node_array
-        if self.current_step != 31:
-            lng_array, lat_array, grid_id_array = self.RN.get_information_for_nodes(new_road_node_array)
-            self.driver_table.loc[road_node_transfer_list, 'lng'] = lng_array
-            self.driver_table.loc[road_node_transfer_list, 'lat'] = lat_array
-            self.driver_table.loc[road_node_transfer_list, 'grid_id'] = grid_id_array
-        else:
-            lng_array, lat_array, grid_id_array = self.RN.get_information_for_nodes(new_road_node_array)
+
+        lng_array, lat_array, grid_id_array = self.RN.get_information_for_nodes(new_road_node_array)
+        self.driver_table.loc[road_node_transfer_list, 'lng'] = lng_array
+        self.driver_table.loc[road_node_transfer_list, 'lat'] = lat_array
+        self.driver_table.loc[road_node_transfer_list, 'grid_id'] = grid_id_array
+
+        # if self.current_step != 31:
+        #     lng_array, lat_array, grid_id_array = self.RN.get_information_for_nodes(new_road_node_array)
+        #     self.driver_table.loc[road_node_transfer_list, 'lng'] = lng_array
+        #     self.driver_table.loc[road_node_transfer_list, 'lat'] = lat_array
+        #     self.driver_table.loc[road_node_transfer_list, 'grid_id'] = grid_id_array
+        # else:
+        #     lng_array, lat_array, grid_id_array = self.RN.get_information_for_nodes(new_road_node_array)
 
         # for all the finished tasks
         self.driver_table.loc[loc_finished & (~ loc_pickup), 'remaining_time'] = 0
@@ -1286,7 +1283,7 @@ class Simulator:
             # print("Shape:", self.dispatch_transitions_buffer[0].shape, self.dispatch_transitions_buffer[1].shape,
             #       self.dispatch_transitions_buffer[2].shape, self.dispatch_transitions_buffer[3].shape)
             if self.dispatch_transitions_buffer[0].shape[0]>0:
-                step_loss = self.matching_agent.update(self.dispatch_transitions_buffer,self.current_step)  # Andrew
+                step_loss = self.matching_agent.update(self.dispatch_transitions_buffer)  # Andrew
         # return self.dispatch_transitions_buffer  # rl for matching
         return step_loss
 
@@ -1360,7 +1357,7 @@ class Simulator:
 
         # use RL's decision as the input
         # 应该在抽取新订单时做修改
-        matched_pair_actual_indexes, matched_itinerary = order_dynamic_dispatch(wait_requests, driver_table,
+        matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
                                                                         self.dispatch_method, self.method)
         # Step 2: driver/passenger reaction after dispatching

@@ -1,12 +1,9 @@
 from matching_strategy_base.sarsa import SarsaAgent
 from matching_strategy_base.Q_learning import QLearningAgent
-# from matching_strategy_base.DQN import DQNAgent
 from matching_strategy_base.DQN_torch import DQNAgent
-import numpy as np
-from simulator_matching.matching_algorithm.dispatch_alg import LD
+from matching_strategy_base.DP import DpValueAgent
 from simulator_matching.matching_strategy_base.Rainbow_DQN.Rainbow_DQN_main import dqn_agent
-from simulator_matching.matching_strategy_base.Rainbow_DQN.rainbow_dqn import DQN
-from simulator_matching.utilities.utilities import distance_array, order_dispatch
+from simulator_matching.utilities.utilities import order_dispatch
 
 
 class MatchingAgent:
@@ -29,7 +26,11 @@ class MatchingAgent:
             self.strategy = SarsaAgent(**strategy_params)
             if flag_load and load_path:
                 self.strategy.load_parameters(load_path)
-        if strategy_type in ['rl','rl_d','rl_tt','d_rl','tt_rl']:
+        elif strategy_type == 'dp':
+            self.strategy = DpValueAgent()
+            if flag_load and load_path:
+                self.strategy.load_parameters(load_path)
+        elif strategy_type in ['rl','rl_d','rl_tt','d_rl','tt_rl']:
             self.strategy = SarsaAgent(**strategy_params)
             if flag_load and load_path:
                 self.strategy.load_parameters(load_path)
@@ -77,7 +78,7 @@ class MatchingAgent:
 
         return matched_pair_actual_indexs,matched_itinerary
 
-    def update(self, transitions,total_steps):
+    def update(self, transitions):
         """
         Update the agent's strategy based on the feedback from the environment.
         :param transitions: Feedback data for updating the strategy.
@@ -85,10 +86,6 @@ class MatchingAgent:
         step_loss = None
         if self.strategy:
             self.strategy.perceive(transitions)
-            # replay_buffer = self.strategy.replay_buffer
-            # replay_buffer.perceive(transitions)
-            # if replay_buffer.current_size >= self.strategy.agent.batch_size:
-            #     step_loss = self.strategy.agent.learn(replay_buffer,total_steps)
 
         else:
             raise RuntimeError("No strategy initialized in MatchingAgent")

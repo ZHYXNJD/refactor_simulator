@@ -13,27 +13,19 @@ import pandas as pd
 import time
 import pickle
 import os
-import logging
 from datetime import datetime
-
 from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import MADDPG
-from simulator_matching.matching_strategy_base.DQN_torch import DQNAgent
-from simulator_matching.matching_strategy_base.Q_learning import QLearningAgent
-from simulator_matching.matching_strategy_base.sarsa import SarsaAgent
-# from simulator_matching.utilities.handle_raw_data import env_params
-# import wandb
 from config import *
 from simulator_matching.utilities import utilities
 
 
 class MetricsLogger:
-    def __init__(self, log_dir='runs/maddpg_train', num_agents=env_params['grid_num'], num_actions=3):
+    def __init__(self, log_dir, num_agents=env_params['grid_num'], num_actions=3):
         self.writer = SummaryWriter(log_dir=log_dir)
         self.num_agents = num_agents
         self.num_actions = num_actions
-        self.writer_dir = log_dir
 
-    def log_rl_metrics(self, total_step,episode, step_actor_losses, step_critic1_loss, step_critic2_loss,step_action_counts,step_q_pi,step_entropy):
+    def log_rl_metrics(self,episode, step_actor_losses, step_critic1_loss, step_critic2_loss,step_action_counts,step_q_pi,step_entropy):
         """
         记录强化学习相关指标
         """
@@ -87,36 +79,6 @@ class SimulatorTrainer:
         self.pricing_agent = pricing_agent
         self.matching_agent = matching_agent
         self.dynamic_matching_agent = dynamic_matching_agent
-        
-        # 指定日志文件夹
-        if isinstance(self.matching_agent, SarsaAgent):
-            log_dir = 'matching_train_logs_sarsa'
-        elif isinstance(self.matching_agent, DQNAgent):
-            log_dir = 'matching_train_logs_dqn'
-        elif isinstance(self.matching_agent, QLearningAgent):
-            log_dir = 'matching_train_logs_qlearning'
-        else:
-            log_dir = 'matching_train_logs'
-        # 如果日志文件夹不存在，则创建
-        if not os.path.exists(log_dir):
-            os.makedirs(log_dir)
-        # 动态生成日志文件名，并包含文件夹路径
-        log_filename = os.path.join(log_dir, datetime.now().strftime('training_%Y%m%d_%H%M%S.log'))
-        # 配置日志记录
-        logging.basicConfig(
-            filename=log_filename,  # 日志文件名
-            level=logging.INFO,        # 日志级别
-            format='%(asctime)s - %(levelname)s - %(message)s',  # 日志格式
-            datefmt='%Y-%m-%d %H:%M:%S'  # 日期格式
-        )
-        self.logger = logging.getLogger(__name__)
-
-        # 初始化 Weights & Biases
-        # wandb.login()
-        # self.matching_refactor = wandb.init(project="simulator_matching_refactor",
-        #                                config={"method": "sarsa_no_subway",
-        #                                        "driver_num": 200,
-        #                                        "EPOCH":4001},)
 
         self.total_step = 0
         self.evaluate_table = None
@@ -168,7 +130,8 @@ class SimulatorTrainer:
         }
 
         # Set up simulator for this epoch
-        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        # self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        self.simulator.experiment_date = train_config['train_dates']
         self.simulator.reset()
 
         # Run the simulation
@@ -203,7 +166,7 @@ class SimulatorTrainer:
 
 
         # Set up simulator for this epoch
-        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        self.simulator.experiment_date = train_config['train_dates']
         self.simulator.reset()
         # Run the simulation
 
@@ -244,7 +207,7 @@ class SimulatorTrainer:
 
         # log to TensorBoard via logger
 
-        logger.log_rl_metrics(self.total_step,epoch, step_actor_losses, step_critic1_loss,step_critic2_loss, step_action_counts,step_q_pi,step_entropy)
+        logger.log_rl_metrics(epoch, step_actor_losses, step_critic1_loss,step_critic2_loss, step_action_counts,step_q_pi,step_entropy)
         logger.log_env_metrics(epoch, self.simulator.total_reward)
 
         self.total_step += len(step_actor_losses[0])
@@ -313,10 +276,7 @@ class SimulatorTrainer:
             print(f"Epoch {epoch + 1}/{train_config['num_epochs']} | Total Reward: {metrics['total_reward']:.2f}")
 
             if epoch % 50 == 0:
-                if self.simulator.matching_agent.strategy =='new_dqn':
-                    self.simulator.matching_agent.strategy.agent.save_model(train_config['output_path'], epoch)
-                else:
-                    self.simulator.matching_agent.strategy.save_parameters(train_config['output_path'], epoch,self.driver_num)
+                self.simulator.matching_agent.strategy.save_parameters(train_config['output_path'], epoch,self.driver_num)
 
     def dynamic_matching_train(self, train_config):
         self.driver_num = train_config['driver_num']
@@ -519,15 +479,16 @@ class SimulatorTrainer:
         N_WARMUP_TRANSITIONS = N_WARMUP_EPOCHS*int((self.simulator.t_end-self.simulator.t_initial)/self.simulator.AGENT_DECISION_FREQUENCY)
         warmup_states = []  # 用于拟合 Scaler
         self.driver_num = train_config['driver_num']
-        write_path = 'dynamic_matching_algorithm/warmup_transitions'
+        write_path = f"dynamic_matching_algorithm/warmup_transitions/{train_config['train_dates']}/{train_config['driver_num']}"
         if not os.path.exists(write_path):
             os.makedirs(write_path)
 
         for epoch in range(N_WARMUP_EPOCHS):
-            self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+            self.simulator.experiment_date = train_config['train_dates']
             self.simulator.reset()
             simulator = self.simulator
             buffer = simulator.dynamic_matching_agent.buffer
+            simulator.dynamic_matching_agent.load_offline_warmup = False
             # Run the simulation
             for step in range(simulator.finish_run_step + 1):
                 # --- 1. Agent 决策与数据存储 (每 15 分钟执行一次) ---
@@ -580,7 +541,7 @@ class SimulatorTrainer:
 
                 # use RL's decision as the input
                 # 应该在抽取新订单时做修改
-                matched_pair_actual_indexes, matched_itinerary = utilities.order_dynamic_dispatch(wait_requests, driver_table,
+                matched_pair_actual_indexes, matched_itinerary = utilities.order_dispatch(wait_requests, driver_table,
                                                                                         simulator.maximal_pickup_distance,
                                                                                         simulator.dispatch_method,
                                                                                         simulator.method)
@@ -634,10 +595,10 @@ class SimulatorTrainer:
         # with open('warmup_buffer.pkl', 'wb') as f:
         #     pickle.dump(buffer, f)
         # (更通用的方法是保存 transitions 列表，在主代码中加载)
-        with open(write_path+f'/driver_{self.driver_num}_data_{N_WARMUP_TRANSITIONS}.pkl', 'wb') as f:
+        with open(write_path+f'/transition_data.pkl', 'wb') as f:
             pickle.dump(list(buffer.buffer), f)  # 假设 buffer.buffer 是你的deque
 
         # **(关键)** 保存拟合好的 Scaler
-        joblib.dump(scaler, write_path+f'/driver_{self.driver_num}_data_{N_WARMUP_TRANSITIONS}_state_scaler.pkl')
+        joblib.dump(scaler, write_path+f'/transition_data_state_scaler.pkl')
 
         print("--- 热启动数据和 Scaler 已保存！ ---")

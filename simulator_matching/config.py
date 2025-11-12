@@ -32,15 +32,15 @@ env_params = {
     # 'driver_file_name': 'drivers_100',
     'dispatch_method': 'LD',  # LD: lagarange decomposition method designed by Peibo Duan
     # 'simulator_mode': 'toy_mode',
-    'experiment_mode': 'train',# train_dynamic_matching, generate_warmup_data,train,test
+    'experiment_mode': 'train_dynamic_matching',# train_dynamic_matching, generate_warmup_data,train,test
     'driver_num': 200, # TODO
     'price_per_km': 5,  # $ / km
     'road_information_mode': 'load',
     'price_increasing_percentage': 0,
-    'rl_mode': 'matching',  # reposition and matching,dynamic_matching
+    'rl_mode': 'dynamic_matching',  # reposition and matching,dynamic_matching
     # 'method': 'instant_reward', # 'q_learning','sarsa_no_subway','instant_reward_no_subway','dqn'   #  rl for matching
     # 我设计的method hong-yang
-    'method': 'sarsa', # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
+    'method': 'dynamic_matching', # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
     'reposition_method': 'random_cruise',  # A2C, A2C_global_aware, random_cruise, stay  # rl for repositioning
     'dayparting': False,
     # if true, simulator_env will compute information based on time periods in a day, e.g. 'morning', 'afternoon'
@@ -85,8 +85,8 @@ PRE_STEP = 0
 #                    ]
 #                    ]
 # TRAIN_DATE_LIST = ['2015-05-04']
-# TRAIN_DATE_LIST = ['2015-05-05']
-TRAIN_DATE_LIST = ['2015-05-04', '2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08']
+TRAIN_DATE_LIST = ['2015-05-05']
+# TRAIN_DATE_LIST = ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08','2015-05-11']
 # TRAIN_DATE_LIST = ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08']
 
 # TEST_DATE_LIST = ['2015-05-04']

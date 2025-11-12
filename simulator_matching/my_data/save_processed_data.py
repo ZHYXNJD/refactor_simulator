@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 import os
 import pickle
 import pandas as pd
@@ -39,6 +38,7 @@ def process_single_csv(csv_file):
     try:
         csv_file_path = os.path.join(csv_path, csv_file)
         csv_order = pd.read_csv(csv_file_path)
+        print("original rows:", len(csv_order))
 
         csv_order.drop(
             ["timestamp", "date", "fare", "origin_geometry", "dest_geometry"],
@@ -49,6 +49,9 @@ def process_single_csv(csv_file):
         csv_order = csv_order[
             (csv_order["origin_id"].notna()) & (csv_order["dest_id"].notna())
         ].copy()
+
+        print("new rows after deleting the none (origin_id or dest_id):", len(csv_order))
+
         csv_order["origin_id"] = csv_order["origin_id"].astype(int)
         csv_order["dest_id"] = csv_order["dest_id"].astype(int)
         csv_order.reset_index(drop=True, inplace=True)
@@ -62,8 +65,16 @@ def process_single_csv(csv_file):
 
         # --- 清洗 ---
         csv_order.dropna(subset=["itinerary_node_list"], inplace=True)
+
+        print("new rows after deleting the none (itinerary_node_list):", len(csv_order))
+
         csv_order = csv_order[csv_order["itinerary_node_list"].apply(lambda x: len(x) > 1)]
+
+        print("new rows after deleting the extreme short orders (itinerary_node_list<=1):", len(csv_order))
+
         csv_order["order_id"] = range(len(csv_order))
+
+        print("final rows:", len(csv_order))
 
         # --- 保存 CSV ---
         csv_order_save_path = os.path.join(save_csv_path, csv_file)

@@ -9,6 +9,20 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="root@root@qdai.scnet.cn:50161 password">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@root@qdai.scnet.cn:50161 password (2)">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
+          </mappings>
+        </serverdata>
+      </paths>
     </serverData>
   </component>
 </project>

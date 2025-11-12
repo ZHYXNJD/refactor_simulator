@@ -50,5 +50,7 @@ simulator_reposition/log
 simulator_matching/dynamic_matching_algorithm/warmup_transitions
 simulator_matching/learned_value
 simulator_matching/output_dynamic_match
+simulator_matching/Q-table
+simulator_matching/Dynamic-matching
 
 
