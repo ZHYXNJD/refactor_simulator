@@ -166,8 +166,8 @@ def LD(dispatch_observ,method):
         order_ids_set.add(pair[0])
         driver_ids_set.add(pair[1])
 
-    l_orders = np.array(list(order_ids_set))  # 转换为 NumPy 数组
-    l_drivers = np.array(list(driver_ids_set))  # 转换为 NumPy 数组
+    l_orders = np.array(list(sorted(order_ids_set)))  # 转换为 NumPy 数组
+    l_drivers = np.array(list(sorted(driver_ids_set)))  # 转换为 NumPy 数组
 
     M = len(l_orders)  # the number of orders
     N = len(l_drivers)  # the number of drivers
@@ -356,10 +356,7 @@ if __name__ == '__main__':
 
     # 写一个脚本测试一下新的LD
     test_dt = [['a', 1, 120, 0],
-                   ['a', 2, 120, 15],
-                   ['a', 3, 120, 0],
                    ['b', 1, 110, 20],
-                   ['b', 4, 110, 0],
                    ['c', 1, 130, 25],
                    ]
     dispatch_action = LD(test_dt, 'rl')

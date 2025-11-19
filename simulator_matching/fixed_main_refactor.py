@@ -20,9 +20,9 @@ if __name__ == "__main__":
     pickup_flag = ['rg']
     delivery_flag = ['rg']
 
-    env_params['experiment_mode'] = 'test' # train_dynamic_matching, generate_warmup_data,train,test
+    env_params['experiment_mode'] = 'train_dynamic_matching' # train_dynamic_matching, generate_warmup_data,train,test
     env_params['rl_mode'] = 'dynamic_matching'#  matching,dynamic_matching
-    env_params['method'] = 'dynamic_matching'  # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching;static_multi
+    env_params['method'] = 'dynamic_matching'  # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
     driver_num = [100]
     order_sample_ratio = [0.1]
     env_params['date'] = '2015-05-05'
@@ -30,7 +30,7 @@ if __name__ == "__main__":
 
     for pc_flag in pickup_flag:
         for dl_flag in delivery_flag:
-            for cr_flag in cruise_flag:
+            for cr_flag in cruise_flag:  
                 for ith,single_driver_num in enumerate(driver_num):
                     for single_max_distance_num in max_distance_num:
                         env_params['pickup_mode'] = pc_flag
@@ -40,7 +40,7 @@ if __name__ == "__main__":
                         env_params['order_sample_ratio'] = order_sample_ratio[ith]
                         env_params['maximal_pickup_distance'] = single_max_distance_num
 
-                        if env_params['method'] == 'dynamic_matching' or (env_params['experiment_mode'] == 'test' and env_params['method'] in ['rl','static_multi']):
+                        if env_params['method'] == 'dynamic_matching' or (env_params['experiment_mode'] == 'test' and env_params['method'] == 'rl'):
                             # 必须load q-table
                             matching_agent_params = {
                                         'strategy_type': 'sarsa',
@@ -126,7 +126,7 @@ if __name__ == "__main__":
                             )
                             trainer.dynamic_matching_train(
                                 train_config={
-                                    'num_epochs': 1001,
+                                    'num_epochs': 501,
                                     'train_dates': env_params['date'],
                                     'driver_num': single_driver_num,
                                     'save_interval': 50,

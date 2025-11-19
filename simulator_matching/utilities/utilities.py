@@ -245,7 +245,6 @@ def distance(coord_1, coord_2):
     :return: the manhattan distance between these two points
     :rtype: float
     """
-    manhattan_dis = 0
     lon1, lat1 = coord_1
     lon2, lat2 = coord_2
     lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
@@ -354,51 +353,8 @@ def _get_safe_worker_count(user_defined=None):
     except Exception:
         return max(1, (os.cpu_count() or 4) - 1)
 
-def _worker_process_route(task_data):
-    """
-    这个函数处理 *一个* 路由任务。
-    它将在一个单独的 CPU 核心上运行。
-    """
-    origin, dest, reposition, mode = task_data
 
-    origin = int(origin)
-    dest = int(dest)
-
-    try:
-        if mode == 'ma':
-            # 处理 'ma' 模式
-            dis = distance(node_id_to_coord[origin], node_id_to_coord[dest])
-            return [dest], [dis], dis
-
-        elif mode == 'rg':
-            # --- 之前两个循环的逻辑合并到这里 ---
-
-            # 1. 寻路 (原 Loop 1)
-            ite = ox.shortest_path(G, origin, dest, weight='length')
-            if ite is None or len(ite) <= 1:
-                ite = [origin, dest]
-
-            # 2. 计算距离 (原 Loop 2)
-            itinerary_segment_dis = []
-            for i in range(len(ite) - 1):
-                dis = distance(node_id_to_coord[ite[i]], node_id_to_coord[ite[i + 1]])
-                itinerary_segment_dis.append(dis)
-
-            total_dis = sum(itinerary_segment_dis)
-
-            # 3. 处理 reposition
-            if not reposition:
-                ite.pop()  # 在计算完距离后再 pop
-
-            return ite, itinerary_segment_dis, total_dis
-
-    except Exception as e:
-        # 捕获并行中的错误，防止整个池崩溃
-        print(f"路由计算出错: O={origin} D={dest} | 错误: {e}")
-        # 返回一个“无效”结果，但保持结构一致
-        return [origin, dest], [0.0], 0.0
-
-def route_generation_array(origin_coord_array, dest_coord_array, reposition=False, mode='rg', max_workers=None):
+def route_generation_array(origin_coord_array, dest_coord_array, reposition=False, mode='rg'):
     """
 
     :param origin_coord_array: the K*2 type list, the first column is lng, the second column
@@ -416,48 +372,45 @@ def route_generation_array(origin_coord_array, dest_coord_array, reposition=Fals
              destination node
     :rtype: tuple
     """
-    """
-    自动适配 Windows/Linux 的并发路由计算函数。
-    - Windows: 使用 ThreadPoolExecutor
-    - Linux/Mac: 使用 ProcessPoolExecutor
-    - 自动检测 CPU 空闲核心数
-    """
     origin_node_list = get_nodeId_from_coordinate(origin_coord_array[:, 0], origin_coord_array[:, 1])
     dest_node_list = get_nodeId_from_coordinate(dest_coord_array[:, 0], dest_coord_array[:, 1])
 
-    # 步骤 2: 准备所有任务 (一个 K 长度的列表)
-    tasks = [(origin, dest, reposition, mode) for origin, dest in zip(origin_node_list, dest_node_list)]
 
-    # 步骤 3: 启动进程池并并行执行
 
     itinerary_node_list = []
     itinerary_segment_dis_list = []
     dis_array_list = []
 
-    # 步骤 2: 自动选择并发方式
-    system_type = platform.system().lower()
-    if system_type == 'windows':
-        safe_workers = _get_safe_worker_count(max_workers)
-    else:
-        safe_workers = 7 # 假设只有一张卡
+    if mode == 'ma':
+        # 处理 'ma' 模式
+        for coord_1, coord_2,dest in zip(origin_coord_array, dest_coord_array,dest_node_list):
+            itinerary_node_list.append([dest])
+            dis = distance(coord_1,coord_2)
+            itinerary_segment_dis_list.append([dis])
+            dis_array_list.append(dis)
+        return itinerary_node_list,itinerary_segment_dis_list,dis_array_list
 
-    if 'windows' in system_type:
-        Executor = ThreadPoolExecutor
-    else:
-        Executor = ProcessPoolExecutor
-
-    # 步骤 3: 并行执行
-    with Executor(max_workers=safe_workers) as executor:
-        results = executor.map(_worker_process_route, tasks)
-
-        for result_tuple in results:
-            ite, segment_dis, total_dis = result_tuple
-            itinerary_node_list.append(ite)
-            itinerary_segment_dis_list.append(segment_dis)
+    elif mode == 'rg':
+        # 1. 寻路 (原 Loop 1)
+        itinerary_node_list = ox.shortest_path(G, origin_node_list, dest_node_list, weight='length')
+        for ith,ite in enumerate(itinerary_node_list):
+            if ite is None or len(ite) <= 1:
+                ite = [origin_node_list[ith], dest_node_list[ith]]
+                itinerary_node_list[ith] = [origin_node_list[ith], dest_node_list[ith]]
+            # 2. 计算距离 (原 Loop 2)
+            itinerary_segment_dis = []
+            for i in range(len(ite) - 1):
+                dis = distance(node_id_to_coord[ite[i]], node_id_to_coord[ite[i + 1]])
+                itinerary_segment_dis.append(dis)
+            # 3. 处理 reposition
+            if not reposition:
+                ite.pop()  # 在计算完距离后再 pop
+            total_dis = sum(itinerary_segment_dis)
+            itinerary_segment_dis_list.append(itinerary_segment_dis)
             dis_array_list.append(total_dis)
 
-    dis_array = np.array(dis_array_list)
-    return itinerary_node_list, itinerary_segment_dis_list, dis_array
+        dis_array = np.array(dis_array_list)
+        return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
 def get_closed_lng_lat(current_lng_lat_array, target_lng_lat_array):
     ret = []
@@ -669,7 +622,7 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
             order_coords_rad = np.radians(order_coords_deg_latlon)
             driver_coords_rad = np.radians(driver_coords_deg_latlon)
 
-            driver_tree = BallTree(driver_coords_rad, metric='haversine')
+            driver_tree = BallTree(driver_coords_rad)
 
             EARTH_RADIUS_METERS = 6371
             radius_rad = maximal_pickup_distance / EARTH_RADIUS_METERS
@@ -720,27 +673,27 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
 
             order_driver_pair_list = []
 
-            if method == 'd_rl':
-                # reward_unit 是 (max_dist - dist), flag 是 原始 weight
-                for i in range(len(final_order_ids)):
-                    reward_unit = maximal_pickup_distance - final_dis_array[i] + 1
-                    flag_val = final_order_weights[i]
-                    order_driver_pair_list.append([
-                        final_order_ids[i],
-                        final_driver_ids[i],
-                        reward_unit,
-                        flag_val
-                    ])
-            elif method == 'dynamic_matching':
+            if method in ['dynamic_matching','static_multi']:
                 # reward_unit 是 (max_dist - dist), flag 是 原始 weight
                 # 需要找到权重为1的order 并将权重替换为相应的distance
                 # 按照之前的分析 还需要用一个大数减去distance
                 for i in range(len(final_order_ids)):
                     flag_val = final_order_weights[i]
-                    if flag_val !=1:
-                        reward_unit = maximal_pickup_distance - final_dis_array[i] + 1
-                    else:
+                    if flag_val == 1:
                         reward_unit = 5000 - final_dis_array[i]
+                    else:
+                        reward_unit = flag_val
+                    order_driver_pair_list.append([
+                        final_order_ids[i],
+                        final_driver_ids[i],
+                        reward_unit,
+                        final_dis_array[i]
+                    ])
+
+            elif method == 'd':
+                for i in range(len(final_order_ids)):
+                    flag_val = final_dis_array[i]
+                    reward_unit = maximal_pickup_distance - flag_val + 1
                     order_driver_pair_list.append([
                         final_order_ids[i],
                         final_driver_ids[i],
@@ -777,7 +730,7 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
 
             # 3. 调用路由生成 (不变)
             itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(
-                driver_loc_array_new, request_array_new, mode=env_params['pickup_mode'])
+                driver_loc_array_new, request_array_new)
 
             matched_itinerary = np.array(
                     [itinerary_node_list, itinerary_segment_dis_list, dis_array],
@@ -883,9 +836,9 @@ def get_nodeId_from_coordinate(lng, lat):
     node_list = []
     for i in range(len(lat)):
         if lng[i] not in lng_list or lat[i] not in lat_list:
-            x = ox.nearest_nodes(G, lng[i], lat[i])
+            x = int(ox.nearest_nodes(G, lng[i], lat[i]))
         else:
-            x = node_coord_to_id[(lng[i], lat[i])]
+            x = int(node_coord_to_id[(lng[i], lat[i])])
         node_list.append(x)
     return node_list
 

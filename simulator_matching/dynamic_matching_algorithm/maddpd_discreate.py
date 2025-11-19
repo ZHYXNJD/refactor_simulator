@@ -122,8 +122,8 @@ class MADDPG:
         # 必须热启动 以节约时间
         load_offline_warmup = True,  # <-- 新增一个控制开关
     ):
-        warmup_data_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data.pkl"
-        scaler_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data_state_scaler.pkl"
+        warmup_data_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data_5min.pkl"
+        scaler_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data_state_scaler_5min.pkl"
         self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.n = len(obs_dims)
         self.n_actions = n_actions
@@ -137,6 +137,7 @@ class MADDPG:
 
         if load_offline_warmup:
             print(f"--- 正在从文件加载热启动数据... ---")
+            print(f"---load file {warmup_data_file} ---")
             try:
                 # 1. 加载并填充 Buffer
                 with open(warmup_data_file, 'rb') as f:
@@ -191,11 +192,6 @@ class MADDPG:
         total_obs = obs_dims[0]-self.n
         total_act = len(n_actions)*n_actions[0]
 
-        # --- Replace old single critic references ---
-        # self.critic = Critic(...)
-        # self.target_critic = copy.deepcopy(self.critic)
-        # self.critic_optim = optim.Adam(self.critic.parameters(), lr=lr_critic)
-
         # double q network
         self.critic1 = Critic(total_obs, total_act, critic_hidden).to(self.device)
         self.target_critic1 = copy.deepcopy(self.critic1).to(self.device)
@@ -206,19 +202,17 @@ class MADDPG:
 
         # losses
         self.actor_losses_history = [[] for _ in range(self.n)]  # per-agent step-level list
-        self.critic_losses_history = []  # step-level list
+        self.critic1_losses_history = []
+        self.critic2_losses_history = []
 
         self.q_pi_history = []
         self.entropy_history = [[] for _ in range(self.n)]
 
-        self.critic1_losses_history = []
-        self.critic2_losses_history = []
-
         # per-episode accumulators
         self.episode_reward = 0.0
         self.episode_step = 0
-        self.actor_counts = [[0] * self.n_actions[i] for i in range(self.n)]
-        self.last_action_freq = [[None] * self.n_actions[i] for i in range(self.n)]
+        self.actor_counts = [[0] * 3 for _ in range(self.n)]
+        self.last_action_freq = [[None] * 3 for _ in range(self.n)]
         self.strategy_tracker = StrategyTracker(self.n)  # last_actions, switch_counts
         self.grid_rewards = np.zeros(self.n)
 
@@ -294,9 +288,6 @@ class MADDPG:
         return critic_input
 
     def update(self):
-
-        # if len(self.buffer) < self.batch_size:
-        #     return
 
         # 新代码: (等待 buffer 积攒足够的、多样化的经验)
         if len(self.buffer) < max(self.batch_size, self.learning_starts):
@@ -393,27 +384,15 @@ class MADDPG:
                 else:
                     actions_for_q.append(acts_b[j])
             critic_input_pi = self._build_critic_input(global_state, actions_for_q)
-            # q_pi = self.critic(critic_input_pi)  # [batch]
-
-            # 用 critic1 评估 actor（也可用两者均值）
             q_pi = self.critic1(critic_input_pi)  # [batch]
-
-            # --- 建议增加 ---
-            # (您需要先在 __init__ 中创建这两个新列表)
-            # self.q_pi_history[i].append(q_pi.mean().item())
-            # self.entropy_history[i].append(entropy.mean().item())
 
             with torch.no_grad():
                 critic_input_base = self._build_critic_input(global_state, acts_b)
-                # q_base = self.critic(critic_input_base)  # [batch]
                 q_base = self.critic1(critic_input_base)
+
             advantage = q_pi - q_base
 
             actor_loss = self.compute_actor_loss(i,logp,entropy,advantage,episode=self.current_episode)
-            # self.actor_losses_history.append(actor_loss.item())
-
-            # actor_loss = -(logp * advantage.detach()).mean() - self.entropy_coef * entropy.mean()
-            # self.actor_losses_history[i].append(actor_loss.item())
 
             self.actor_optims[i].zero_grad()
             actor_loss.backward()
@@ -439,17 +418,15 @@ class MADDPG:
 
     def save(self, path,epoch,driver_num):
 
-        file_folder = path + '/' + str(driver_num)
-        if not os.path.exists(file_folder):
-            os.makedirs(file_folder)  # create a folder
-        file_path = os.path.join(file_folder, 'epoch_'+str(epoch) + '.pt')
-
+        if not os.path.exists(path):
+            os.makedirs(path)  # create a folder
+        file_path = os.path.join(path, 'epoch_'+str(epoch) + '.pt')
         state = {
             'actors': [a.state_dict() for a in self.actors],
             'crit1': self.critic1.state_dict(),
-            'crit2': self.critic1.state_dict()
-
+            'crit2': self.critic2.state_dict()
         }
+        torch.save(state, file_path)
         torch.save(state, file_path)
 
     def load(self, path):
@@ -461,8 +438,8 @@ class MADDPG:
         # update targets
         for i in range(self.n):
             self.target_actors[i].load_state_dict(self.actors[i].state_dict())
-        self.target_critic2.load_state_dict(self.critic1.state_dict())
-        self.target_critic1.load_state_dict(self.critic2.state_dict())
+        self.target_critic1.load_state_dict(self.critic1.state_dict())
+        self.target_critic2.load_state_dict(self.critic2.state_dict())
 
     def compute_actor_loss(self, i, logp, entropy, advantage, episode,max_episode=301):
         """

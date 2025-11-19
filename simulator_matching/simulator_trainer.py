@@ -171,7 +171,6 @@ class SimulatorTrainer:
         # Run the simulation
 
         self.simulator.dynamic_matching_agent.actor_losses_history = [[] for _ in range(35)]  # per-agent step-level list
-        self.simulator.dynamic_matching_agent.critic_losses_history = []  # step-level list
 
         self.simulator.dynamic_matching_agent.q_pi_history = []
         self.simulator.dynamic_matching_agent.entropy_history = [[] for _ in range(35)]
@@ -191,7 +190,6 @@ class SimulatorTrainer:
         print(f"Epoch: {epoch}/{train_config['num_epochs']} | Total Reward: {self.simulator.total_reward}")
 
         step_actor_losses = self.simulator.dynamic_matching_agent.actor_losses_history
-        # step_critic_loss = self.simulator.dynamic_matching_agent.critic_losses_history
         step_critic1_loss = self.simulator.dynamic_matching_agent.critic1_losses_history
         step_critic2_loss = self.simulator.dynamic_matching_agent.critic2_losses_history
         step_q_pi = self.simulator.dynamic_matching_agent.q_pi_history
@@ -280,7 +278,7 @@ class SimulatorTrainer:
 
     def dynamic_matching_train(self, train_config):
         self.driver_num = train_config['driver_num']
-        write_path = train_config['output_path'] + '/' + str(self.driver_num)
+        write_path = train_config['output_path'] + '/' + str(self.driver_num) + '/long_decision_30min_fixed_seed'
         if not os.path.exists(write_path):
             os.makedirs(write_path)
         writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
@@ -290,8 +288,7 @@ class SimulatorTrainer:
             # Run a single training epoch
             self.run_training_epoch_match_method(epoch, train_config,logger)
             if epoch % 50 == 0:
-                self.simulator.dynamic_matching_agent.save(train_config['output_path'], epoch,
-                                                                           self.driver_num)
+                self.simulator.dynamic_matching_agent.save(write_path, epoch,self.driver_num)
     def accumulate_metrics(self, simulator: Simulator):
         """
         Accumulate metrics for one test run.
@@ -328,14 +325,14 @@ class SimulatorTrainer:
 
         total_metrics = []
         for date in dates:
-            print(f"method:{simulator.method},test date: {date},driver_num: {env_params['driver_num']},order sample ratio:{env_params['order_sample_ratio']},")
+            print(f"method:{simulator.method},test date: {date},driver_num: {simulator.driver_num},order sample ratio:{simulator.order_sample_ratio},")
             simulator.reset()
             simulator.experiment_date = date
             if simulator.method != 'dynamic_matching':
                 for step in range(simulator.finish_run_step):
                     simulator.rl_step()
             else:
-                simulator.dynamic_matching_agent.load(path='./output_dynamic_match/100/epoch_300.pt')
+                simulator.dynamic_matching_agent.load(path='./Dynamic-matching/2015-05-05/100/fixed_seed_long_epoch/epoch_750.pt')
                 for step in range(simulator.finish_run_step):
                     simulator.rl_step_test_dynamic()
             metrics = self.accumulate_metrics(simulator)
@@ -453,18 +450,21 @@ class SimulatorTrainer:
         total_evaluate_df = pd.DataFrame(metrics)
 
         # 修改保存路径为当前路径下的 models 文件夹
-        base_folder = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'evaluate_results')
-        folder = os.path.join(base_folder, f'{datetime.now().strftime("%Y%m%d-%H%M%S")}')
+        base_folder = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'evaluate_results/new results')
+        folder = os.path.join(base_folder, f'{datetime.now().strftime("%m%d-%H%M%S")}')
 
         # 如果文件夹不存在，则创建
         if not os.path.exists(folder):
             os.makedirs(folder)
 
         total_evaluate_df.to_csv(
-            folder + f"/{test_config['method']}_driver_{test_config['driver_num']}_order_{test_config['order_sample_ratio']}.csv",
+            folder + f"/{test_config['test_dates'][0].split('-')[-1]}_{test_config['method']}_driver_{test_config['driver_num']}.csv",
             index=False)
-        np.save(folder + f"/{test_config['method']}_detail_driver_{test_config['driver_num']}_order_{test_config['order_sample_ratio']}.npy",
+        np.save(folder + f"/{test_config['test_dates'][0].split('-')[-1]}_{test_config['method']}_detail_driver_{test_config['driver_num']}.npy",
                 evaluate_table)
+
+        #
+        simulator.record.to_csv(folder+f"/{test_config['test_dates'][0].split('-')[-1]}_{test_config['method']}_driver_{test_config['driver_num']}_matched.csv")
 
     def render(self):
         """
@@ -475,7 +475,7 @@ class SimulatorTrainer:
     def generate_warmup_data(self,train_config):
 
         # --- 1. 设置 ---
-        N_WARMUP_EPOCHS = 70
+        N_WARMUP_EPOCHS = 300
         N_WARMUP_TRANSITIONS = N_WARMUP_EPOCHS*int((self.simulator.t_end-self.simulator.t_initial)/self.simulator.AGENT_DECISION_FREQUENCY)
         warmup_states = []  # 用于拟合 Scaler
         self.driver_num = train_config['driver_num']
@@ -487,8 +487,8 @@ class SimulatorTrainer:
             self.simulator.experiment_date = train_config['train_dates']
             self.simulator.reset()
             simulator = self.simulator
-            buffer = simulator.dynamic_matching_agent.buffer
             simulator.dynamic_matching_agent.load_offline_warmup = False
+            buffer = simulator.dynamic_matching_agent.buffer
             # Run the simulation
             for step in range(simulator.finish_run_step + 1):
                 # --- 1. Agent 决策与数据存储 (每 15 分钟执行一次) ---
@@ -595,10 +595,10 @@ class SimulatorTrainer:
         # with open('warmup_buffer.pkl', 'wb') as f:
         #     pickle.dump(buffer, f)
         # (更通用的方法是保存 transitions 列表，在主代码中加载)
-        with open(write_path+f'/transition_data.pkl', 'wb') as f:
+        with open(write_path+f'/transition_data_30min.pkl', 'wb') as f:
             pickle.dump(list(buffer.buffer), f)  # 假设 buffer.buffer 是你的deque
 
         # **(关键)** 保存拟合好的 Scaler
-        joblib.dump(scaler, write_path+f'/transition_data_state_scaler.pkl')
+        joblib.dump(scaler, write_path+f'/transition_data_state_scaler_30min.pkl')
 
         print("--- 热启动数据和 Scaler 已保存！ ---")
