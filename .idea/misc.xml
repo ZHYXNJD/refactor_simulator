@@ -3,5 +3,5 @@
   <component name="Black">
     <option name="sdkName" value="DRL-code-pytorch" />
   </component>
-  <component name="ProjectRootManager" version="2" project-jdk-name="Remote Python 3.11.9 (sftp://root@root@qdai.scnet.cn:50161/opt/conda/bin/python3)" project-jdk-type="Python SDK" />
+  <component name="ProjectRootManager" version="2" project-jdk-name="trans_simulator_torch" project-jdk-type="Python SDK" />
 </project>

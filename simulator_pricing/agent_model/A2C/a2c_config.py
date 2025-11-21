@@ -6,6 +6,5 @@ A2C_ACTION_DIM = 50 # actor输出的是50个动作的概率
 A2C_ACTION_PRICE_MAPPING = np.arange(0.02, 1.02, 0.02) # 在这个系数的基础上乘以最高价格
 STATE_DIM = 3 # time_slice idle_vehicle demand
 
-ENV_NAME = 'test'
-ENV_NUMBER = 5
-SEED = 89
+a2c_params = {'state_dim':3,'action_dim':50,'action_mapping':np.arange(0.02, 1.02, 0.02)}
+

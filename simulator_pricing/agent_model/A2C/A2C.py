@@ -44,10 +44,10 @@ class Critic(nn.Module):
 
 
 class A2C(object):
-    def __init__(self, state_dim, action_dim,action_mapping):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.action_mapping = action_mapping
+    def __init__(self, **params):
+        self.state_dim = params['state_dim']
+        self.action_dim = params['action_dim']
+        self.action_mapping = params['action_mapping']
         self.hidden_width = 64  # The number of neurons in hidden layers of the neural network
         self.lr = 5e-5  # learning rate   # 调大学习率就需要把entropy_beta调大
         self.GAMMA = 0.99  # discount factor

@@ -114,7 +114,7 @@ class SimulatorTrainer:
         # self.matching_refactor.log({"Occupancy rate": simulator.occupancy_rate})
         # self.matching_refactor.log({"Matching rate": simulator.matched_requests_num / simulator.total_request_num})
 
-    def run_training_epoch(self,epoch, train_config, writer):
+    def run_training_epoch(self,epoch,train_config, writer):
         """
         Run a single training epoch.
         :param epoch: Current epoch number.
@@ -130,8 +130,8 @@ class SimulatorTrainer:
         }
 
         # Set up simulator for this epoch
-        # self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
-        self.simulator.experiment_date = train_config['train_dates']
+        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        # self.simulator.experiment_date = train_config['train_dates']
         self.simulator.reset()
 
         # Run the simulation
@@ -147,6 +147,8 @@ class SimulatorTrainer:
                 )
                 self.total_step += 1
         end_time = time.time()
+        # 更新学习率
+        self.simulator.matching_agent.strategy.update_learning_rate(epoch)
 
         # Collect metrics
         metrics['total_reward'] = self.simulator.total_reward
@@ -251,7 +253,7 @@ class SimulatorTrainer:
         """
         total_reward_record = np.zeros(train_config['num_epochs'])
         self.driver_num = train_config['driver_num']
-        write_path = train_config['output_path'] + '/' + str(self.driver_num)
+        write_path = train_config['output_path'] + '/' + str(self.driver_num) + '_discount09'
         if not os.path.exists(write_path):
             os.makedirs(write_path)
         writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
@@ -259,7 +261,7 @@ class SimulatorTrainer:
 
         for epoch in range(train_config['num_epochs']):
             # Run a single training epoch
-            metrics = self.run_training_epoch(epoch, train_config,writer)
+            metrics = self.run_training_epoch(epoch,train_config,writer)
             # Record total reward
             total_reward_record[epoch] = metrics['total_reward']
 

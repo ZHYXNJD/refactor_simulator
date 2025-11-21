@@ -37,10 +37,25 @@ class SarsaAgent(object):
             self.time_slices.append(i)
 
         # learning rate
-        self.learning_rate = params['learning_rate']
+        # self.learning_rate = params['learning_rate']
+
+        # --- 修改开始 ---
+        # 记录初始学习率，作为衰减的基准
+        self.initial_learning_rate = 0.02
+        # 当前学习率（初始化时等于初始学习率）
+        self.learning_rate = self.initial_learning_rate
+
+        # 衰减系数 (建议从 0.01 或 0.001 开始尝试)
+        # 如果 params 里没传，默认给 0 (即不衰减)
+        self.lr_decay_rate = params.get('lr_decay_rate', 0.05)
+
+        # 设置一个下限，防止后期学习率过小导致完全学不动 (例如 1e-3)
+        self.min_learning_rate = params.get('min_learning_rate', 0.0001)
+        # --- 修改结束 ---
 
         # discount rate
-        self.discount_rate = params['discount_rate']
+        # self.discount_rate = params['discount_rate']
+        self.discount_rate = 0.9
 
         # initialization of Q value table
         self.q_value_table = dict()  # each state a two dimensional vector
@@ -48,6 +63,20 @@ class SarsaAgent(object):
             for grid_id in self.grid_ids:
                 s = State(time_slice, grid_id)
                 self.q_value_table[s] = 0
+
+    # --- 新增方法 ---
+    def update_learning_rate(self, epoch_index):
+        """
+        在每个 Epoch 结束时调用此函数。
+        公式: lr_t = lr_0 / (1 + decay_rate * epoch)
+        """
+        decayed_lr = self.initial_learning_rate / (1.0 + self.lr_decay_rate * epoch_index)
+
+        # 确保不低于最小值
+        self.learning_rate = max(decayed_lr, self.min_learning_rate)
+
+        return self.learning_rate
+
 
     def update_q_value_table(self, s0: State, s1: State, reward: float):
         if s1.time_slice >= int(LEN_TIME / LEN_TIME_SLICE):

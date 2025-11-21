@@ -56,6 +56,7 @@ class Simulator:
         # self.simulator_mode = kwargs.pop('simulator_mode', 'simulator_mode')
         # self.experiment_mode = kwargs.pop('experiment_mode', 'train')
         # self.experiment_date = kwargs.pop('experiment_date', '')
+        self.experiment_date = None
         # pattern = SimulatorPattern()
         # self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
 
@@ -119,15 +120,17 @@ class Simulator:
             self.reposition_method = kwargs['reposition_method']  # rl for repositioning
 
         self.AGENT_DECISION_FREQUENCY = 10 * 60  # 后期把这个参数改为可以调整的
-        pattern = SimulatorPattern(kwargs['date'])
-        self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
-        self.driver_info = pattern.driver_info
 
     def initial_base_tables(self):
         """
         This function used to initial the driver table and order table
         :return: None
         """
+
+        pattern = SimulatorPattern(self.experiment_date)
+        self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
+        self.driver_info = pattern.driver_info
+
         self.time = deepcopy(self.t_initial)
         self.current_step = int((self.time - self.t_initial) // self.delta_t)
         self.grid_value = {}
@@ -355,10 +358,23 @@ class Simulator:
                     reward_array = 5151. - new_matched_requests['pickup_time'].values - new_matched_requests[
                         'trip_time'].values
                 else:
-                    # reward_array = new_matched_requests['immediate_reward'].values
-                    # TJ
-                    reward_array = new_matched_requests['designed_reward'].values
-                    # TJ
+                    # reward_array = new_matched_requests['designed_reward'].values
+
+                    # 如果要考虑空车的惩罚 可以在这里添加
+                    idle_drivers = self.driver_table[
+                        (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)].copy()
+                    grid_total_wait = idle_drivers.groupby('grid_id')['total_idle_time'].sum()
+                    grid_match_counts = new_matched_requests['origin_grid_id'].value_counts()
+                    grid_unit_penalty = grid_total_wait / grid_match_counts
+                    matched_grids = new_matched_requests['origin_grid_id'].values
+                    penalties = pd.Series(matched_grids).map(grid_unit_penalty).fillna(0).values
+                    # 惩罚系数 ALPHA 需要重新调整。
+                    # 因为 Penalty 现在包含了 (N_idle / N_match) 的倍数，数值可能会很大。
+                    # 建议 ALPHA 设得比之前更小，例如 0.001 或 0.01，视你的 time 单位（秒/分）而定
+                    ALPHA = 0.001
+                    original_rewards = new_matched_requests['designed_reward'].values
+                    final_rewards = original_rewards - (ALPHA * penalties)
+                    # print(f"Max Penalty: {np.max(ALPHA * penalties):.2f}, Mean Penalty: {np.mean(ALPHA * penalties):.2f}")
 
                 self.dispatch_transitions_buffer[0] = np.concatenate([self.dispatch_transitions_buffer[0], state_array])
                 self.dispatch_transitions_buffer[1] = np.concatenate(
@@ -366,8 +382,12 @@ class Simulator:
                 self.dispatch_transitions_buffer[2] = np.concatenate(
                     [self.dispatch_transitions_buffer[2], next_state_array])
                 # 将已匹配订单的reward_array与buffer连接
+                # self.dispatch_transitions_buffer[3] = np.concatenate(
+                #     [self.dispatch_transitions_buffer[3], reward_array])
+                # 更新 Buffer
                 self.dispatch_transitions_buffer[3] = np.concatenate(
-                    [self.dispatch_transitions_buffer[3], reward_array])
+                    [self.dispatch_transitions_buffer[3], final_rewards]
+                )
 
             if self.track_recording_flag:
                 for j, index in enumerate(cor_driver[con_remain]):
@@ -431,7 +451,7 @@ class Simulator:
                 # 假如训练集比较小 只有一天的数据  那么就不固定随机种子
                 # 假如训练集比较大 可以抽取多天的数据  那么这里就固定随机种子
                 # lol
-                np.random.seed(42) # 训练的随机种子
+                np.random.seed(43) # 训练的随机种子
                 # np.random.seed(1578) # 测试的随机种子
                 sampled_request_index = np.random.choice(database_size, num_request, replace=False).tolist()
                 sampled_requests = [temp_request[index] for index in sampled_request_index]
@@ -504,8 +524,7 @@ class Simulator:
                             else:  # RL
                                 current_time_slice = int((self.time - self.t_initial - 1) / LEN_TIME_SLICE)
                                 num_slices = int(LEN_TIME / LEN_TIME_SLICE)
-                                end_time_slice = int((
-                                                                 self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / LEN_TIME_SLICE)
+                                end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / LEN_TIME_SLICE)
                                 if end_time_slice >= num_slices:
                                     original_trip_score = reward
                                 else:
@@ -559,7 +578,6 @@ class Simulator:
                             dynamic_matching_array[i] = 2
 
                 wait_info['dynamic_matching_array'] = dynamic_matching_array
-
                 wait_info['weight'] = weight_array
                 wait_info['wait_time'] = 0
                 wait_info['status'] = 0
@@ -1270,13 +1288,9 @@ class Simulator:
         # MATCHING:AGENT UPDATE
         # step 10: update matching agent
         step_loss = None
-        # TODO: matching_agent更新位置
         if self.matching_agent is not None:
-            # print("Shape:", self.dispatch_transitions_buffer[0].shape, self.dispatch_transitions_buffer[1].shape,
-            #       self.dispatch_transitions_buffer[2].shape, self.dispatch_transitions_buffer[3].shape)
             if self.dispatch_transitions_buffer[0].shape[0]>0:
                 step_loss = self.matching_agent.update(self.dispatch_transitions_buffer)  # Andrew
-        # return self.dispatch_transitions_buffer  # rl for matching
         return step_loss
 
     def calculate_current_time_slice(self):

@@ -20,12 +20,12 @@ if __name__ == "__main__":
     pickup_flag = ['rg']
     delivery_flag = ['rg']
 
-    env_params['experiment_mode'] = 'train_dynamic_matching' # train_dynamic_matching, generate_warmup_data,train,test
-    env_params['rl_mode'] = 'dynamic_matching'#  matching,dynamic_matching
-    env_params['method'] = 'dynamic_matching'  # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
-    driver_num = [100]
-    order_sample_ratio = [0.1]
-    env_params['date'] = '2015-05-05'
+    env_params['experiment_mode'] = 'train' # train_dynamic_matching, generate_warmup_data,train,test
+    env_params['rl_mode'] = 'matching'#  matching,dynamic_matching
+    env_params['method'] = 'rl'  # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
+    driver_num = [1000]
+    order_sample_ratio = [1]
+    env_params['date'] = ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08','2015-05-11']
     best_epoch = 300 # 注意 该值需要你自己指定！！！
 
     for pc_flag in pickup_flag:
@@ -111,7 +111,7 @@ if __name__ == "__main__":
                                     'train_dates': env_params['date'],
                                     'driver_num':single_driver_num,
                                     'save_interval': 50,
-                                    'output_path': f"Q-table/{env_params['date']}", #
+                                    'output_path': "New-Q-table", #
                                     'flag_load': False, # 这里的load是加载之前的matching agent
                                 }
                             )
