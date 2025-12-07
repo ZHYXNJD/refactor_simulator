@@ -1,18 +1,15 @@
 from copy import deepcopy
-
-import numpy as np
 import pandas as pd
-from pricing_agent import PricingAgent
-from matching_agent import MatchingAgent
 from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import *
-from simulator_matching.utilities.utilities import road_network, sample_all_drivers, route_generation_array, State, \
-    cruising, order_dispatch
+from simulator_matching.utilities.utilities import road_network, sample_all_drivers, State,order_dispatch
 from simulator_pattern import *
 from simulator_matching.utilities.utilities import driver_online_offline_decision, calculate_evaluate_table
 from config import qTable_params
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 class Simulator:
-    def __init__(self, matching_agent: MatchingAgent, pricing_agent: PricingAgent,dynamic_matching_agent:MADDPG, **kwargs):
+    def __init__(self, matching_agent,dynamic_matching_agent, **kwargs):
 
         # basic parameters: time & sample
         self.t_initial = kwargs['t_initial']
@@ -26,7 +23,7 @@ class Simulator:
 
         # Andrew :RL agents(RL module)
         self.matching_agent = matching_agent
-        self.pricing_agent = pricing_agent
+        # self.pricing_agent = pricing_agent
 
         # register dynamic matching agent
         self.dynamic_matching_agent = dynamic_matching_agent
@@ -121,15 +118,26 @@ class Simulator:
 
         self.AGENT_DECISION_FREQUENCY = 10 * 60  # 后期把这个参数改为可以调整的
 
-    def initial_base_tables(self):
+        # 创建一个私有的随机生成器实例，初始为 None
+        self.rng = None
+
+        # pattern = SimulatorPattern('2015-05-05')
+        # self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
+        # self.driver_info = pattern.driver_info
+
+    def initial_base_tables(self,given_data=False,request_databases=None,driver_info=None):
         """
         This function used to initial the driver table and order table
         :return: None
         """
-
-        pattern = SimulatorPattern(self.experiment_date)
-        self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
-        self.driver_info = pattern.driver_info
+        if not given_data:
+            pattern = SimulatorPattern(self.experiment_date)
+            self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
+            self.driver_info = pattern.driver_info
+        else:
+            print("并行训练，从外部加载数据")
+            self.request_databases = request_databases
+            self.driver_info = driver_info
 
         self.time = deepcopy(self.t_initial)
         self.current_step = int((self.time - self.t_initial) // self.delta_t)
@@ -170,6 +178,7 @@ class Simulator:
         self.matched_short_requests_num = 0
         self.matched_requests_num = 0.0000001
 
+        self.sampled_total_request = []
         self.transfer_request_num = 0
         self.long_requests_num = 0.0000001
         self.medium_requests_num = 0.0000001
@@ -202,8 +211,10 @@ class Simulator:
         self.held_action_tuple = ([0]* int(self.grid_num),[0] * int(self.grid_num))
 
 
-    def reset(self):
-        self.initial_base_tables()
+    def reset(self,seed,given_data=False,request_databases=None,driver_info=None):
+        if seed is not None:
+            self.rng = np.random.RandomState(seed)
+        self.initial_base_tables(given_data,request_databases,driver_info)
 
     def update_info_after_matching_multi_process(self, matched_pair_actual_indexes, matched_itinerary):
         """
@@ -371,10 +382,12 @@ class Simulator:
                     # 惩罚系数 ALPHA 需要重新调整。
                     # 因为 Penalty 现在包含了 (N_idle / N_match) 的倍数，数值可能会很大。
                     # 建议 ALPHA 设得比之前更小，例如 0.001 或 0.01，视你的 time 单位（秒/分）而定
-                    ALPHA = 0.001
+                    ALPHA = 0.001 # large:0.001
                     original_rewards = new_matched_requests['designed_reward'].values
                     final_rewards = original_rewards - (ALPHA * penalties)
+                    # print(f"Max original: {np.max(original_rewards):.2f}, Mean original: {np.mean(original_rewards):.2f}")
                     # print(f"Max Penalty: {np.max(ALPHA * penalties):.2f}, Mean Penalty: {np.mean(ALPHA * penalties):.2f}")
+                    # print(f"Max final: {np.max(final_rewards):.2f}, Mean final: {np.mean(final_rewards):.2f}")
 
                 self.dispatch_transitions_buffer[0] = np.concatenate([self.dispatch_transitions_buffer[0], state_array])
                 self.dispatch_transitions_buffer[1] = np.concatenate(
@@ -427,7 +440,7 @@ class Simulator:
 
         return new_matched_requests, update_wait_requests
 
-    def step_bootstrap_new_orders(self, score_agent: MatchingAgent):
+    def step_bootstrap_new_orders(self, score_agent):
         """
         This function used to generate initial order by different time
         :return:
@@ -447,13 +460,9 @@ class Simulator:
             # sample a portion of historical orders
             num_request = int(np.rint(self.order_sample_ratio * database_size))
             if num_request < database_size:
-                # 两种策略
-                # 假如训练集比较小 只有一天的数据  那么就不固定随机种子
-                # 假如训练集比较大 可以抽取多天的数据  那么这里就固定随机种子
-                # lol
-                np.random.seed(43) # 训练的随机种子
+                # np.random.seed(43) # 训练的随机种子
                 # np.random.seed(1578) # 测试的随机种子
-                sampled_request_index = np.random.choice(database_size, num_request, replace=False).tolist()
+                sampled_request_index = self.rng.choice(database_size, num_request, replace=False).tolist()
                 sampled_requests = [temp_request[index] for index in sampled_request_index]
             else:
                 sampled_requests = temp_request
@@ -463,20 +472,16 @@ class Simulator:
                            'itinerary_segment_dis_list', 'trip_time', 'designed_reward', 'cancel_prob']
             if len(sampled_requests) > 0:
                 wait_info = pd.DataFrame(sampled_requests, columns=column_name)
-                # wait_info['itinerary_node_list'] = list(map(lambda x: x[0], sampled_requests_array[:, 11]))
-                # wait_info['itinerary_segment_dis_list'] = list(map(lambda x: x[0], sampled_requests_array[:, 12]))
-                # wait_info['itinerary_node_list'] = np.array(sampled_requests)[:, 11]
                 wait_info['itinerary_node_list'] = [req[11] for req in sampled_requests]
-                # wait_info['itinerary_segment_dis_list'] = np.array(sampled_requests)[:, 12]
                 wait_info['itinerary_segment_dis_list'] = [req[12] for req in sampled_requests]
                 wait_info['start_time'] = self.time
-                # wait_info['trip_distance'] = np.array(sampled_requests)[:, 7]
                 wait_info['trip_distance'] = [req[7] for req in sampled_requests]
                 wait_info['trip_time'] = wait_info['trip_distance'] / self.vehicle_speed * 3600
                 wait_info['designed_reward'] = 2.5 + 0.5 * (
-                        (wait_info['trip_distance'] * 1000 - 322).clip(lower=0) / 322
-                )
+                        (wait_info['trip_distance'] * 1000 - 322).clip(lower=0) / 322)
                 dynamic_matching_array = np.zeros(len(sampled_requests)) + 0.01
+
+                self.sampled_total_request.append(sampled_requests)
 
                 # Andrew
                 # assign weight array
@@ -507,9 +512,22 @@ class Simulator:
                                 original_trip_score = reward
                             else:
                                 next_state = State(end_time_slice, int(dest_grid_id))
-                                original_trip_score = reward + (
+                                # 只用一个qtable small size乘以的缩放系数为0.3
+                                # middle 系数0.5
+                                # 只用一个qtable small size乘以的缩放系数为0.3
+                                # middle size 系数0.5
+                                if self.driver_num == 100:
+                                    scale_coeff = 0.3
+                                elif self.driver_num == 500:
+                                    scale_coeff = 0.5
+                                elif self.driver_num == 1000:
+                                    scale_coeff = 1.0
+                                # original_trip_score = reward + scale_coeff * (
+                                #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
+                                #                       score_agent.strategy.q_value_table[next_state]
+                                original_trip_score = reward + scale_coeff * (
                                         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
-                                                      score_agent.strategy.q_value_table[next_state]
+                                                      score_agent.q_value_table[next_state]
                             weight_array[i] = original_trip_score
                             self.transfer_request_num += 1
                     elif self.method == 'static_multi':
@@ -571,9 +589,20 @@ class Simulator:
                                 original_trip_score = reward
                             else:
                                 next_state = State(end_time_slice, int(dest_grid_id))
-                                original_trip_score = reward + (
+                                # 只用一个qtable small size乘以的缩放系数为0.3
+                                # middle size 系数0.5
+                                if self.driver_num == 100:
+                                    scale_coeff = 0.3
+                                elif self.driver_num == 500:
+                                    scale_coeff = 0.5
+                                elif self.driver_num == 1000:
+                                    scale_coeff = 1.0
+                                original_trip_score = reward + scale_coeff * (
                                         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
                                                       score_agent.strategy.q_value_table[next_state]
+                                # original_trip_score = reward + scale_coeff * (
+                                #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
+                                #                       score_agent.q_value_table[next_state]
                             weight_array[i] = original_trip_score
                             dynamic_matching_array[i] = 2
 
@@ -594,7 +623,11 @@ class Simulator:
                     env_params['maximum_pickup_time_passenger_can_tolerate_mean'],
                     env_params['maximum_pickup_time_passenger_can_tolerate_std'],
                     len(wait_info))
-                self.wait_requests = pd.concat([self.wait_requests, wait_info], ignore_index=True)
+
+                dfs = [self.wait_requests, wait_info]
+                self.wait_requests = pd.concat([df for df in dfs if df is not None and not df.empty],
+                                               ignore_index=True)
+                # self.wait_requests = pd.concat([self.wait_requests, wait_info], ignore_index=True)
 
                 # statistics
                 long_ = wait_info[wait_info['trip_time'] >= 600].shape[0]
@@ -603,6 +636,7 @@ class Simulator:
                 self.short_requests_num += short_
                 self.medium_requests_num += wait_info.shape[0]-long_-short_
                 self.total_request_num += wait_info.shape[0]
+
 
         return
 
@@ -946,18 +980,9 @@ class Simulator:
         This function used to run the simulator step by step
         :return:
         """
-        # self.new_tracks = {}
-        # print("------------------current step: {}------------------".format(self.current_step))
-        self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]), np.array([]).reshape([0, 2]),
-                                            np.array([]).astype(float)]  # rl for matching
-
         # Step 1: order dispatching
         wait_requests = deepcopy(self.wait_requests)
-        # print("--------------------wait_requests----------------:",wait_requests.shape[0])
         driver_table = deepcopy(self.driver_table)
-        # idle_driver_table = driver_table[con_ready_to_dispatch]
-        # print("--------------------idle_driver_table----------------:",idle_driver_table.shape[0])
-        # print("order duplicated flag:",wait_requests.order_id.duplicated().sum())
 
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
@@ -969,18 +994,13 @@ class Simulator:
             self.record = df_new_matched_requests
         else:
             self.record = pd.concat([self.record, df_new_matched_requests], axis=0, ignore_index=True)
+
         # TJ
         if len(df_new_matched_requests) != 0:
             # TODO: pricing
             self.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
         else:
             self.total_reward += 0
-            # Update matched requests count
-
-        # print(f"waiting request number:{wait_requests.shape[0]},order id:{wait_requests['order_id'].values.tolist()}")
-        # print(f"idle driver number:{idle_driver_table.shape[0]},idle driver id:{idle_driver_table['driver_id'].values.tolist()}")
-        # print(f"matched_pair_actual_indexes:{matched_pair_actual_indexes}")
-        # print(f"matched_reward:{np.sum(df_new_matched_requests['designed_reward'].values)}")
 
         self.matched_requests_num += len(df_new_matched_requests)
 
@@ -1089,24 +1109,6 @@ class Simulator:
         # Step 7: update time
         self.update_time()
 
-
-    # Add changes for pricing module: Andrew
-    def get_pricing_state(self):
-        """
-        获取与定价相关的状态
-        """
-        return {
-            "trip_distances": self.requests['trip_distance'].tolist(),  # 每个订单的距离
-            "supply": self.driver_table[self.driver_table['status'] == 0].shape[0],  # 空闲司机数量
-            "demand": self.requests.shape[0],  # 当前订单数量
-        }
-
-    def exectue_pricing_action(self, pricing_action):
-        """
-        更新订单表中的价格
-        """
-        self.requests['designed_reward'] = pricing_action  # 使用 PricingAgent 提供的价格更新订单
-
     # Add changes for matching module: Andrew
     def get_matching_state(self):
         """
@@ -1124,60 +1126,6 @@ class Simulator:
             'maximal_pickup_distance': self.maximal_pickup_distance,
         }
         return state
-
-    def get_state(self):
-        """
-        Get the current state for the matching process.
-        :return: A dictionary containing the state information.
-        """
-        # Extract required information
-        state = {
-            'wait_requests': deepcopy(self.wait_requests),
-            'driver_table': deepcopy(self.driver_table),
-            'time': self.time,
-            'current_step': self.current_step,
-            'dispatch_method': self.dispatch_method,
-            'method': self.method,
-            'maximal_pickup_distance': self.maximal_pickup_distance,
-        }
-        return state
-
-    def execute_matching_action(self, matching_action):
-        """
-        Execute the matching action and generate matched itineraries.
-        :param matching_action: Matched order-driver pairs.
-        :return: Matched itineraries.
-        """
-        if len(matching_action['matched_pair_actual_indexs']) == 0:
-            # If no matching action, return empty itinerary
-            # print("No matching action")
-            return np.array([])
-
-        # print("Matching action is not None")
-        request_indexs = np.array(matching_action['matched_pair_actual_indexs'])[:, 0]
-        driver_indexs = np.array(matching_action['matched_pair_actual_indexs'])[:, 1]
-        request_array_temp = matching_action['request_array_temp']
-        driver_loc_array_temp = matching_action['driver_loc_array_temp']
-
-        request_indexs_new = []
-        driver_indexs_new = []
-        for index in request_indexs:
-            request_indexs_new.append(
-                request_array_temp[request_array_temp['order_id'] == int(index)].index.tolist()[0])
-        for index in driver_indexs:
-            driver_indexs_new.append(
-                driver_loc_array_temp[driver_loc_array_temp['driver_id'] == index].index.tolist()[0])
-        request_array_new = np.array(request_array_temp.loc[request_indexs_new])[:, :2]
-        driver_loc_array_new = np.array(driver_loc_array_temp.loc[driver_indexs_new])[:, :2]
-        # 模拟的真实路网（距离）
-        # 注意：如果想要加速，那么距离计算可以换一种方法
-        # 现在方法是rg，换成ma会加速
-        itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(
-            driver_loc_array_new, request_array_new, self.pickup_mode)
-
-        matched_itinerary = [itinerary_node_list, itinerary_segment_dis_list, dis_array]
-
-        return np.array(matched_itinerary)
 
     def get_matching_reward(self, df_new_matched_requests):
         """
@@ -1338,19 +1286,14 @@ class Simulator:
                     return
 
             # --- B. 为下一个 15 分钟获取新动作 A_k+1 ---
-
             # 获取 S_k (当前状态)
             matching_state_current = self.get_global_state()
-            # print(f"--- Agent 决策 (decision interval {self.calculate_current_time_slice()}) ---")
 
             # 存储 S_k, 用于 15 分钟后
             self.state_at_decision_time = matching_state_current
 
             # 调用 Agent 获取新动作，并“持有”它
-            # here the input parameter is the global state
-            # in the select actions function, you need to add a one-hot parameter to encode
-            # each agent's location id, so we can get each agent's action
-            actions, log_probs = self.dynamic_matching_agent.select_actions(matching_state_current)
+            actions, log_probs = self.dynamic_matching_agent.select_actions(matching_state_current,deterministic=False)
             self.held_action_tuple = (actions, log_probs)
 
             # 重置 5 分钟的奖励累加器
@@ -1362,7 +1305,6 @@ class Simulator:
         driver_table = deepcopy(self.driver_table)
 
         # use RL's decision as the input
-        # 应该在抽取新订单时做修改
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
                                                                         self.dispatch_method, self.method)
@@ -1372,10 +1314,13 @@ class Simulator:
         if isinstance(self.record, str):
             self.record = df_new_matched_requests
         else:
-            self.record = pd.concat([self.record, df_new_matched_requests], axis=0, ignore_index=True)
+            dfs_to_concat = [df for df in (self.record, df_new_matched_requests)
+                             if df is not None and not df.empty]
+            if dfs_to_concat:
+                self.record = pd.concat(dfs_to_concat, ignore_index=True)
+            # self.record = pd.concat([self.record, df_new_matched_requests], axis=0, ignore_index=True)
 
         if len(df_new_matched_requests) != 0:
-            # TODO: pricing
             self.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
         else:
             self.total_reward += 0
@@ -1389,7 +1334,6 @@ class Simulator:
 
         self.matched_requests_num += len(df_new_matched_requests)
 
-        # TJ
         if self.end_of_episode == 0:
             self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0)
             self.matched_requests = self.matched_requests.reset_index(drop=True)
@@ -1397,21 +1341,16 @@ class Simulator:
 
             # Step 3: bootstrap new orders
             # self.matching_agent是之前训练好的agent 用于加载未来区域价值
-            # 跟正在训练的rl agent不是一个
+            # 跟正在训练的rl agent不是一个,是一个训练好的给未来区域打分的agent
+            # 根据这个分数作为order-driver匹配的权重
+            # 也就是在这里，会根据目前正在训练的agent给出的动作，为各个区域选则合适的打分机制
             self.step_bootstrap_new_orders(self.matching_agent)
 
-        # Step 4: both-rg-cruising and/or repositioning decision
-        # self.cruise_and_reposition()
-
-        # Step 4.1: track recording
-        if self.track_recording_flag:
-            self.real_time_track_recording()
 
         # Step 5: update next state for drivers
         self.update_state()
         # Step 6： online/offline update()
         self.driver_online_offline_update()
-
         # Step 7: update time
         self.update_time()
 
@@ -1420,27 +1359,38 @@ class Simulator:
         grid_num = self.grid_num
         grid_ids = list(range(grid_num))
 
-        # --- 1. 订单分布 ---
+        # --- 1. 订单起点分布 ---
         wait_requests_by_grid = self.wait_requests.groupby('origin_grid_id')['origin_grid_id'].count()
         wait_requests_vector = wait_requests_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
 
-        # --- 2. 空闲司机分布 ---
+        # --- 2. 订单终点分布 ---
+        # wait_requests_dest_by_grid = self.wait_requests.groupby('dest_grid_id')['dest_grid_id'].count()
+        # wait_requests_dest_vector = wait_requests_dest_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
+        #
+        # # --- 2. 订单行程时间分布 (平均值) ---
+        # # 新版fill value改成了0。 原来是999
+        # wait_requests_time_by_grid = self.wait_requests.groupby('origin_grid_id')['trip_time'].mean().astype(float)
+        # wait_requests_time_vector = wait_requests_time_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
+
+        # --- 3. 空闲司机分布 ---
         con_ready_to_dispatch = (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)
         idle_driver_table = self.driver_table[con_ready_to_dispatch]
         idle_driver_by_grid = idle_driver_table.groupby('grid_id')['grid_id'].count()
         idle_driver_vector = idle_driver_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
 
-        # --- 3. 正在配送司机分布 ---
+        # --- 4. 正在配送司机分布 ---
         occupied_driver_table = self.driver_table[self.driver_table['status'] == 1]
         occupied_driver_by_grid = occupied_driver_table.groupby('target_grid_id')['target_grid_id'].count()
         occupied_driver_vector = occupied_driver_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
 
-        # --- 4. 拼接为 [grid_num, 3] 的状态矩阵 ---
+        # --- 4. 拼接为 [grid_num, 5] 的状态矩阵 ---
         state_matrix = np.concatenate([
             wait_requests_vector,  # 订单数
+            # wait_requests_dest_vector,
+            # wait_requests_time_vector,
             idle_driver_vector,  # 空车数
             occupied_driver_vector  # 配送车数
-        ], axis=1)  # shape: [35, 3]
+        ], axis=1)  # shape: [35, 5]
 
         time_scalar = self.current_step
         time_sin = np.sin(2 * np.pi * time_scalar / 1440)
@@ -1448,7 +1398,7 @@ class Simulator:
         time_encoding = np.array([time_sin, time_cos])
 
         # --- 6. 展平为一维状态向量 + 时间编码 ---
-        state_vector = state_matrix.flatten()  # shape: [105]
-        final_state = np.concatenate([state_vector, time_encoding])  # shape: [107]
+        state_vector = state_matrix.flatten()  # shape: [175]
+        final_state = np.concatenate([state_vector, time_encoding])  # shape: [177]
 
         return final_state

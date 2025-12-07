@@ -176,7 +176,7 @@ def LD(dispatch_observ,method):
     driver_to_index = {driver_id: i for i, driver_id in enumerate(l_drivers)}
 
     # coefficients and parameters, formulated as M * N matrix
-    non_exist_link_value = 0.
+    non_exist_link_value = -50 # this value should be  smaller when use a trained q-table by large dataset
     matrix_reward = non_exist_link_value + np.zeros([M, N])  # reward     # this value should be smaller than any possible weights
     matrix_flag = np.zeros([M, N])  # pick up distance
     matrix_x_variables = np.zeros([M, N])  # 1 means there is potential match. otherwise, 0

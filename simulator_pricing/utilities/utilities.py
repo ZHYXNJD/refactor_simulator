@@ -1,44 +1,32 @@
-# from re import I
-# from socket import if_indextoname
-import json
-import os
-
 import numpy as np
 from copy import deepcopy
 import random
 from random import choice
-from shapely.geometry import Point, Polygon
-from pymongo.errors import ConnectionFailure
-
-from .dispatch_alg import LD
-from math import radians, sin, atan2, cos, acos
-from config import *
+from matplotlib import pyplot as plt
+from sklearn.neighbors import BallTree
+from math import acos
 import math
-import pickle
 import osmnx as ox
-from tqdm import tqdm
 import pandas as pd
-import sys
-from collections import Counter
-import pymongo
-import time
-import scipy.stats as st
 from scipy.stats import skewnorm
 from collections import defaultdict
-import networkx as nx
-from config import env_params
+from simulator_matching.config import env_params
 import geopandas as gpd
-from path import *
-from math import sin, cos, sqrt, atan2, radians, degrees, asin, pi
+from math import sin, cos, atan2, radians, degrees, asin, pi
 import os
-import sys
+
+from simulator_pricing.utilities.dispatch_alg import LD
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 """
 Here, we load the information of graph network from graphml file.
 """
+data_path = 'simulator_matching/my_data'
 G = ox.load_graphml(os.path.join(data_path, 'manhattan.graphml'))
-# G = ox.load_graphml('Queens_data/queens_drive_network_simplified.graphml')
-gdf_nodes, _ = ox.graph_to_gdfs(G)
 gdf_nodes, _ = ox.graph_to_gdfs(G)
 lat_list = gdf_nodes['y'].tolist()
 lng_list = gdf_nodes['x'].tolist()
@@ -46,13 +34,13 @@ node_id = gdf_nodes.index.tolist()
 
 shp_file_path = os.path.join(data_path,f"new_grids_{env_params['grid_num']}", f"new_grids_{env_params['grid_num']}.shp")
 result = gpd.read_file(shp_file_path)
-# result = pd.read_csv('Queens_data/queens_network_ndoes_gridID.csv')
 result = result.rename(columns={"osmid": "node_id", "x": "lng", "y": "lat"})
-result['lng'] = result['lng'].round(decimals=7)
-result['lat'] = result['lat'].round(decimals=7)
 # map id to coordinate; map coordinate to node_id
+# 重建索引
+result.set_index('node_id', inplace=True,drop=False)
 node_id_to_coord = result.set_index('node_id')[['lng', 'lat']].apply(tuple, axis=1).to_dict()
 node_coord_to_id = {value: key for key, value in node_id_to_coord.items()}
+
 
 map_from_node_to_grid = {}
 map_from_grid_to_nodes = defaultdict(list)
@@ -64,21 +52,9 @@ for index, row in result.iterrows():
     map_from_grid_to_nodes[grid_id].append(node_id)
     map_from_grid_to_centroid[grid_id] = (row['centroid_x'], row['centroid_y'])
 
-
 """
 Here, we build the connection to mongodb, which will be used to speed up access to road network information.
 """
-# myclient = pymongo.MongoClient("mongodb://localhost:27017/")
-myclient = pymongo.MongoClient("mongodb://host.docker.internal:27017/")
-try:
-    # The ismaster command is cheap and does not require auth.
-    myclient.admin.command('ismaster')
-    print("MongoDB is connected!")
-except ConnectionFailure:
-    print("Server not available")
-mydb = myclient["manhattan_island"]
-mycollection = mydb['od_shortest_path']
-
 
 df_neighbor_centroid = pd.DataFrame()
 zone_id = []
@@ -91,14 +67,12 @@ right_b = []
 
 if env_params['repo2any'] == True:
     for id in range(env_params['grid_num']):
-    # for id in (result['grid_id'].unique().tolist()):
         zone_id.append(id)
         current_centroid = map_from_grid_to_centroid[id]
         centroid_lng.append(current_centroid[0])
         centroid_lat.append(current_centroid[1])
     df_neighbor_centroid['zone_id'] = zone_id
     df_neighbor_centroid['centroid_lng'] = centroid_lng
-    # df_neighbor_centroid['centroid_lon'] = centroid_lng
     df_neighbor_centroid['centroid_lat'] = centroid_lat
     direction_0 = [1] * len(zone_id)
     df_available_directions = pd.DataFrame([direction_0] * len(direction_0)).transpose()
@@ -109,7 +83,7 @@ else:
         down = [2, 3, 4, 5, 6, 7, 6, 7]
         left = [0, 2, 4, 6, 0, 2, 4, 6]
         right = [1, 3, 5, 7, 1, 3, 5, 7]
-    elif env_params['grid_num'] == 35:    
+    elif env_params['grid_num'] == 35:
         up = [1, 3, 4, 6, 7, 8, 9, 10, 13, 14, 12, 12, 15, 16, 20, 21, 17, 18, 24, 25, 23, 22, 23, 26, 27, 29, 29, 28, 30, 31, 32, 34, 33, 33, 34]
         down = [0, 0, 0, 1, 2, 3, 3, 4, 5, 6, 7, 7, 10, 8, 9, 12, 13, 16, 17, 14, 14, 15, 21, 20, 18, 18, 23, 24, 27, 25, 28, 29, 30, 32, 31]
         left = [0, 1, 1, 3, 3, 5, 5, 6, 8, 8, 9, 10, 14, 13, 13, 14, 16, 17, 18, 17, 20, 20, 20, 25, 24, 24, 25, 27, 28, 27, 30, 30, 32, 33, 33]
@@ -208,43 +182,6 @@ def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, 
 
     return np.array(epsilons)
 
-# Andrew: modified cruising function 
-def cruising(eligible_driver_table, mode):
-    """
-    :param eligible_driver_table: information of eligible driver.
-    :type eligible_driver_table: pandas.DataFrame
-    :param mode: the type of both-rg-cruising, if type is random; it can cruise to every node with equal
-                probability; if the type is nearby, it will cruise to the node in adjacent grid or
-                just stay at the original region.
-    :type mode: string
-    :return: itinerary_node_list, itinerary_segment_dis_list, dis_array
-    :rtype: tuple
-    """
-    dest_array = []
-    grid_id_list = eligible_driver_table.loc[:, 'grid_id'].values
-
-    for grid_id in grid_id_list:
-        if mode == "global-random":
-            random_number = random.choice(df_neighbor_centroid['zone_id'].values)
-        elif mode == 'random':
-            target = [grid_id]
-            neighbors = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == grid_id].iloc[0]
-            for direction in ['up', 'down', 'left', 'right']:
-                neighbor_id = neighbors[direction]
-                if neighbor_id != grid_id:
-                    target.append(neighbor_id)
-            random_number = choice(target)
-        
-        record = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == random_number]
-        if len(record) > 0:
-            dest_array.append([record.iloc[0]['centroid_lng'], record.iloc[0]['centroid_lat']])
-        else:
-            dest_array.append([df_neighbor_centroid.iloc[0]['centroid_lng'], df_neighbor_centroid.iloc[0]['centroid_lat']])
-    
-    coord_array = eligible_driver_table.loc[:, ['lng', 'lat']].values
-    itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array, np.array(dest_array))
-    return itinerary_node_list, itinerary_segment_dis_list, dis_array
-
 
 def get_real_coord_given_current_next_coord(coord1, coord2, d):
     '''
@@ -291,7 +228,6 @@ def distance(coord_1, coord_2):
     :return: the manhattan distance between these two points
     :rtype: float
     """
-    manhattan_dis = 0
     lon1, lat1 = coord_1
     lon2, lat2 = coord_2
     lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
@@ -381,6 +317,26 @@ def get_distance_array(origin_coord_array, dest_coord_array):
     return dis_array
 
 
+def _get_safe_worker_count(user_defined=None):
+    """
+    自动计算安全的并发 worker 数量。
+    - 如果用户提供了 max_workers，则使用用户定义。
+    - 否则自动检测 CPU 空闲核心。
+    """
+    if user_defined is not None:
+        return max(1, int(user_defined))
+
+    try:
+        cpu_count = psutil.cpu_count(logical=True) if psutil else os.cpu_count()
+        cpu_percent = psutil.cpu_percent(percpu=True) if psutil else [0] * cpu_count
+        # 计算空闲核心数
+        idle_cores = sum(1 for p in cpu_percent if p < 50)
+        usable = min(cpu_count - 1, max(1, idle_cores))  # 留 1 个核心
+        return usable
+    except Exception:
+        return max(1, (os.cpu_count() or 4) - 1)
+
+
 def route_generation_array(origin_coord_array, dest_coord_array, reposition=False, mode='rg'):
     """
 
@@ -399,68 +355,45 @@ def route_generation_array(origin_coord_array, dest_coord_array, reposition=Fals
              destination node
     :rtype: tuple
     """
-    # print("route generation start")
-    # origin_coord_list为 Kx2 的array，第一列为lng，第二列为lat；dest_coord_array同理
-    # itinerary_node_list的每一项为一个list，包含了对应路线中的各个节点编号
-    # itinerary_segment_dis_list的每一项为一个array，包含了对应路线中的各节点到相邻下一节点的距离
-    # dis_array包含了各行程的总里程
     origin_node_list = get_nodeId_from_coordinate(origin_coord_array[:, 0], origin_coord_array[:, 1])
     dest_node_list = get_nodeId_from_coordinate(dest_coord_array[:, 0], dest_coord_array[:, 1])
+
+
+
     itinerary_node_list = []
     itinerary_segment_dis_list = []
-    dis_array = []
-    if mode == 'ma':
-        for origin, dest in zip(origin_node_list, dest_node_list):
-            itinerary_node_list.append([dest])
-            dis = distance(node_id_to_coord[origin], node_id_to_coord[dest])
-            itinerary_segment_dis_list.append([dis])
-            dis_array.append(dis)
-        return itinerary_node_list, itinerary_segment_dis_list, np.array(dis_array)
-    
-    elif mode == 'rg':
-        # 返回完整itinerary
-        for origin, dest in zip(origin_node_list, dest_node_list):
-            origin = int(origin)
-            dest = int(dest)
-            query = {
-                'origin': origin,
-                'destination': dest
-            }
-            re = mycollection.find_one(query)
-            if re:
-                ite = re['itinerary_node_list']
-            else:
-                ite = ox.distance.shortest_path(G, origin, dest, weight='length', cpus=16)
-                if ite is None:
-                    ite = [origin, dest]
-                content = {
-                    'origin': origin,
-                    'destination': dest,
-                    'itinerary_node_list': ite
-                }
-                try:
-                    mycollection.insert_one(content)
-                except Exception as e:
-                    print(f"Error inserting data for origin: {origin}, destination: {dest}: {e}")
-            if ite is not None and len(ite) > 1:
-                itinerary_node_list.append(ite)
-            else:
-                itinerary_node_list.append([origin, dest])
-      
-        for itinerary_node in itinerary_node_list:
-            if itinerary_node is not None:
-                itinerary_segment_dis = []
-                for i in range(len(itinerary_node) - 1):
-                    dis = distance(node_id_to_coord[itinerary_node[i]], node_id_to_coord[itinerary_node[i + 1]])
-                    itinerary_segment_dis.append(dis)
-                dis_array.append(sum(itinerary_segment_dis))
-                itinerary_segment_dis_list.append(itinerary_segment_dis)
-            if not reposition: 
-                itinerary_node.pop()
-    
-    dis_array = np.array(dis_array)
-    return itinerary_node_list, itinerary_segment_dis_list, dis_array
+    dis_array_list = []
 
+    if mode == 'ma':
+        # 处理 'ma' 模式
+        for coord_1, coord_2,dest in zip(origin_coord_array, dest_coord_array,dest_node_list):
+            itinerary_node_list.append([dest])
+            dis = distance(coord_1,coord_2)
+            itinerary_segment_dis_list.append([dis])
+            dis_array_list.append(dis)
+        return itinerary_node_list,itinerary_segment_dis_list,dis_array_list
+
+    elif mode == 'rg':
+        # 1. 寻路 (原 Loop 1)
+        itinerary_node_list = ox.shortest_path(G, origin_node_list, dest_node_list, weight='length')
+        for ith,ite in enumerate(itinerary_node_list):
+            if ite is None or len(ite) <= 1:
+                ite = [origin_node_list[ith], dest_node_list[ith]]
+                itinerary_node_list[ith] = [origin_node_list[ith], dest_node_list[ith]]
+            # 2. 计算距离 (原 Loop 2)
+            itinerary_segment_dis = []
+            for i in range(len(ite) - 1):
+                dis = distance(node_id_to_coord[ite[i]], node_id_to_coord[ite[i + 1]])
+                itinerary_segment_dis.append(dis)
+            # 3. 处理 reposition
+            if not reposition:
+                ite.pop()  # 在计算完距离后再 pop
+            total_dis = sum(itinerary_segment_dis)
+            itinerary_segment_dis_list.append(itinerary_segment_dis)
+            dis_array_list.append(total_dis)
+
+        dis_array = np.array(dis_array_list)
+        return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
 def get_closed_lng_lat(current_lng_lat_array, target_lng_lat_array):
     ret = []
@@ -510,10 +443,14 @@ class road_network:
                 lat_array is the array of latitude; the array of node id.
         :rtype: tuple
         """
-        index_list = [self.df_road_network[self.df_road_network['node_id'] == item].index[0] for item in node_id_array]
-        lng_array = self.df_road_network.loc[index_list, 'lng'].values
-        lat_array = self.df_road_network.loc[index_list, 'lat'].values
-        grid_id_array = self.df_road_network.loc[index_list, 'grid_id'].values
+        result_df = self.df_road_network.loc[node_id_array]
+        lng_array = result_df['lng'].values
+        lat_array = result_df['lat'].values
+        grid_id_array = result_df['grid_id'].values
+        # index_list = [self.df_road_network[self.df_road_network['node_id'] == item].index[0] for item in node_id_array]
+        # lng_array = self.df_road_network.loc[index_list, 'lng'].values
+        # lat_array = self.df_road_network.loc[index_list, 'lat'].values
+        # grid_id_array = self.df_road_network.loc[index_list, 'grid_id'].values
         return lng_array, lat_array, grid_id_array
 
 
@@ -565,7 +502,11 @@ def sample_all_drivers(driver_info, t_initial, t_end, driver_sample_ratio=1, dri
     """
     # 当前并无随机抽样司机；后期若需要，可设置抽样模块生成sampled_driver_info
     new_driver_info = deepcopy(driver_info)
-    sampled_driver_info = new_driver_info.sample(frac=driver_sample_ratio)
+    # np.random.seed(42)
+    if driver_sample_ratio != 1:
+        sampled_driver_info = new_driver_info.sample(frac=driver_sample_ratio)
+    else:
+        sampled_driver_info = new_driver_info
     sampled_driver_info['status'] = 3
     loc_con = (sampled_driver_info['start_time'] >= t_initial) & (sampled_driver_info['start_time'] <= t_end)
     sampled_driver_info.loc[loc_con, 'status'] = 0
@@ -608,120 +549,219 @@ def skewed_normal_distribution(u, thegma, k, omega, a, input_size):
     return skewnorm.rvs(a, loc=u, scale=thegma, size=input_size)
 
 
-def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=950, dispatch_method='LD',
-                   method=env_params['method']):
+def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, dispatch_method='LD',
+                   method='pickup_distance'):
     """
     :param wait_requests: the requests of orders
     :type wait_requests: pandas.DataFrame
+
     :param driver_table: the information of online drivers
     :type driver_table:  pandas.DataFrame
+
     :param maximal_pickup_distance: maximum of pickup distance
     :type maximal_pickup_distance: int
+
     :param dispatch_method: the method of order dispatch
     :type dispatch_method: string
+
     :return: matched_pair_actual_indexs: order and driver pair, matched_itinerary: the itinerary of matched driver
     :rtype: tuple
     """
-    # print("matching driver: ", len(driver_table)," matching orders: ",len(wait_requests))
-
-    # 排除掉repo至机场的
-    # repo2airport0 = (driver_table['status']==4) & (driver_table['target_grid_id']==132) & (driver_table['grid_id']!=132)
-    # repo2airport1 = (driver_table['status']==4) & (driver_table['target_grid_id']==138) & (driver_table['grid_id']!=138)
-    #
-    # print(f"调度至机场0但是未到达的车辆数：{sum(repo2airport0)}")
-    # print(f"调度至机场1但是未到达的车辆数：{sum(repo2airport1)}")
-
     con_ready_to_dispatch = (driver_table['status'] == 0) | (driver_table['status'] == 4)
     idle_driver_table = driver_table[con_ready_to_dispatch]
-    # idle_driver_table = driver_table[con_ready_to_dispatch & ~repo2airport0 & ~repo2airport1]
     num_wait_request = wait_requests.shape[0]
     num_idle_driver = idle_driver_table.shape[0]
-    # print(f"空闲车辆：{num_idle_driver}")
     matched_pair_actual_indexs = []
     matched_itinerary = []
 
     if num_wait_request > 0 and num_idle_driver > 0:
         if dispatch_method == 'LD':
             # generate order driver pairs and corresponding itinerary
-            request_array_temp = wait_requests.loc[:, ['origin_lng', 'origin_lat', 'order_id', 'weight']] # 这里默认的weight是design reward
-            # request_array_temp = wait_requests.loc[:, ['origin_lng', 'origin_lat', 'order_id', 'designed_reward']]
-            request_array = np.repeat(request_array_temp.values, num_idle_driver, axis=0)
-            driver_loc_array_temp = idle_driver_table.loc[:, ['lng', 'lat', 'driver_id']]
-            driver_loc_array = np.tile(driver_loc_array_temp.values, (num_wait_request, 1))
-            dis_array = distance_array(request_array[:, :2], driver_loc_array[:, :2])
-            # 匹配方法就是在这里修改
-            if method == "pickup_distance":
-                # weight转换为最大pickup distance - 当前pickup distance
-                request_array[:, -1] = maximal_pickup_distance - dis_array + 1
-            elif method == "instant_reward":
-                pass
-            elif method == "":
-                pass
-            flag = np.where(dis_array <= maximal_pickup_distance)[0]
-            # print("flag length", len(flag))
-            if len(flag) > 0:
-                order_driver_pair = np.vstack(
-                    [request_array[flag, 2], driver_loc_array[flag, 2], request_array[flag, 3], dis_array[flag]]).T
-                matched_pair_actual_indexs = LD(order_driver_pair.tolist())
-                request_indexs = np.array(matched_pair_actual_indexs)[:, 0]
-                driver_indexs = np.array(matched_pair_actual_indexs)[:, 1]
-                request_indexs_new = []
-                driver_indexs_new = []
-                for index in request_indexs:
-                    request_indexs_new.append(
-                        request_array_temp[request_array_temp['order_id'] == int(index)].index.tolist()[0])
-                for index in driver_indexs:
-                    driver_indexs_new.append(
-                        driver_loc_array_temp[driver_loc_array_temp['driver_id'] == index].index.tolist()[0])
-                request_array_new = np.array(request_array_temp.loc[request_indexs_new])[:, :2]
-                driver_loc_array_new = np.array(driver_loc_array_temp.loc[driver_indexs_new])[:, :2]
-                itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(
-                    driver_loc_array_new, request_array_new, mode=env_params['pickup_mode'])
-                # itinerary_node_list_new = []
-                # itinerary_segment_dis_list_new = []
-                # dis_array_new = []
-                # for item in matched_pair_actual_indexs:
-                #     index = int(item[3])
-                #     itinerary_node_list_new.append(itinerary_node_list[index])
-                #     itinerary_segment_dis_list_new.append(itinerary_segment_dis_list[index])
-                #     dis_array_new.append(dis_array[index])
+            request_array_temp = wait_requests.loc[:, ['origin_id','origin_lng', 'origin_lat', 'order_id', 'weight']]
+            driver_loc_array_temp = idle_driver_table.loc[:, ['node_id','lng', 'lat', 'driver_id']]
 
-                # 机场订单
-                # airport0_requests = wait_requests.loc[wait_requests['origin_grid_id']==132].index.tolist()
-                # airport1_requests = wait_requests.loc[wait_requests['origin_grid_id']==138].index.tolist()
-                # matched_airport0_requests = len(set(request_indexs_new) & set(airport0_requests))
-                # matched_airport1_requests = len(set(request_indexs_new) & set(airport1_requests))
-                # print(f"总订单：{num_wait_request}，匹配完成的订单：{len(matched_pair_actual_indexs)}")
-                # print(f"机场0订单：{len(airport0_requests)}，匹配完成的订单：{matched_airport0_requests}")
-                # print(f"机场1订单：{len(airport1_requests)}，匹配完成的订单：{matched_airport1_requests}")
+            # [新增优化] 立即设置索引，为“step 2”的快速查找做准备
+            request_array_temp['order_id'] = request_array_temp['order_id'].astype(int)
+            driver_loc_array_temp['driver_id'] = driver_loc_array_temp['driver_id'].astype(int)
+            request_array_temp.set_index('order_id', inplace=True)
+            driver_loc_array_temp.set_index('driver_id', inplace=True)
 
-                matched_itinerary = [itinerary_node_list, itinerary_segment_dis_list, dis_array]
+            # 1. 准备数据
+            order_data = wait_requests.loc[:, ['origin_lng', 'origin_lat', 'order_id', 'weight']].values
+            driver_data = idle_driver_table.loc[:, ['lng', 'lat', 'driver_id']].values
+
+            # ------------------ [关键修正开始] ------------------
+
+            # [原始数据, 格式: [lng, lat]]
+            order_coords_deg_lnglat = order_data[:, :2].astype(np.float64)
+            driver_coords_deg_lnglat = driver_data[:, :2].astype(np.float64)
+
+            # 2. 阶段 1: BallTree 粗筛 (需要 [lat, lng])
+
+            # [翻转为 [lat, lng]]
+            order_coords_deg_latlon = order_coords_deg_lnglat[:, ::-1]
+            driver_coords_deg_latlon = driver_coords_deg_lnglat[:, ::-1]
+
+            order_coords_rad = np.radians(order_coords_deg_latlon)
+            driver_coords_rad = np.radians(driver_coords_deg_latlon)
+
+            driver_tree = BallTree(driver_coords_rad)
+
+            EARTH_RADIUS_METERS = 6371
+            radius_rad = maximal_pickup_distance / EARTH_RADIUS_METERS
+
+            possible_pairs_indices = driver_tree.query_radius(order_coords_rad, r=radius_rad)
+
+            m_indices = []
+            n_indices = []
+            for m, driver_idx_list in enumerate(possible_pairs_indices):
+                for n in driver_idx_list:
+                    m_indices.append(m)
+                    n_indices.append(n)
+
+            if len(m_indices) == 0:
+                return [], []
+
+                # 3. 阶段 2: distance_array 精筛 (需要 [lng, lat])
+
+            # [FIX] 我们必须使用*原始的*、未翻转的 [lng, lat] 坐标
+            candidate_order_coords = order_coords_deg_lnglat[m_indices]
+            candidate_driver_coords = driver_coords_deg_lnglat[n_indices]
+
+            # 现在 distance_array 得到了它期望的 [lng, lat] 格式
+            dis_array_candidates = distance_array(candidate_order_coords, candidate_driver_coords)
+
+            # ------------------ [关键修正结束] ------------------
+
+            # 使用精确距离进行最终过滤
+            valid_mask = dis_array_candidates <= maximal_pickup_distance
+
+            if not np.any(valid_mask):
+                return [], []  # 精筛后没有任何匹配
+
+            # 3. [核心优化] 从过滤后的索引直接构建 order_driver_pair
+
+            final_m_indices = np.array(m_indices)[valid_mask]
+            final_n_indices = np.array(n_indices)[valid_mask]
+            final_dis_array = dis_array_candidates[valid_mask]
+
+            # 提取最终配对所需的数据
+            final_order_ids = order_data[final_m_indices, 2]
+            final_order_weights = order_data[final_m_indices, 3]  # 这是原始 reward
+            final_driver_ids = driver_data[final_n_indices, 2]
+
+            # 4. 构建 LD 函数的输入
+            #    注意：我们不再创建 NumPy 数组再 .tolist()
+            #    我们直接构建 LD 期望的 list[list]
+
+            order_driver_pair_list = []
+
+            if method in ['dynamic_matching','static_multi']:
+                # reward_unit 是 (max_dist - dist), flag 是 原始 weight
+                # 需要找到权重为1的order 并将权重替换为相应的distance
+                # 按照之前的分析 还需要用一个大数减去distance
+                for i in range(len(final_order_ids)):
+                    flag_val = final_order_weights[i]
+                    if flag_val == 1:
+                        reward_unit = 5000 - final_dis_array[i]
+                    else:
+                        reward_unit = flag_val
+                    order_driver_pair_list.append([
+                        final_order_ids[i],
+                        final_driver_ids[i],
+                        reward_unit,
+                        final_dis_array[i]
+                    ])
+
+            elif method == 'd':
+                for i in range(len(final_order_ids)):
+                    flag_val = final_dis_array[i]
+                    reward_unit = maximal_pickup_distance - flag_val + 1
+                    order_driver_pair_list.append([
+                        final_order_ids[i],
+                        final_driver_ids[i],
+                        reward_unit,
+                        flag_val
+                    ])
+            else:
+                # reward_unit 是 原始 weight, flag 是 距离
+                for i in range(len(final_order_ids)):
+                    reward_unit = final_order_weights[i]
+                    flag_val = final_dis_array[i]
+                    order_driver_pair_list.append([
+                        final_order_ids[i],
+                        final_driver_ids[i],
+                        reward_unit,
+                        flag_val
+                    ])
+
+            if not order_driver_pair_list:
+                return [], []
+
+            # 5. [核心优化] 直接传入 list，而不是 np.array().tolist()
+            matched_pair_actual_indexs = LD(order_driver_pair_list, method)
+
+            # [新代码] 1. 提取 ID
+            # (确保 LD 返回的 ID 是 int 或 float，如果不是，请转换)
+            request_indexs = np.array(matched_pair_actual_indexs)[:, 0].astype(int)
+            driver_indexs = np.array(matched_pair_actual_indexs)[:, 1].astype(int)
+
+            # [新代码] 2. 直接批量查找坐标 (替换所有 for 循环)
+            # .loc[id_list] 使用哈希索引，速度极快
+            request_array_new = request_array_temp.loc[request_indexs, ['origin_lng', 'origin_lat']].values
+            driver_loc_array_new = driver_loc_array_temp.loc[driver_indexs, ['lng', 'lat']].values
+
+            # 3. 调用路由生成 (不变)
+            itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(
+                driver_loc_array_new, request_array_new)
+
+            matched_itinerary = np.array(
+                    [itinerary_node_list, itinerary_segment_dis_list, dis_array],
+                    dtype=object
+                )
+
+        # TODO: ADD NEW dispatch method
     return matched_pair_actual_indexs, np.array(matched_itinerary)
 
+# Andrew: modified cruising function 
+def cruising(eligible_driver_table, mode):
+    """
+    :param eligible_driver_table: information of eligible driver.
+    :type eligible_driver_table: pandas.DataFrame
+    :param mode: the type of both-rg-cruising, if type is random; it can cruise to every node with equal
+                probability; if the type is nearby, it will cruise to the node in adjacent grid or
+                just stay at the original region.
+    :type mode: string
+    :return: itinerary_node_list, itinerary_segment_dis_list, dis_array
+    :rtype: tuple
+    """
+    dest_array = []
+    grid_id_list = eligible_driver_table.loc[:, 'grid_id'].values
 
-# def driver_online_offline_decision(driver_table, current_time):
-#     # 注意pickup和delivery driver不应当下线
-#     # 车辆状态：0 cruise (park 或正在cruise)， 1 表示delivery，2 pickup, 3 表示下线, 4 reposition
-#     # This function is aimed to switch the driver states between 0 and 3, based on the 'start_time' and 'end_time' of drivers
-#     # Notice that we should not change the state of delievery and pickup drivers, since they are occopied.
-#     online_driver_table = driver_table.loc[
-#         (driver_table['start_time'] <= current_time) & (driver_table['end_time'] > current_time)]
-#     offline_driver_table = driver_table.loc[
-#         (driver_table['start_time'] > current_time) | (driver_table['end_time'] <= current_time)]
-#
-#     online_driver_table = online_driver_table.loc[
-#         (online_driver_table['status'] != 1) & (online_driver_table['status'] != 2)]
-#     offline_driver_table = offline_driver_table.loc[
-#         (offline_driver_table['status'] != 1) | (offline_driver_table['status'] != 2)]
-#     # print(f'online count: {len(online_driver_table)}, offline count: {len(offline_driver_table)}, total count: {len(driver_table)}')
-#     new_driver_table = driver_table
-#     new_driver_table.loc[new_driver_table.isin(online_driver_table.to_dict('list')).all(axis=1), 'status'] = 0
-#     new_driver_table.loc[new_driver_table.isin(offline_driver_table.to_dict('list')).all(axis=1), 'status'] = 3
-#     # return new_driver_table
-#     return new_driver_table
-
-
-# define the function to get zone_id of segment node
+    for grid_id in grid_id_list:
+        if mode == "global-random":
+            np.random.seed(42)
+            random_number = random.choice(df_neighbor_centroid['zone_id'].values)
+        elif mode == 'random':
+            target = [grid_id]
+            neighbors = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == grid_id].iloc[0]
+            for direction in ['up', 'down', 'left', 'right']:
+                neighbor_id = neighbors[direction]
+                if neighbor_id != grid_id:
+                    target.append(neighbor_id)
+            random_number = choice(target)
+        
+        record = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == random_number]
+        if len(record) > 0:
+            dest_array.append([record.iloc[0]['centroid_lng'], record.iloc[0]['centroid_lat']])
+        else:
+            dest_array.append([df_neighbor_centroid.iloc[0]['centroid_lng'], df_neighbor_centroid.iloc[0]['centroid_lat']])
+    
+    coord_array = eligible_driver_table.loc[:, ['lng', 'lat']].values
+    # 注意：如果想要加速，那么距离计算可以换一种方法
+    # 现在方法是rg，换成ma会加速
+    itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array, np.array(dest_array))
+    return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
 def driver_online_offline_decision(driver_table, current_time):
     # 车辆状态：0 cruise, 1 delivery, 2 pickup, 3 offline, 4 reposition
@@ -762,6 +802,10 @@ def driver_online_offline_decision(driver_table, current_time):
     # new_driver_table = driver_table 是多余的，因为 driver_table 已经被就地修改
     return driver_table
 
+
+# define the function to get zone_id of segment node
+
+
 def get_nodeId_from_coordinate(lng, lat):
     """
 
@@ -775,9 +819,9 @@ def get_nodeId_from_coordinate(lng, lat):
     node_list = []
     for i in range(len(lat)):
         if lng[i] not in lng_list or lat[i] not in lat_list:
-            x = ox.nearest_nodes(G, lng[i], lat[i])
+            x = int(ox.nearest_nodes(G, lng[i], lat[i]))
         else:
-            x = node_coord_to_id[(lng[i], lat[i])]
+            x = int(node_coord_to_id[(lng[i], lat[i])])
         node_list.append(x)
     return node_list
 
@@ -792,6 +836,133 @@ def random_actions(possible_directions):
     action = random.sample(possible_directions, 1)[0]
     return action
 
+# rl for matching
+# state for sarsa
+#
+class State:
+    def __init__(self, time_slice: int, grid_id: int):
+        self.time_slice = time_slice  # time slice
+        self.grid_id = grid_id  # the grid where a taxi stays in
+
+    def __hash__(self):
+        return hash(str(self.grid_id) + str(self.time_slice))
+
+    def __eq__(self, other):
+        if self.grid_id == other.grid_id and self.time_slice == other.time_slice:
+            return True
+        return False
+
+# 在每轮仿真结束后调用，并传入 MetricsLogger.log_rl_metrics()。
+def compute_action_counts(actions, num_agents, num_actions):
+    """
+    actions: list of int, len = num_agents
+    returns: list of list, shape = [num_agents, num_actions]
+    """
+    action_counts = [[0] * num_actions for _ in range(num_agents)]
+    for i in range(num_agents):
+        action = actions[i]
+        action_counts[i][action] += 1
+    return action_counts
+
+# 每次 agent 决策后调用 tracker.update(actions)，每轮结束后记录 tracker.get_switch_counts()。
+class StrategyTracker:
+    def __init__(self, num_agents):
+        self.num_agents = num_agents
+        self.last_actions = [None] * num_agents
+        self.switch_counts = [0] * num_agents
+
+    def update(self, current_actions):
+        for i in range(self.num_agents):
+            if self.last_actions[i] is not None and self.last_actions[i] != current_actions[i]:
+                self.switch_counts[i] += 1
+            self.last_actions[i] = current_actions[i]
+
+    def get_switch_counts(self):
+        return self.switch_counts
+
+# 每轮仿真结束后调用一次，保存为图片或记录数值。
+def plot_grid_rewards(grid_rewards, episode):
+    plt.figure(figsize=(10, 4))
+    plt.plot(range(len(grid_rewards)), grid_rewards, marker='o')
+    plt.title(f'Grid Reward Distribution - Episode {episode}')
+    plt.xlabel('Grid ID')
+    plt.ylabel('Cumulative Reward')
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(f'reward_plot_episode_{episode}.png')
+    plt.close()
+
+def calculate_evaluate_table(wait_requests,df_new_matched_requests):
+    # 假设 env_params 已定义
+    grid_num = env_params['grid_num']  # 35
+
+    # -------------------
+    # Step 1: 分类函数
+    # -------------------
+    def classify_request(row):
+        if row['trip_time'] >= 600:
+            return 'long_req'
+        elif row['trip_time'] <= 300:
+            return 'short_req'
+        else:
+            return 'medium_req'
+
+    for df in [df_new_matched_requests, wait_requests]:
+        df['req_type'] = df.apply(classify_request, axis=1)
+
+    # -------------------
+    # Step 2: matched requests 聚合
+    # -------------------
+    matched_group = df_new_matched_requests.groupby('origin_grid_id').agg(
+        total_reward=('designed_reward', 'sum'),
+        matched_request_num=('order_id', 'count'),
+        matched_long_request_num=('req_type', lambda x: (x == 'long_req').sum()),
+        matched_medium_request_num=('req_type', lambda x: (x == 'medium_req').sum()),
+        matched_short_request_num=('req_type', lambda x: (x == 'short_req').sum()),
+        waiting_time=('wait_time', 'mean'),
+        pickup_time=('pickup_time', 'mean'),
+        # trip_time_sum=('trip_time', 'sum'),
+        # pickup_time_sum=('pickup_time', 'sum')
+    ).reset_index()
+
+
+    # -------------------
+    # Step 3: wait requests 聚合
+    # -------------------
+    wait_group = wait_requests.groupby('origin_grid_id').agg(
+        total_request_num=('order_id', 'count'),
+        long_request_num=('req_type', lambda x: (x == 'long_req').sum()),
+        medium_request_num=('req_type', lambda x: (x == 'medium_req').sum()),
+        short_request_num=('req_type', lambda x: (x == 'short_req').sum())
+    ).reset_index()
+
+    # -------------------
+    # Step 4: 合并两个表
+    # -------------------
+    final_df = pd.merge(wait_group, matched_group, on='origin_grid_id', how='outer').fillna(0)
+
+    # -------------------
+    # Step 5: 计算匹配率
+    # -------------------
+    final_df['matched_long_request_ratio'] = final_df['matched_long_request_num'] / final_df[
+        'long_request_num'].replace(0, np.nan)
+    final_df['matched_medium_request_ratio'] = final_df['matched_medium_request_num'] / final_df[
+        'medium_request_num'].replace(0, np.nan)
+    final_df['matched_short_request_ratio'] = final_df['matched_short_request_num'] / final_df[
+        'short_request_num'].replace(0, np.nan)
+    final_df['matched_request_ratio'] = final_df['matched_request_num'] / final_df['total_request_num'].replace(0,
+                                                                                                                np.nan)
+
+    # NaN 替换为 0
+    final_df = final_df.fillna(0)
+
+    # -------------------
+    # Step 6: 补齐 grid
+    # -------------------
+    all_grids = pd.DataFrame({'origin_grid_id': range(grid_num)})
+    final_df = pd.merge(all_grids, final_df, on='origin_grid_id', how='left').fillna(0)
+
+    return final_df
 
 def get_airport_veh(airport_grid_id,current_pred_demand,next_pred_demand,driver_table):
 
@@ -890,90 +1061,3 @@ def airport_cruising(airport_eligible_driver_index,airport_num, driver_table,mod
     itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array,
                                                                                         np.array(dest_array))
     return itinerary_node_list, itinerary_segment_dis_list, dis_array
-
-def calculate_evaluate_table(wait_requests,df_new_matched_requests):
-    # 假设 env_params 已定义
-    grid_num = env_params['grid_num']  # 35
-
-    # -------------------
-    # Step 1: 分类函数
-    # -------------------
-    def classify_request(row):
-        if row['trip_time'] >= 600:
-            return 'long_req'
-        elif row['trip_time'] <= 300:
-            return 'short_req'
-        else:
-            return 'medium_req'
-
-    for df in [df_new_matched_requests, wait_requests]:
-        df['req_type'] = df.apply(classify_request, axis=1)
-
-    # -------------------
-    # Step 2: matched requests 聚合
-    # -------------------
-    matched_group = df_new_matched_requests.groupby('origin_grid_id').agg(
-        total_reward=('designed_reward', 'sum'),
-        matched_request_num=('order_id', 'count'),
-        matched_long_request_num=('req_type', lambda x: (x == 'long_req').sum()),
-        matched_medium_request_num=('req_type', lambda x: (x == 'medium_req').sum()),
-        matched_short_request_num=('req_type', lambda x: (x == 'short_req').sum()),
-        waiting_time=('wait_time', 'mean'),
-        pickup_time=('pickup_time', 'mean'),
-        # trip_time_sum=('trip_time', 'sum'),
-        # pickup_time_sum=('pickup_time', 'sum')
-    ).reset_index()
-
-
-    # -------------------
-    # Step 3: wait requests 聚合
-    # -------------------
-    wait_group = wait_requests.groupby('origin_grid_id').agg(
-        total_request_num=('order_id', 'count'),
-        long_request_num=('req_type', lambda x: (x == 'long_req').sum()),
-        medium_request_num=('req_type', lambda x: (x == 'medium_req').sum()),
-        short_request_num=('req_type', lambda x: (x == 'short_req').sum())
-    ).reset_index()
-
-    # -------------------
-    # Step 4: 合并两个表
-    # -------------------
-    final_df = pd.merge(wait_group, matched_group, on='origin_grid_id', how='outer').fillna(0)
-
-    # -------------------
-    # Step 5: 计算匹配率
-    # -------------------
-    final_df['matched_long_request_ratio'] = final_df['matched_long_request_num'] / final_df[
-        'long_request_num'].replace(0, np.nan)
-    final_df['matched_medium_request_ratio'] = final_df['matched_medium_request_num'] / final_df[
-        'medium_request_num'].replace(0, np.nan)
-    final_df['matched_short_request_ratio'] = final_df['matched_short_request_num'] / final_df[
-        'short_request_num'].replace(0, np.nan)
-    final_df['matched_request_ratio'] = final_df['matched_request_num'] / final_df['total_request_num'].replace(0,
-                                                                                                                np.nan)
-
-    # NaN 替换为 0
-    final_df = final_df.fillna(0)
-
-    # -------------------
-    # Step 6: 补齐 grid
-    # -------------------
-    all_grids = pd.DataFrame({'origin_grid_id': range(grid_num)})
-    final_df = pd.merge(all_grids, final_df, on='origin_grid_id', how='left').fillna(0)
-
-    return final_df
-
-# rl for matching
-# state for sarsa
-class State:
-    def __init__(self, time_slice: int, grid_id: int):
-        self.time_slice = time_slice  # time slice
-        self.grid_id = grid_id  # the grid where a taxi stays in
-
-    def __hash__(self):
-        return hash(str(self.grid_id) + str(self.time_slice))
-
-    def __eq__(self, other):
-        if self.grid_id == other.grid_id and self.time_slice == other.time_slice:
-            return True
-        return False

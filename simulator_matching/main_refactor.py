@@ -1,12 +1,13 @@
 from simulator_env import Simulator
+from simulator_matching.dynamic_matching_algorithm.idqn import IDQN
 from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import *
+from simulator_matching.dynamic_matching_algorithm.mappo import MAPPO
 from simulator_trainer import SimulatorTrainer
 from simulator_matching.pricing_agent import *
 from matching_agent import MatchingAgent
 from config import *
 import warnings
 warnings.filterwarnings("ignore")
-# from A2C import * # you may comment this import if you are running matching
 
 if __name__ == "__main__":
     # Andrew: set up logger
@@ -20,13 +21,14 @@ if __name__ == "__main__":
     pickup_flag = ['rg']
     delivery_flag = ['rg']
 
-    env_params['experiment_mode'] = 'train' # train_dynamic_matching, generate_warmup_data,train,test
-    env_params['rl_mode'] = 'matching'#  matching,dynamic_matching
-    env_params['method'] = 'rl'  # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
+    env_params['experiment_mode'] = 'test' # train_dynamic_matching, generate_warmup_data,train,test
+    env_params['rl_mode'] = 'dynamic_matching' #  matching,dynamic_matching
+    env_params['method'] = 'dynamic_matching'  # ir,rl,d,tt;ir_d;rl_d;d_rl,d_tt;tt_d,tt_rl;dynamic_matching
     driver_num = [1000]
     order_sample_ratio = [1]
-    env_params['date'] = ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08','2015-05-11']
-    best_epoch = 300 # 注意 该值需要你自己指定！！！
+    # env_params['date'] = ['2015-05-12']
+    # env_params['date'] = ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08','2015-05-11']
+    env_params['date'] = ['2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15','2015-05-18']
 
     for pc_flag in pickup_flag:
         for dl_flag in delivery_flag:
@@ -45,7 +47,8 @@ if __name__ == "__main__":
                             matching_agent_params = {
                                         'strategy_type': 'sarsa',
                                         'strategy_params': qTable_params,
-                                        'load_path': f"Q-table/{env_params['date']}/{env_params['driver_num']}/sarsa_q_value_table_epoch_{best_epoch}.pickle",
+                                        # 'load_path': f"Q-table/{env_params['date']}/{env_params['driver_num']}/sarsa_q_value_table_epoch_{best_epoch}.pickle",
+                                        'load_path': f"New-Q-table/1000/sarsa_q_value_table_epoch_150.pickle",
                                         'flag_load': True
                                     }
                         else:
@@ -64,31 +67,39 @@ if __name__ == "__main__":
                         if env_params['method'] == 'dynamic_matching':
                             M = env_params['grid_num']  # grid 数量
                             state_dim = M * 3 + 2
+                            # state_dim = M * 5 + 2
                             obs_dim_per_agent = state_dim + M  # 加上 grid ID one-hot
                             obs_dims = [obs_dim_per_agent for _ in range(M)]
                             n_actions = [3 for _ in range(M)]
-                            maddpg = MADDPG(obs_dims=obs_dims, n_actions=n_actions,date=env_params['date'],driver_num=env_params['driver_num'])
-                            dynamic_matching_agent = maddpg
-                            simulator = Simulator(**env_params, matching_agent=matching_agent,
-                                                          pricing_agent=pricing_agent, dynamic_matching_agent=dynamic_matching_agent)
+
+                            config = {"lr_actor": 1e-05,"lr_critic": 0.0005,"gamma": 0.95,"tau": 0.005,"buffer_size": 5000,
+                                      "batch_size": 64,"action_var": 0.3,"update": 3}
+                            dynamic_matching_agent = MADDPG(obs_dims=obs_dims, n_actions=n_actions,date=env_params['date'],driver_num=env_params['driver_num'],**config)
+
+                            # config = {'agent_type': 'IDQN', 'lr_actor': 1e-5, 'lr_critic': 5e-4, 'gamma': 0.95, 'tau': 0.005,
+                            #  'buffer_size': 5000, 'batch_size': 64, 'action_var': 0.3, 'update': 3}
+                            # dynamic_matching_agent = IDQN(obs_dims=obs_dims, n_actions=n_actions,driver_num=env_params['driver_num'],**config)
+
+                            # config = {'agent_type': 'MAPPO', 'lr_actor': 1e-5, 'lr_critic': 5e-5, 'gamma': 0.95, 'tau': 0.005,
+                            #  'buffer_size': 5000, 'batch_size': 128, 'action_var': 0.3, 'update': 3}
+                            # dynamic_matching_agent =MAPPO(obs_dims=obs_dims, n_actions=n_actions, driver_num=env_params['driver_num'],**config)
+
+                            simulator = Simulator(**env_params, matching_agent=matching_agent, dynamic_matching_agent=dynamic_matching_agent)
 
                         else:
-                            simulator = Simulator(**env_params, matching_agent=matching_agent,
-                                                  pricing_agent=pricing_agent,dynamic_matching_agent=dynamic_matching_agent)
+                            simulator = Simulator(**env_params, matching_agent=matching_agent,dynamic_matching_agent=dynamic_matching_agent)
 
                         if simulator.experiment_mode == 'test':
                             trainer = SimulatorTrainer(
                                 simulator=simulator,
                                 matching_agent=matching_agent,
-                                pricing_agent=pricing_agent,
                                 dynamic_matching_agent=dynamic_matching_agent
                             )
-
 
                             trainer.test(
                                     simulator=simulator,
                                     test_config={
-                                        'test_dates': ['2015-05-05'],
+                                        'test_dates': env_params['date'],
                                         'method': simulator.method,
                                         'driver_num': single_driver_num,
                                         'order_sample_ratio': order_sample_ratio[ith],
@@ -102,7 +113,6 @@ if __name__ == "__main__":
                             trainer = SimulatorTrainer(
                                 simulator=simulator,
                                 matching_agent=matching_agent,
-                                pricing_agent=pricing_agent,
                                 dynamic_matching_agent=dynamic_matching_agent
                             )
                             trainer.train(
@@ -121,16 +131,17 @@ if __name__ == "__main__":
                             trainer = SimulatorTrainer(
                                 simulator=simulator,
                                 matching_agent=matching_agent,
-                                pricing_agent=pricing_agent,
                                 dynamic_matching_agent=dynamic_matching_agent
                             )
                             trainer.dynamic_matching_train(
                                 train_config={
-                                    'num_epochs': 1001,
+                                    'num_epochs': 801,
                                     'train_dates': env_params['date'],
                                     'driver_num': single_driver_num,
                                     'save_interval': 50,
-                                    'output_path': f"Dynamic-matching/{env_params['date']}",
+                                    # 'output_path': f"Dynamic-matching/{env_params['date']}",
+                                    'output_path': f"Dynamic-matching/PPO",
+                                    'parallel':False,
                                     'flag_load': True,  # 一定要加载之前的matching agent 也即q-table
                                 }
                             )
@@ -140,7 +151,6 @@ if __name__ == "__main__":
                             trainer = SimulatorTrainer(
                                 simulator=simulator,
                                 matching_agent=matching_agent,
-                                pricing_agent=pricing_agent,
                                 dynamic_matching_agent=dynamic_matching_agent
                             )
                             trainer.generate_warmup_data(

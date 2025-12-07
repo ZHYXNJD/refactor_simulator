@@ -1,10 +1,11 @@
 # 导入核心类
+import heapq
+import json
 from copy import deepcopy
 import joblib
 from sklearn.preprocessing import StandardScaler
 from torch.utils.tensorboard import SummaryWriter
 from simulator_env import Simulator
-from pricing_agent import PricingAgent
 from matching_agent import MatchingAgent
 
 # 导入工具库
@@ -14,8 +15,11 @@ import time
 import pickle
 import os
 from datetime import datetime
+
+from simulator_matching.dynamic_matching_algorithm.idqn import IDQN
 from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import MADDPG
 from config import *
+from simulator_matching.dynamic_matching_algorithm.mappo import MAPPO
 from simulator_matching.utilities import utilities
 
 
@@ -38,21 +42,9 @@ class MetricsLogger:
 
         self.writer.add_scalar('Critic/Critic1_Loss', critic1_loss_episode, episode)
         self.writer.add_scalar('Critic/Critic2_Loss', critic2_loss_episode, episode)
-        self.writer.add_scalar(f'Q_pi/Q_pi', q_pi_histoty, episode)
+        self.writer.add_scalar(f'Q_pi', q_pi_histoty, episode)
 
         for i in range(self.num_agents):
-            # try:
-            #     for step_index, actor_loss in enumerate(step_actor_losses[i]):
-            #         self.writer.add_scalar(f'Actor_{i}/Step_Loss', actor_loss, global_step=total_step+step_index)
-            #     for step_index, Q_pi in enumerate(step_q_pi[i]):
-            #         self.writer.add_scalar(f'Actor_{i}/Step_Loss', Q_pi,
-            #                                global_step=total_step + step_index)
-            #     for step_index, entropy in enumerate(step_entropy[i]):
-            #         self.writer.add_scalar(f'Actor_{i}/Step_Loss', entropy,
-            #                                global_step=total_step + step_index)
-            # except TypeError:
-            #     pass
-
             self.writer.add_scalar(f'Actor_{i}/Episode_Loss', actor_losses_episode[i], episode)
             self.writer.add_scalar(f'Actor_{i}/Episode_Entropy', entropy_history[i], episode)
 
@@ -64,7 +56,7 @@ class MetricsLogger:
         """
         记录环境反馈指标
         """
-        self.writer.add_scalar('Env/Total_Reward', total_reward, episode)
+        self.writer.add_scalar('Total_Reward', total_reward, episode)
         # self.writer.add_scalar('Env/Match_Rate', match_rate, episode)
         # self.writer.add_scalar('Env/Avg_Wait_Time', avg_wait_time, episode)
         # self.writer.add_scalar('Env/Occupancy_Rate', occupancy_rate, episode)
@@ -74,9 +66,9 @@ class MetricsLogger:
 
 # SimulatorTrainer: Andrew
 class SimulatorTrainer:
-    def __init__(self, simulator: Simulator, pricing_agent: PricingAgent, matching_agent: MatchingAgent,dynamic_matching_agent: MADDPG,):
+    def __init__(self, simulator: Simulator, matching_agent,dynamic_matching_agent):
         self.simulator = simulator
-        self.pricing_agent = pricing_agent
+        # self.pricing_agent = pricing_agent
         self.matching_agent = matching_agent
         self.dynamic_matching_agent = dynamic_matching_agent
 
@@ -130,9 +122,12 @@ class SimulatorTrainer:
         }
 
         # Set up simulator for this epoch
-        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
-        # self.simulator.experiment_date = train_config['train_dates']
+        # self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        self.simulator.experiment_date = train_config['train_dates']
         self.simulator.reset()
+        seed_list = [0,42,3407,1024,215] # 一切的开始 / 《银河系漫游指南》 / 《Torch.manual_seed(3407) is all you need》 / 程序员的信仰 / 太上老君生日
+        seed = seed_list[epoch % len(seed_list)]
+        np.random.seed(seed)
 
         # Run the simulation
         start_time = time.time()
@@ -165,56 +160,90 @@ class SimulatorTrainer:
         :param train_config: Training configuration dictionary.
         :logger: personalized logger.
         """
-
-
+        seed_list = [0, 42, 3407, 1024,215]  # 一切的开始 / 《银河系漫游指南》 / 《Torch.manual_seed(3407) is all you need》 / 程序员的信仰 / 太上老君生日
+        seed = seed_list[epoch % len(seed_list)]
         # Set up simulator for this epoch
-        self.simulator.experiment_date = train_config['train_dates']
-        self.simulator.reset()
+        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        if not train_config['parallel']:
+            # self.simulator.experiment_date = train_config['train_dates']
+            self.simulator.reset(seed)
+        else:
+            self.simulator.reset(seed,given_data=True,request_databases=train_config['REQUEST_DICT'][self.simulator.experiment_date],driver_info=train_config['DRIVER_INFO'])
+
         # Run the simulation
+        if isinstance(self.simulator.dynamic_matching_agent, MADDPG):
+            self.simulator.dynamic_matching_agent.actor_losses_history = [[] for _ in range(35)]
+            self.simulator.dynamic_matching_agent.q_pi_history = []
+            self.simulator.dynamic_matching_agent.entropy_history = [[] for _ in range(35)]
+            self.simulator.dynamic_matching_agent.critic1_losses_history = []
+            self.simulator.dynamic_matching_agent.critic2_losses_history = []
 
-        self.simulator.dynamic_matching_agent.actor_losses_history = [[] for _ in range(35)]  # per-agent step-level list
+        elif isinstance(self.simulator.dynamic_matching_agent, IDQN):
+            self.simulator.dynamic_matching_agent.loss_history = [[] for _ in range(35)]
 
-        self.simulator.dynamic_matching_agent.q_pi_history = []
-        self.simulator.dynamic_matching_agent.entropy_history = [[] for _ in range(35)]
-
-        self.simulator.dynamic_matching_agent.critic1_losses_history = []
-        self.simulator.dynamic_matching_agent.critic2_losses_history = []
+        elif isinstance(self.simulator.dynamic_matching_agent, MAPPO):
+            self.simulator.dynamic_matching_agent.actor_losses_history = [[] for _ in range(35)]
+            self.simulator.dynamic_matching_agent.critic_losses_history = []
 
         self.simulator.dynamic_matching_agent.actor_counts = [[0] * 3 for _ in range(35)]
 
 
         for step in range(self.simulator.finish_run_step+1):
-            # TODO: Implement RL agent logic here
             self.simulator.rl_step_train_matching_method()
 
         self.simulator.dynamic_matching_agent.current_episode += 1
 
-        print(f"Epoch: {epoch}/{train_config['num_epochs']} | Total Reward: {self.simulator.total_reward}")
 
-        step_actor_losses = self.simulator.dynamic_matching_agent.actor_losses_history
-        step_critic1_loss = self.simulator.dynamic_matching_agent.critic1_losses_history
-        step_critic2_loss = self.simulator.dynamic_matching_agent.critic2_losses_history
-        step_q_pi = self.simulator.dynamic_matching_agent.q_pi_history
-        step_entropy = self.simulator.dynamic_matching_agent.entropy_history
+        if train_config['parallel']:
+            print(f"Worker: {train_config['worker_id']} | Date: {self.simulator.experiment_date} | Epoch: {epoch}/{train_config['num_epochs']} | Total Reward: {self.simulator.total_reward}")
+        else:
+            print(f"Epoch: {epoch}/{train_config['num_epochs']} | Total Reward: {self.simulator.total_reward}")
 
-        # compute action frequencies (normalize)
-        step_action_counts = self.simulator.dynamic_matching_agent.actor_counts
-        # record this episode's action frequency
-        self.simulator.dynamic_matching_agent.last_action_freq = [[cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in range(35)]
+        if isinstance(self.simulator.dynamic_matching_agent, MADDPG):
+            step_actor_losses = self.simulator.dynamic_matching_agent.actor_losses_history
+            step_critic1_loss = self.simulator.dynamic_matching_agent.critic1_losses_history
+            step_critic2_loss = self.simulator.dynamic_matching_agent.critic2_losses_history
+            step_entropy = self.simulator.dynamic_matching_agent.entropy_history
+            step_q_pi = self.simulator.dynamic_matching_agent.q_pi_history
+            step_action_counts = self.simulator.dynamic_matching_agent.actor_counts
+            # record this episode's action frequency
+            self.simulator.dynamic_matching_agent.last_action_freq = [[cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in range(35)]
+            # strategy switch counts
+            switch_counts = self.simulator.dynamic_matching_agent.strategy_tracker.get_switch_counts()
+            # log to TensorBoard via logger
+            logger.log_rl_metrics(epoch, step_actor_losses, step_critic1_loss, step_critic2_loss, step_action_counts,
+                                  step_q_pi, step_entropy)
+            logger.log_env_metrics(epoch, self.simulator.total_reward)
+        elif isinstance(self.simulator.dynamic_matching_agent, IDQN):
+            step_loss = self.simulator.dynamic_matching_agent.loss_history
+            step_action_counts = self.simulator.dynamic_matching_agent.actor_counts
+            # strategy switch counts
+            switch_counts = self.simulator.dynamic_matching_agent.strategy_tracker.get_switch_counts()
+            action_counts = [[cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in
+                             range(35)]
+            # log to TensorBoard via logger
+            loss_episode = np.mean(step_loss) if step_loss else 0.0
+            logger.writer.add_scalar('loss', loss_episode,epoch)
+            for i in range(35):
+                for a in range(3):
+                    logger.writer.add_scalar(f'Actor_{i}/Action_{a}_Freq', action_counts[i][a], epoch)
+            logger.writer.add_scalar('Total_Reward', self.simulator.total_reward, epoch)
+        elif isinstance(self.simulator.dynamic_matching_agent, MAPPO):
+            step_actor_losses = self.simulator.dynamic_matching_agent.actor_losses_history
+            step_critic_loss = self.simulator.dynamic_matching_agent.critic_losses_history
+            step_action_counts = self.simulator.dynamic_matching_agent.actor_counts
+            switch_counts = self.simulator.dynamic_matching_agent.strategy_tracker.get_switch_counts()
+            action_counts = [[cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in
+                             range(35)]
+            actor_loss_episode = [np.mean(step_actor_losses[i]) if step_actor_losses[i] else 0.0 for i in range(35)]
+            critic_loss_episode = np.mean(step_critic_loss) if step_critic_loss else 0.0
 
-        # strategy switch counts
-        switch_counts = self.simulator.dynamic_matching_agent.strategy_tracker.get_switch_counts()
-
-        # log to TensorBoard via logger
-
-        logger.log_rl_metrics(epoch, step_actor_losses, step_critic1_loss,step_critic2_loss, step_action_counts,step_q_pi,step_entropy)
-        logger.log_env_metrics(epoch, self.simulator.total_reward)
-
-        self.total_step += len(step_actor_losses[0])
-
-
-        # log strategy switches and grid_rewards
-
+            logger.writer.add_scalar('Critic_loss', critic_loss_episode,epoch)
+            for i in range(35):
+                logger.writer.add_scalar(f'Actor_{i}/Episode_loss', actor_loss_episode[i], epoch)
+                for a in range(3):
+                    logger.writer.add_scalar(f'Actor_{i}/Action_{a}_Freq', action_counts[i][a], epoch)
+            logger.writer.add_scalar('Total_Reward', self.simulator.total_reward, epoch)
         for i in range(env_params['grid_num']):
             logger.writer.add_scalar(f'Strategy/Agent_{i}_Switches', switch_counts[i], epoch)
         # logger.writer.add_histogram('Grid/Rewards', np.array(self.simulator.total_reward_by_grid.values), epoch)  # or log values per grid
@@ -254,6 +283,7 @@ class SimulatorTrainer:
         total_reward_record = np.zeros(train_config['num_epochs'])
         self.driver_num = train_config['driver_num']
         write_path = train_config['output_path'] + '/' + str(self.driver_num) + '_discount09'
+        # write_path = train_config['output_path'] + '/' + str(self.driver_num) + f"_{train_config['train_dates']}"
         if not os.path.exists(write_path):
             os.makedirs(write_path)
         writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
@@ -280,17 +310,55 @@ class SimulatorTrainer:
 
     def dynamic_matching_train(self, train_config):
         self.driver_num = train_config['driver_num']
-        write_path = train_config['output_path'] + '/' + str(self.driver_num) + '/long_decision_30min_fixed_seed'
+        write_path = train_config['output_path'] + '/' + str(self.driver_num)
         if not os.path.exists(write_path):
             os.makedirs(write_path)
-        writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
+        if not train_config['parallel']:
+            writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
+        else:
+            writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S')+'_'+str(train_config['worker_id']))
+            # 创建目录
+            os.makedirs(writer_filename, exist_ok=True)
+            # 保存为 JSON 文件
+            with open(f'{writer_filename}/hyper_parameters.json', "w", encoding="utf-8") as f:
+                json.dump(train_config['hyper_parameters'], f, ensure_ascii=False, indent=4)
+
         logger = MetricsLogger(log_dir=writer_filename,num_agents=env_params['grid_num'], num_actions=3)
 
+        # for epoch in range(train_config['num_epochs']):
+        #     # Run a single training epoch
+        #     self.run_training_epoch_match_method(epoch, train_config,logger)
+        #     if epoch % 50 == 0:
+        #         self.simulator.dynamic_matching_agent.save(write_path, epoch)
+
+        # 用最小堆维护前5个最优模型
+        best_models = []  # 存储 (score, epoch, path)
         for epoch in range(train_config['num_epochs']):
-            # Run a single training epoch
-            self.run_training_epoch_match_method(epoch, train_config,logger)
-            if epoch % 50 == 0:
-                self.simulator.dynamic_matching_agent.save(write_path, epoch,self.driver_num)
+            # 运行一个训练epoch
+            self.run_training_epoch_match_method(epoch, train_config, logger)
+
+            # 计算当前模型的性能指标，比如平均reward
+            score = self.simulator.total_reward
+
+            # 保存路径
+            model_path = f"{writer_filename}/model_epoch{epoch}_score{int(score)}.pt"
+
+            # 如果堆里不足5个，直接加入
+            if len(best_models) < 5:
+                self.simulator.dynamic_matching_agent.save(model_path)
+                heapq.heappush(best_models, (score, epoch, model_path))
+            else:
+                # 如果当前比最差的好，替换掉最差的
+                if score > best_models[0][0]:
+                    # 删除最差的模型文件
+                    worst_score, worst_epoch, worst_path = heapq.heappop(best_models)
+                    # 可以选择删除旧文件：
+                    os.remove(worst_path)
+                    # 保存新模型
+                    self.simulator.dynamic_matching_agent.save(model_path)
+                    heapq.heappush(best_models, (score, epoch, model_path))
+
+
     def accumulate_metrics(self, simulator: Simulator):
         """
         Accumulate metrics for one test run.
@@ -326,15 +394,20 @@ class SimulatorTrainer:
         self.evaluate_table = None
 
         total_metrics = []
-        for date in dates:
-            print(f"method:{simulator.method},test date: {date},driver_num: {simulator.driver_num},order sample ratio:{simulator.order_sample_ratio},")
-            simulator.reset()
+        for ith,date in enumerate(dates):
+            seed_list = [0, 42, 3407, 1024,215]  # 一切的开始 / 《银河系漫游指南》 / 《Torch.manual_seed(3407) is all you need》 / 程序员的信仰 / 太上老君生日
+            seed = seed_list[ith]
+            np.random.seed(seed)
+            print(f"seed:{seed},method:{simulator.method},test date: {date},driver_num: {simulator.driver_num},order sample ratio:{simulator.order_sample_ratio},")
             simulator.experiment_date = date
+            simulator.reset(seed)
             if simulator.method != 'dynamic_matching':
                 for step in range(simulator.finish_run_step):
                     simulator.rl_step()
             else:
-                simulator.dynamic_matching_agent.load(path='./Dynamic-matching/2015-05-05/100/fixed_seed_long_epoch/epoch_750.pt')
+                # simulator.dynamic_matching_agent.load(path='./Dynamic-matching/all_day_new/1000new_state/training_20251201_112932/model_epoch173_score200460.pt')
+                # simulator.dynamic_matching_agent.load(path='./Dynamic-matching/parallel_output/1000/training_20251204_115858_6/model_epoch43_score207963.pt')
+                simulator.dynamic_matching_agent.load(path='./Dynamic-matching/parallel_output/1000/training_20251204_115858_8/model_epoch78_score207574.pt')
                 for step in range(simulator.finish_run_step):
                     simulator.rl_step_test_dynamic()
             metrics = self.accumulate_metrics(simulator)
@@ -460,13 +533,13 @@ class SimulatorTrainer:
             os.makedirs(folder)
 
         total_evaluate_df.to_csv(
-            folder + f"/{test_config['test_dates'][0].split('-')[-1]}_{test_config['method']}_driver_{test_config['driver_num']}.csv",
+            folder + f"/all_day_{test_config['method']}_driver_{test_config['driver_num']}.csv",
             index=False)
-        np.save(folder + f"/{test_config['test_dates'][0].split('-')[-1]}_{test_config['method']}_detail_driver_{test_config['driver_num']}.npy",
+        np.save(folder + f"/all_day_{test_config['method']}_detail_driver_{test_config['driver_num']}.npy",
                 evaluate_table)
-
         #
-        simulator.record.to_csv(folder+f"/{test_config['test_dates'][0].split('-')[-1]}_{test_config['method']}_driver_{test_config['driver_num']}_matched.csv")
+        # #
+        # simulator.record.to_csv(folder+f"/{test_config['test_dates'][0].split('-')[-1]}_{test_config['method']}_driver_{test_config['driver_num']}_matched.csv")
 
     def render(self):
         """
@@ -477,20 +550,33 @@ class SimulatorTrainer:
     def generate_warmup_data(self,train_config):
 
         # --- 1. 设置 ---
-        N_WARMUP_EPOCHS = 300
+        N_WARMUP_EPOCHS = (3+3+4) * 5 # 3: 单纯执行每一种策略； 3: 随机化每个区域的不同的策略，但是时间维度上不变化; 4: 随机化每个区域不同的策略，时间维度也变化；5：5天的数据
         N_WARMUP_TRANSITIONS = N_WARMUP_EPOCHS*int((self.simulator.t_end-self.simulator.t_initial)/self.simulator.AGENT_DECISION_FREQUENCY)
         warmup_states = []  # 用于拟合 Scaler
         self.driver_num = train_config['driver_num']
-        write_path = f"dynamic_matching_algorithm/warmup_transitions/{train_config['train_dates']}/{train_config['driver_num']}"
+        write_path = f"dynamic_matching_algorithm/warmup_transitions/all_day/{train_config['driver_num']}"
         if not os.path.exists(write_path):
             os.makedirs(write_path)
 
         for epoch in range(N_WARMUP_EPOCHS):
-            self.simulator.experiment_date = train_config['train_dates']
-            self.simulator.reset()
+            seed_list = [0, 42, 3407, 1024,215]  # 一切的开始 / 《银河系漫游指南》 / 《Torch.manual_seed(3407) is all you need》 / 程序员的信仰 / 太上老君生日
+            seed = seed_list[epoch % len(seed_list)]
+            # self.simulator.experiment_date = train_config['train_dates']
+            self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+            self.simulator.reset(seed=seed)  # 内层仍然要用seed来保证抽取的样本是一样的
             simulator = self.simulator
             simulator.dynamic_matching_agent.load_offline_warmup = False
             buffer = simulator.dynamic_matching_agent.buffer
+            #    利用 epoch 序号作为种子，保证每个 epoch (即使环境种子相同) 策略都不同
+            #    例如：Epoch 0 和 Epoch 5 环境种子一样，但这里 policy_rng 的种子不一样
+            policy_rng = np.random.RandomState(seed=epoch + 10000)
+            # 【变量】用于记录上一步的动作，实现惯性
+            last_actions = policy_rng.choice([0,1,2], size=35)
+            # 如果是“时间不变”的策略，可以在这里预先生成好，后面一直用
+            fixed_actions_for_epoch = None
+            if 15 <= epoch <= 29:  # 对应你原来的 15-29 (空间混合，时间不变)
+                fixed_actions_for_epoch = policy_rng.choice([0,1,2], size=35, replace=True)
+
             # Run the simulation
             for step in range(simulator.finish_run_step + 1):
                 # --- 1. Agent 决策与数据存储 (每 15 分钟执行一次) ---
@@ -512,27 +598,41 @@ class SimulatorTrainer:
                                                                 reward,
                                                                 s1,
                                                                 [1 if simulator.time == simulator.t_end else 0] * env_params['grid_num'])
-
                         warmup_states.append(s0)
-
                         if simulator.time == simulator.t_end:
                             break
-
                     # --- B. 为下一个 15 分钟获取新动作 A_k+1 ---
-
                     # 获取 S_k (当前状态)
                     matching_state_current = simulator.get_global_state()
-
-                    # print(f"--- Agent 决策 (decision interval {self.calculate_current_time_slice()}) ---")
-
                     # 存储 S_k, 用于 15 分钟后
                     simulator.state_at_decision_time = matching_state_current
 
-                    actions = np.random.choice([0, 1, 2], size=35, replace=True)
-                    log_probs = [-1.098612 for _ in range(35)]
+                    # Phase 1: 纯策略 (Epoch 0-14)
+                    if epoch<=4:
+                        actions = [0]*35
+                    elif epoch<=9:
+                        actions = [1]*35
+                    elif epoch<=14:
+                        actions = [2]*35
 
+                    # Phase 2: 空间混合，时间不变 (Epoch 15-29)
+                    elif epoch<=29:
+                    # 直接使用在 loop 外生成的固定动作，避免每步重置 seed 的麻烦
+                        actions = fixed_actions_for_epoch
+
+                    # Phase 3: 时空全混合 (Epoch 30-49)
+                    else:
+                        # 还可以加入概率控制，比如 80% 概率保持上一步，20% 概率突变
+                        change_mask = policy_rng.rand(35) > 0.8
+                        # 生成全新的随机动作
+                        new_random_actions = policy_rng.choice([0,1,2], size=35)
+                        # 更新 last_actions：
+                        # 如果 mask 是 True，就用新动作；如果是 False，就保留旧动作
+                        # np.where(condition, x, y) -> if cond then x else y
+                        last_actions = np.where(change_mask, new_random_actions, last_actions)
+
+                    log_probs = [0 for _ in range(35)] # 根本没有用到这个值 后面再做修改 现在随便赋一个值即可
                     simulator.held_action_tuple = (actions, log_probs)
-
                     # 重置 5 分钟的奖励累加器
                     simulator.reward_by_grid_df = pd.Series(data=np.zeros(env_params['grid_num']))
 
@@ -552,7 +652,6 @@ class SimulatorTrainer:
                     matched_pair_actual_indexes, matched_itinerary)
 
                 if len(df_new_matched_requests) != 0:
-                    # TODO: pricing
                     simulator.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
                 else:
                     simulator.total_reward += 0
@@ -567,7 +666,6 @@ class SimulatorTrainer:
 
                 simulator.matched_requests_num += len(df_new_matched_requests)
 
-                # TJ
                 if simulator.end_of_episode == 0:
                     simulator.matched_requests = pd.concat([simulator.matched_requests, df_new_matched_requests], axis=0)
                     simulator.matched_requests = simulator.matched_requests.reset_index(drop=True)
@@ -597,10 +695,10 @@ class SimulatorTrainer:
         # with open('warmup_buffer.pkl', 'wb') as f:
         #     pickle.dump(buffer, f)
         # (更通用的方法是保存 transitions 列表，在主代码中加载)
-        with open(write_path+f'/transition_data_30min.pkl', 'wb') as f:
+        with open(write_path+f'/transition_data_revised_new_state.pkl', 'wb') as f:
             pickle.dump(list(buffer.buffer), f)  # 假设 buffer.buffer 是你的deque
 
         # **(关键)** 保存拟合好的 Scaler
-        joblib.dump(scaler, write_path+f'/transition_data_state_scaler_30min.pkl')
+        joblib.dump(scaler, write_path+f'/transition_data_state_scaler_revised_new_state.pkl')
 
         print("--- 热启动数据和 Scaler 已保存！ ---")

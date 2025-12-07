@@ -6,7 +6,7 @@ env_params = {
     'delta_t': 60,  # note: need to be the same as 'request_interval'
     'vehicle_speed': 22.788,  # km / h
     'repo_speed': 22.788,  # need to be the same as vehicl speed
-    'order_sample_ratio': 0.05, # TODO
+    'order_sample_ratio': 0.1, # TODO
     'order_generation_mode': 'sample_from_base',
     'driver_sample_ratio': 1,
     'maximum_wait_time_mean': 300,

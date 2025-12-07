@@ -41,7 +41,7 @@ class SarsaAgent(object):
 
         # --- 修改开始 ---
         # 记录初始学习率，作为衰减的基准
-        self.initial_learning_rate = 0.02
+        self.initial_learning_rate = 0.02 # large size 0.02
         # 当前学习率（初始化时等于初始学习率）
         self.learning_rate = self.initial_learning_rate
 

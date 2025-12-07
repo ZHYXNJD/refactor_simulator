@@ -2,28 +2,35 @@
 <project version="4">
   <component name="PublishConfigData" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="fixed_sample">
+      <paths name="161">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="189">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="root@root@qdai.scnet.cn:50161 password">
         <serverdata>
           <mappings>
             <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
-      <paths name="fixed_sample (2)">
+      <paths name="root@root@qdai.scnet.cn:50179 password">
         <serverdata>
           <mappings>
             <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
-      <paths name="random_sample">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="shared_actor_fixed_seed">
+      <paths name="root@root@qdai.scnet.cn:50189 password">
         <serverdata>
           <mappings>
             <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />

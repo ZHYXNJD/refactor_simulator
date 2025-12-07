@@ -1,240 +1,211 @@
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 import numpy as np
 from copy import deepcopy
-import random
-from random import choice
-from matplotlib import pyplot as plt
 from sklearn.neighbors import BallTree
 from simulator_matching.matching_algorithm.dispatch_alg import LD
 from math import acos
-import math
-import osmnx as ox
 import pandas as pd
-from scipy.stats import skewnorm
-from collections import defaultdict
 from simulator_matching.config import env_params
-import geopandas as gpd
-from math import sin, cos, atan2, radians, degrees, asin, pi
-import os
+from math import sin, cos, radians
 
-try:
-    import psutil
-except ImportError:
-    psutil = None
-import platform
 """
 Here, we load the information of graph network from graphml file.
 """
-data_path = 'my_data'
-G = ox.load_graphml(os.path.join(data_path, 'manhattan.graphml'))
-gdf_nodes, _ = ox.graph_to_gdfs(G)
-lat_list = gdf_nodes['y'].tolist()
-lng_list = gdf_nodes['x'].tolist()
-node_id = gdf_nodes.index.tolist()
 
-shp_file_path = os.path.join(data_path,f"new_grids_{env_params['grid_num']}", f"new_grids_{env_params['grid_num']}.shp")
-result = gpd.read_file(shp_file_path)
-result = result.rename(columns={"osmid": "node_id", "x": "lng", "y": "lat"})
+
+# data_path = 'my_data'
+# G = ox.load_graphml(os.path.join(data_path, 'manhattan.graphml'))
+# gdf_nodes, _ = ox.graph_to_gdfs(G)
+# lat_list = gdf_nodes['y'].tolist()
+# lng_list = gdf_nodes['x'].tolist()
+# node_id = gdf_nodes.index.tolist()
+
+# shp_file_path = os.path.join(data_path,f"new_grids_{env_params['grid_num']}", f"new_grids_{env_params['grid_num']}.shp")
+# result = gpd.read_file(shp_file_path)
+# result = result.rename(columns={"osmid": "node_id", "x": "lng", "y": "lat"})
 # map id to coordinate; map coordinate to node_id
 # 重建索引
-result.set_index('node_id', inplace=True,drop=False)
-node_id_to_coord = result.set_index('node_id')[['lng', 'lat']].apply(tuple, axis=1).to_dict()
-node_coord_to_id = {value: key for key, value in node_id_to_coord.items()}
+# result.set_index('node_id', inplace=True,drop=False)
+# node_id_to_coord = result.set_index('node_id')[['lng', 'lat']].apply(tuple, axis=1).to_dict()
+# node_coord_to_id = {value: key for key, value in node_id_to_coord.items()}
 
+result = pd.read_csv('my_data/new_grids_35.csv',index_col='node_id', dtype={'node_id': float})
 
-map_from_node_to_grid = {}
-map_from_grid_to_nodes = defaultdict(list)
-map_from_grid_to_centroid = {}
-for index, row in result.iterrows():
-    node_id = row['node_id']
-    grid_id = row['grid_id']
-    map_from_node_to_grid[node_id] = grid_id
-    map_from_grid_to_nodes[grid_id].append(node_id)
-    map_from_grid_to_centroid[grid_id] = (row['centroid_x'], row['centroid_y'])
-
-"""
-Here, we build the connection to mongodb, which will be used to speed up access to road network information.
-"""
-# myclient = pymongo.MongoClient("mongodb://localhost:27017/")
-# myclient = pymongo.MongoClient("mongodb://host.docker.internal:27017/")
-# try:
-#     # The ismaster command is cheap and does not require auth.
-#     myclient.admin.command('ismaster')
-#     print("MongoDB is connected!")
-# except ConnectionFailure:
-#     print("Server not available")
-# mydb = myclient["manhattan_island"]
-# mycollection = mydb['od_shortest_path']
-
-# 这里直接放弃使用pymongo
-# 加载pickle即可
-# 在本地跑可以关掉 直接启用在线搜索
-# 因为加载到内存要消耗10GB
-# with open ('my_data/master_path_cache.pkl', 'rb') as f:
-#     master_path_cache = pickle.load(f)
-
-df_neighbor_centroid = pd.DataFrame()
-zone_id = []
-centroid_lng = []
-centroid_lat = []
-up_b = []
-down_b = []
-left_b = []
-right_b = []
-
-if env_params['repo2any'] == True:
-    for id in range(env_params['grid_num']):
-        zone_id.append(id)
-        current_centroid = map_from_grid_to_centroid[id]
-        centroid_lng.append(current_centroid[0])
-        centroid_lat.append(current_centroid[1])
-    df_neighbor_centroid['zone_id'] = zone_id
-    df_neighbor_centroid['centroid_lng'] = centroid_lng
-    df_neighbor_centroid['centroid_lat'] = centroid_lat
-    direction_0 = [1] * len(zone_id)
-    df_available_directions = pd.DataFrame([direction_0] * len(direction_0)).transpose()
-    df_available_directions.insert(0,'zone_id',range(len(df_available_directions)))
-else:
-    if env_params['grid_num'] == 8:
-        up = [0, 1, 0, 1, 2, 3, 4, 5]
-        down = [2, 3, 4, 5, 6, 7, 6, 7]
-        left = [0, 2, 4, 6, 0, 2, 4, 6]
-        right = [1, 3, 5, 7, 1, 3, 5, 7]
-    elif env_params['grid_num'] == 35:
-        up = [1, 3, 4, 6, 7, 8, 9, 10, 13, 14, 12, 12, 15, 16, 20, 21, 17, 18, 24, 25, 23, 22, 23, 26, 27, 29, 29, 28, 30, 31, 32, 34, 33, 33, 34]
-        down = [0, 0, 0, 1, 2, 3, 3, 4, 5, 6, 7, 7, 10, 8, 9, 12, 13, 16, 17, 14, 14, 15, 21, 20, 18, 18, 23, 24, 27, 25, 28, 29, 30, 32, 31]
-        left = [0, 1, 1, 3, 3, 5, 5, 6, 8, 8, 9, 10, 14, 13, 13, 14, 16, 17, 18, 17, 20, 20, 20, 25, 24, 24, 25, 27, 28, 27, 30, 30, 32, 33, 33]
-        right = [0, 2, 2, 4, 4, 6, 7, 7, 9, 10, 11, 11, 12, 14, 15, 15, 19, 19, 19, 20, 21, 21, 22, 23, 25, 26, 26, 29, 29, 26, 31, 31, 31, 34, 34]
-
-    for id in range(env_params['grid_num']):
-        zone_id.append(id)
-        current_centroid = map_from_grid_to_centroid[id]
-        centroid_lng.append(current_centroid[0])
-        centroid_lat.append(current_centroid[1])
-        up_b.append(1 if up[id] != id else 0)
-        down_b.append(1 if down[id] != id else 0)
-        left_b.append(1 if left[id] != id else 0)
-        right_b.append(1 if right[id] != id else 0)
-
-    df_neighbor_centroid['zone_id'] = zone_id
-    df_neighbor_centroid['centroid_lng'] = centroid_lng
-    df_neighbor_centroid['centroid_lat'] = centroid_lat
-    df_neighbor_centroid['stay'] = zone_id
-    df_neighbor_centroid['up'] = up
-    df_neighbor_centroid['right'] = right
-    df_neighbor_centroid['down'] = down
-    df_neighbor_centroid['left'] = left
-
-    direction_0 = [1] * len(zone_id)
-    df_available_directions = pd.DataFrame({
-        'zone_id': zone_id,
-        'direction_0': direction_0,
-        'direction_1': up_b,  # Up
-        'direction_2': down_b,  # Down
-        'direction_3': left_b,  # Left
-        'direction_4': right_b  # Right
-    }
-    )
+# map_from_node_to_grid = {}
+# map_from_grid_to_nodes = defaultdict(list)
+# map_from_grid_to_centroid = {}
+# for index, row in result.iterrows():
+#     node_id = row['node_id']
+#     grid_id = row['grid_id']
+#     map_from_node_to_grid[node_id] = grid_id
+#     map_from_grid_to_nodes[grid_id].append(node_id)
+#     map_from_grid_to_centroid[grid_id] = (row['centroid_x'], row['centroid_y'])
+#
+# """
+# Here, we build the connection to mongodb, which will be used to speed up access to road network information.
+# """
+#
+# df_neighbor_centroid = pd.DataFrame()
+# zone_id = []
+# centroid_lng = []
+# centroid_lat = []
+# up_b = []
+# down_b = []
+# left_b = []
+# right_b = []
+#
+# if env_params['repo2any'] == True:
+#     for id in range(env_params['grid_num']):
+#         zone_id.append(id)
+#         current_centroid = map_from_grid_to_centroid[id]
+#         centroid_lng.append(current_centroid[0])
+#         centroid_lat.append(current_centroid[1])
+#     df_neighbor_centroid['zone_id'] = zone_id
+#     df_neighbor_centroid['centroid_lng'] = centroid_lng
+#     df_neighbor_centroid['centroid_lat'] = centroid_lat
+#     direction_0 = [1] * len(zone_id)
+#     df_available_directions = pd.DataFrame([direction_0] * len(direction_0)).transpose()
+#     df_available_directions.insert(0,'zone_id',range(len(df_available_directions)))
+# else:
+#     if env_params['grid_num'] == 8:
+#         up = [0, 1, 0, 1, 2, 3, 4, 5]
+#         down = [2, 3, 4, 5, 6, 7, 6, 7]
+#         left = [0, 2, 4, 6, 0, 2, 4, 6]
+#         right = [1, 3, 5, 7, 1, 3, 5, 7]
+#     elif env_params['grid_num'] == 35:
+#         up = [1, 3, 4, 6, 7, 8, 9, 10, 13, 14, 12, 12, 15, 16, 20, 21, 17, 18, 24, 25, 23, 22, 23, 26, 27, 29, 29, 28, 30, 31, 32, 34, 33, 33, 34]
+#         down = [0, 0, 0, 1, 2, 3, 3, 4, 5, 6, 7, 7, 10, 8, 9, 12, 13, 16, 17, 14, 14, 15, 21, 20, 18, 18, 23, 24, 27, 25, 28, 29, 30, 32, 31]
+#         left = [0, 1, 1, 3, 3, 5, 5, 6, 8, 8, 9, 10, 14, 13, 13, 14, 16, 17, 18, 17, 20, 20, 20, 25, 24, 24, 25, 27, 28, 27, 30, 30, 32, 33, 33]
+#         right = [0, 2, 2, 4, 4, 6, 7, 7, 9, 10, 11, 11, 12, 14, 15, 15, 19, 19, 19, 20, 21, 21, 22, 23, 25, 26, 26, 29, 29, 26, 31, 31, 31, 34, 34]
+#
+#     for id in range(env_params['grid_num']):
+#         zone_id.append(id)
+#         current_centroid = map_from_grid_to_centroid[id]
+#         centroid_lng.append(current_centroid[0])
+#         centroid_lat.append(current_centroid[1])
+#         up_b.append(1 if up[id] != id else 0)
+#         down_b.append(1 if down[id] != id else 0)
+#         left_b.append(1 if left[id] != id else 0)
+#         right_b.append(1 if right[id] != id else 0)
+#
+#     df_neighbor_centroid['zone_id'] = zone_id
+#     df_neighbor_centroid['centroid_lng'] = centroid_lng
+#     df_neighbor_centroid['centroid_lat'] = centroid_lat
+#     df_neighbor_centroid['stay'] = zone_id
+#     df_neighbor_centroid['up'] = up
+#     df_neighbor_centroid['right'] = right
+#     df_neighbor_centroid['down'] = down
+#     df_neighbor_centroid['left'] = left
+#
+#     direction_0 = [1] * len(zone_id)
+#     df_available_directions = pd.DataFrame({
+#         'zone_id': zone_id,
+#         'direction_0': direction_0,
+#         'direction_1': up_b,  # Up
+#         'direction_2': down_b,  # Down
+#         'direction_3': left_b,  # Left
+#         'direction_4': right_b  # Right
+#     }
+#     )
 
 # rl for matching
-def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, pre_steps=10):
-    """
-    obtain exponential decay epsilons
-    :param initial_epsilon:
-    :param final_epsilon:
-    :param steps:
-    :param decay: decay rate
-    :param pre_steps: first several epsilons does note decay
-    :return:
-    """
-    epsilons = []
-
-    # pre randomness
-    for i in range(0, pre_steps):
-        epsilons.append(deepcopy(initial_epsilon))
-
-    # decay randomness
-    epsilon = initial_epsilon
-    for i in range(pre_steps, steps):
-        epsilon = max(final_epsilon, epsilon * decay)
-        epsilons.append(deepcopy(epsilon))
-
-    return np.array(epsilons)
-
-
-# rl for matching
-
-# rl for repositioning
-def s2e(n, total_len=14):
-    n = n.astype(int)
-    k = (((n[:, None] & (1 << np.arange(total_len))[::-1])) > 0).astype(np.float64)
-    return k
-
-
-# rl for repositioning
+# def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, pre_steps=10):
+#     """
+#     obtain exponential decay epsilons
+#     :param initial_epsilon:
+#     :param final_epsilon:
+#     :param steps:
+#     :param decay: decay rate
+#     :param pre_steps: first several epsilons does note decay
+#     :return:
+#     """
+#     epsilons = []
+#
+#     # pre randomness
+#     for i in range(0, pre_steps):
+#         epsilons.append(deepcopy(initial_epsilon))
+#
+#     # decay randomness
+#     epsilon = initial_epsilon
+#     for i in range(pre_steps, steps):
+#         epsilon = max(final_epsilon, epsilon * decay)
+#         epsilons.append(deepcopy(epsilon))
+#
+#     return np.array(epsilons)
+#
+#
+# # rl for matching
+#
+# # rl for repositioning
+# def s2e(n, total_len=14):
+#     n = n.astype(int)
+#     k = (((n[:, None] & (1 << np.arange(total_len))[::-1])) > 0).astype(np.float64)
+#     return k
 
 
 # rl for repositioning
-def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, pre_steps=10):
-    """
-    obtain exponential decay epsilons
-    :param initial_epsilon:
-    :param final_epsilon:
-    :param steps:
-    :param decay: decay rate
-    :param pre_steps: first several epsilons does note decay
-    :return:
-    """
-    epsilons = []
-
-    # pre randomness
-    for i in range(0, pre_steps):
-        epsilons.append(deepcopy(initial_epsilon))
-
-    # decay randomness
-    epsilon = initial_epsilon
-    for i in range(pre_steps, steps):
-        epsilon = max(final_epsilon, epsilon * decay)
-        epsilons.append(deepcopy(epsilon))
-
-    return np.array(epsilons)
 
 
-def get_real_coord_given_current_next_coord(coord1, coord2, d):
-    '''
-    coord1: current GPS coordinate (may not be the real position)
-    coord2: next GPS coordinate
-    '''
-    R = 6371.0
-    # Convert latitude and longitude from degrees to radians
-    lat1 = radians(coord1[1])
-    lng1 = radians(coord1[0])
-    lat2 = radians(coord2[1])
-    lng2 = radians(coord2[0])
+# rl for repositioning
+# def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, pre_steps=10):
+#     """
+#     obtain exponential decay epsilons
+#     :param initial_epsilon:
+#     :param final_epsilon:
+#     :param steps:
+#     :param decay: decay rate
+#     :param pre_steps: first several epsilons does note decay
+#     :return:
+#     """
+#     epsilons = []
+#
+#     # pre randomness
+#     for i in range(0, pre_steps):
+#         epsilons.append(deepcopy(initial_epsilon))
+#
+#     # decay randomness
+#     epsilon = initial_epsilon
+#     for i in range(pre_steps, steps):
+#         epsilon = max(final_epsilon, epsilon * decay)
+#         epsilons.append(deepcopy(epsilon))
+#
+#     return np.array(epsilons)
 
-    # Compute the angular distance d/R
-    angular_distance = d / R
 
-    # Compute the initial bearing from point A to point B
-    bearing = atan2(sin(lng2 - lng1) * cos(lat2),
-                    cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(lng2 - lng1))
-
-    # Find the latitude of point A'
-    lat_prime = asin(sin(lat1) * cos(angular_distance) +
-                     cos(lat1) * sin(angular_distance) * cos(bearing))
-
-    # Find the longitude of point A', considering the change across the Prime Meridian or Date Line
-    lng_prime = lng1 + atan2(sin(bearing) * sin(angular_distance) * cos(lat1),
-                             cos(angular_distance) - sin(lat1) * sin(lat_prime))
-
-    # Normalize the longitude to be within the range [-180, 180]
-    lng_prime = (lng_prime + pi) % (2 * pi) - pi
-
-    # Convert the result from radians to degrees
-    lat_prime = degrees(lat_prime)
-    lng_prime = degrees(lng_prime)
-
-    return (lng_prime, lat_prime)
+# def get_real_coord_given_current_next_coord(coord1, coord2, d):
+#     '''
+#     coord1: current GPS coordinate (may not be the real position)
+#     coord2: next GPS coordinate
+#     '''
+#     R = 6371.0
+#     # Convert latitude and longitude from degrees to radians
+#     lat1 = radians(coord1[1])
+#     lng1 = radians(coord1[0])
+#     lat2 = radians(coord2[1])
+#     lng2 = radians(coord2[0])
+#
+#     # Compute the angular distance d/R
+#     angular_distance = d / R
+#
+#     # Compute the initial bearing from point A to point B
+#     bearing = atan2(sin(lng2 - lng1) * cos(lat2),
+#                     cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(lng2 - lng1))
+#
+#     # Find the latitude of point A'
+#     lat_prime = asin(sin(lat1) * cos(angular_distance) +
+#                      cos(lat1) * sin(angular_distance) * cos(bearing))
+#
+#     # Find the longitude of point A', considering the change across the Prime Meridian or Date Line
+#     lng_prime = lng1 + atan2(sin(bearing) * sin(angular_distance) * cos(lat1),
+#                              cos(angular_distance) - sin(lat1) * sin(lat_prime))
+#
+#     # Normalize the longitude to be within the range [-180, 180]
+#     lng_prime = (lng_prime + pi) % (2 * pi) - pi
+#
+#     # Convert the result from radians to degrees
+#     lat_prime = degrees(lat_prime)
+#     lng_prime = degrees(lng_prime)
+#
+#     return (lng_prime, lat_prime)
 
 def distance(coord_1, coord_2):
     """
@@ -255,26 +226,26 @@ def distance(coord_1, coord_2):
 
     return manhattan_dis
 
-def manhattan_dist_estimate(coord_1, coord_2):
-    lng1, lat1 = coord_1
-    lng2, lat2 = coord_2
-    # Radius of the Earth in km
-    R = 6371.0
-    # Convert degrees to radians
-    lat1_rad = math.radians(lat1)
-    lat2_rad = math.radians(lat2)
-    lng1_rad = math.radians(lng1)
-    lng2_rad = math.radians(lng2)
-    # Calculate the differences in coordinates
-    dlat = abs(lat2_rad - lat1_rad)
-    dlng = abs(lng2_rad - lng1_rad)
-    # Convert latitude difference to km
-    lat_dist_km = dlat * R
-    # Use the average latitude to approximate the conversion factor for longitude
-    avg_lat_rad = (lat1_rad + lat2_rad) / 2
-    lng_dist_km = dlng * R * math.cos(avg_lat_rad)
-    
-    return lat_dist_km + lng_dist_km
+# def manhattan_dist_estimate(coord_1, coord_2):
+#     lng1, lat1 = coord_1
+#     lng2, lat2 = coord_2
+#     # Radius of the Earth in km
+#     R = 6371.0
+#     # Convert degrees to radians
+#     lat1_rad = math.radians(lat1)
+#     lat2_rad = math.radians(lat2)
+#     lng1_rad = math.radians(lng1)
+#     lng2_rad = math.radians(lng2)
+#     # Calculate the differences in coordinates
+#     dlat = abs(lat2_rad - lat1_rad)
+#     dlng = abs(lng2_rad - lng1_rad)
+#     # Convert latitude difference to km
+#     lat_dist_km = dlat * R
+#     # Use the average latitude to approximate the conversion factor for longitude
+#     avg_lat_rad = (lat1_rad + lat2_rad) / 2
+#     lng_dist_km = dlng * R * math.cos(avg_lat_rad)
+#
+#     return lat_dist_km + lng_dist_km
 
 
 
@@ -299,62 +270,42 @@ def distance_array(coord_1, coord_2):
     distance = c * r
     return distance
 
-def haversine_dist_array(coord_1, coord_2):
-    # Convert coordinates from degrees to radians
-    coord_1_array = np.radians(coord_1)
-    coord_2_array = np.radians(coord_2)
-    
-    # Differences in coordinates
-    dlon = coord_2_array[:, 0] - coord_1_array[:, 0]
-    dlat = coord_2_array[:, 1] - coord_1_array[:, 1]
-    
-    # Haversine formula
-    a = np.sin(dlat / 2) ** 2 + np.cos(coord_1_array[:, 1]) * np.cos(coord_2_array[:, 1]) * np.sin(dlon / 2) ** 2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-    
-    # Radius of Earth in kilometers
-    r = 6371
-    distance = c * r
-    return distance
+# def haversine_dist_array(coord_1, coord_2):
+#     # Convert coordinates from degrees to radians
+#     coord_1_array = np.radians(coord_1)
+#     coord_2_array = np.radians(coord_2)
+#
+#     # Differences in coordinates
+#     dlon = coord_2_array[:, 0] - coord_1_array[:, 0]
+#     dlat = coord_2_array[:, 1] - coord_1_array[:, 1]
+#
+#     # Haversine formula
+#     a = np.sin(dlat / 2) ** 2 + np.cos(coord_1_array[:, 1]) * np.cos(coord_2_array[:, 1]) * np.sin(dlon / 2) ** 2
+#     c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+#
+#     # Radius of Earth in kilometers
+#     r = 6371
+#     distance = c * r
+#     return distance
 
-def get_distance_array(origin_coord_array, dest_coord_array):
-    """
-    :param origin_coord_array: list of coordinates
-    :type origin_coord_array:  list
-    :param dest_coord_array:  list of coordinates
-    :type dest_coord_array:  list
-    :return: tuple like (
-    :rtype: list
-    """
-    dis_array = []
-    for i in range(len(origin_coord_array)):
-        dis = distance(origin_coord_array[i], dest_coord_array[i])
-        dis_array.append(dis)
-    dis_array = np.array(dis_array)
-    return dis_array
-
-
-def _get_safe_worker_count(user_defined=None):
-    """
-    自动计算安全的并发 worker 数量。
-    - 如果用户提供了 max_workers，则使用用户定义。
-    - 否则自动检测 CPU 空闲核心。
-    """
-    if user_defined is not None:
-        return max(1, int(user_defined))
-
-    try:
-        cpu_count = psutil.cpu_count(logical=True) if psutil else os.cpu_count()
-        cpu_percent = psutil.cpu_percent(percpu=True) if psutil else [0] * cpu_count
-        # 计算空闲核心数
-        idle_cores = sum(1 for p in cpu_percent if p < 50)
-        usable = min(cpu_count - 1, max(1, idle_cores))  # 留 1 个核心
-        return usable
-    except Exception:
-        return max(1, (os.cpu_count() or 4) - 1)
+# def get_distance_array(origin_coord_array, dest_coord_array):
+#     """
+#     :param origin_coord_array: list of coordinates
+#     :type origin_coord_array:  list
+#     :param dest_coord_array:  list of coordinates
+#     :type dest_coord_array:  list
+#     :return: tuple like (
+#     :rtype: list
+#     """
+#     dis_array = []
+#     for i in range(len(origin_coord_array)):
+#         dis = distance(origin_coord_array[i], dest_coord_array[i])
+#         dis_array.append(dis)
+#     dis_array = np.array(dis_array)
+#     return dis_array
 
 
-def route_generation_array(origin_coord_array, dest_coord_array, reposition=False, mode='rg'):
+def route_generation_array(origin_coord_array, dest_coord_array,dest_node, reposition=False, mode='ma'):
     """
 
     :param origin_coord_array: the K*2 type list, the first column is lng, the second column
@@ -372,9 +323,8 @@ def route_generation_array(origin_coord_array, dest_coord_array, reposition=Fals
              destination node
     :rtype: tuple
     """
-    origin_node_list = get_nodeId_from_coordinate(origin_coord_array[:, 0], origin_coord_array[:, 1])
-    dest_node_list = get_nodeId_from_coordinate(dest_coord_array[:, 0], dest_coord_array[:, 1])
-
+    # origin_node_list = get_nodeId_from_coordinate(origin_coord_array[:, 0], origin_coord_array[:, 1])
+    # dest_node_list = get_nodeId_from_coordinate(dest_coord_array[:, 0], dest_coord_array[:, 1])
 
 
     itinerary_node_list = []
@@ -383,56 +333,56 @@ def route_generation_array(origin_coord_array, dest_coord_array, reposition=Fals
 
     if mode == 'ma':
         # 处理 'ma' 模式
-        for coord_1, coord_2,dest in zip(origin_coord_array, dest_coord_array,dest_node_list):
+        for coord_1, coord_2,dest in zip(origin_coord_array, dest_coord_array,dest_node):
             itinerary_node_list.append([dest])
             dis = distance(coord_1,coord_2)
             itinerary_segment_dis_list.append([dis])
             dis_array_list.append(dis)
         return itinerary_node_list,itinerary_segment_dis_list,dis_array_list
 
-    elif mode == 'rg':
-        # 1. 寻路 (原 Loop 1)
-        itinerary_node_list = ox.shortest_path(G, origin_node_list, dest_node_list, weight='length')
-        for ith,ite in enumerate(itinerary_node_list):
-            if ite is None or len(ite) <= 1:
-                ite = [origin_node_list[ith], dest_node_list[ith]]
-                itinerary_node_list[ith] = [origin_node_list[ith], dest_node_list[ith]]
-            # 2. 计算距离 (原 Loop 2)
-            itinerary_segment_dis = []
-            for i in range(len(ite) - 1):
-                dis = distance(node_id_to_coord[ite[i]], node_id_to_coord[ite[i + 1]])
-                itinerary_segment_dis.append(dis)
-            # 3. 处理 reposition
-            if not reposition:
-                ite.pop()  # 在计算完距离后再 pop
-            total_dis = sum(itinerary_segment_dis)
-            itinerary_segment_dis_list.append(itinerary_segment_dis)
-            dis_array_list.append(total_dis)
+    # elif mode == 'rg':
+    #     # 1. 寻路 (原 Loop 1)
+    #     itinerary_node_list = ox.shortest_path(G, origin_node_list, dest_node_list, weight='length')
+    #     for ith,ite in enumerate(itinerary_node_list):
+    #         if ite is None or len(ite) <= 1:
+    #             ite = [origin_node_list[ith], dest_node_list[ith]]
+    #             itinerary_node_list[ith] = [origin_node_list[ith], dest_node_list[ith]]
+    #         # 2. 计算距离 (原 Loop 2)
+    #         itinerary_segment_dis = []
+    #         for i in range(len(ite) - 1):
+    #             dis = distance(node_id_to_coord[ite[i]], node_id_to_coord[ite[i + 1]])
+    #             itinerary_segment_dis.append(dis)
+    #         # 3. 处理 reposition
+    #         if not reposition:
+    #             ite.pop()  # 在计算完距离后再 pop
+    #         total_dis = sum(itinerary_segment_dis)
+    #         itinerary_segment_dis_list.append(itinerary_segment_dis)
+    #         dis_array_list.append(total_dis)
+    #
+    #     dis_array = np.array(dis_array_list)
+    #     return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
-        dis_array = np.array(dis_array_list)
-        return itinerary_node_list, itinerary_segment_dis_list, dis_array
-
-def get_closed_lng_lat(current_lng_lat_array, target_lng_lat_array):
-    ret = []
-    for cur_lng_cur_lat, tar_lng_list_tar_lat_list in zip(current_lng_lat_array, target_lng_lat_array):
-        cur_lng = cur_lng_cur_lat[0]
-        cur_lat = cur_lng_cur_lat[1]
-        tar_lng_list = [float(i) for i in tar_lng_list_tar_lat_list[0].split("_")]
-        tar_lat_list = [float(i) for i in tar_lng_list_tar_lat_list[1].split("_")]
-        final_ln = -999
-        final_la = -999
-        Mindis = 999999
-        for ln, la in zip(tar_lng_list, tar_lat_list):
-            cur_dis = distance((cur_lat, cur_lng), (la, ln))
-            if cur_dis < Mindis:
-                Mindis = cur_dis
-                final_ln = ln
-                final_la = la
-        ret.append(np.array([final_ln, final_la]))
-
-    print(1)
-    ret = np.array(ret)
-    return ret
+# def get_closed_lng_lat(current_lng_lat_array, target_lng_lat_array):
+#     ret = []
+#     for cur_lng_cur_lat, tar_lng_list_tar_lat_list in zip(current_lng_lat_array, target_lng_lat_array):
+#         cur_lng = cur_lng_cur_lat[0]
+#         cur_lat = cur_lng_cur_lat[1]
+#         tar_lng_list = [float(i) for i in tar_lng_list_tar_lat_list[0].split("_")]
+#         tar_lat_list = [float(i) for i in tar_lng_list_tar_lat_list[1].split("_")]
+#         final_ln = -999
+#         final_la = -999
+#         Mindis = 999999
+#         for ln, la in zip(tar_lng_list, tar_lat_list):
+#             cur_dis = distance((cur_lat, cur_lng), (la, ln))
+#             if cur_dis < Mindis:
+#                 Mindis = cur_dis
+#                 final_ln = ln
+#                 final_la = la
+#         ret.append(np.array([final_ln, final_la]))
+#
+#     print(1)
+#     ret = np.array(ret)
+#     return ret
 
 
 class road_network:
@@ -471,35 +421,35 @@ class road_network:
         return lng_array, lat_array, grid_id_array
 
 
-def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, pre_steps=10):
-    """
-    :param initial_epsilon: initial epsilon
-    :type initial_epsilon: float
-    :param final_epsilon: final epsilon
-    :type final_epsilon: float
-    :param steps: the number of iteration
-    :type steps: int
-    :param decay: decay rate
-    :type decay:  float
-    :param pre_steps: the number of iteration of pre randomness
-    :type pre_steps: int
-    :return: the array of epsilon
-    :rtype: numpy.array
-    """
-
-    epsilons = []
-
-    # pre randomness
-    for i in range(0, pre_steps):
-        epsilons.append(deepcopy(initial_epsilon))
-
-    # decay randomness
-    epsilon = initial_epsilon
-    for i in range(pre_steps, steps):
-        epsilon = max(final_epsilon, epsilon * decay)
-        epsilons.append(deepcopy(epsilon))
-
-    return np.array(epsilons)
+# def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, pre_steps=10):
+#     """
+#     :param initial_epsilon: initial epsilon
+#     :type initial_epsilon: float
+#     :param final_epsilon: final epsilon
+#     :type final_epsilon: float
+#     :param steps: the number of iteration
+#     :type steps: int
+#     :param decay: decay rate
+#     :type decay:  float
+#     :param pre_steps: the number of iteration of pre randomness
+#     :type pre_steps: int
+#     :return: the array of epsilon
+#     :rtype: numpy.array
+#     """
+#
+#     epsilons = []
+#
+#     # pre randomness
+#     for i in range(0, pre_steps):
+#         epsilons.append(deepcopy(initial_epsilon))
+#
+#     # decay randomness
+#     epsilon = initial_epsilon
+#     for i in range(pre_steps, steps):
+#         epsilon = max(final_epsilon, epsilon * decay)
+#         epsilons.append(deepcopy(epsilon))
+#
+#     return np.array(epsilons)
 
 
 def sample_all_drivers(driver_info, t_initial, t_end, driver_sample_ratio=1, driver_number_dist=''):
@@ -530,40 +480,40 @@ def sample_all_drivers(driver_info, t_initial, t_end, driver_sample_ratio=1, dri
     sampled_driver_info['target_loc_lng'] = sampled_driver_info['lng']
     sampled_driver_info['target_loc_lat'] = sampled_driver_info['lat']
     sampled_driver_info['target_grid_id'] = sampled_driver_info['grid_id']
-    sampled_driver_info['remaining_time'] = 0
+    sampled_driver_info['remaining_time'] = float(0)
     sampled_driver_info['matched_order_id'] = 'None'
     sampled_driver_info['total_idle_time'] = 0
     sampled_driver_info['time_to_last_cruising'] = 0
     sampled_driver_info['current_road_node_index'] = 0
-    sampled_driver_info['remaining_time_for_current_node'] = 0
+    sampled_driver_info['remaining_time_for_current_node'] = float(0)
     sampled_driver_info['itinerary_node_list'] = [[] for i in range(sampled_driver_info.shape[0])]
     sampled_driver_info['itinerary_segment_time_list'] = [[] for i in range(sampled_driver_info.shape[0])]
 
     return sampled_driver_info
 
 
-def sample_request_num(t_mean, std, delta_t):
-    """
-    sample request num during delta t
-    :param t_mean:
-    :param std:
-    :param delta_t:
-    :return:
-    """
-    random_num = np.random.normal(t_mean, std, 1)[0] * (delta_t / 100)
-    random_int = random_num // 1
-    random_reminder = random_num % 1
+# def sample_request_num(t_mean, std, delta_t):
+#     """
+#     sample request num during delta t
+#     :param t_mean:
+#     :param std:
+#     :param delta_t:
+#     :return:
+#     """
+#     random_num = np.random.normal(t_mean, std, 1)[0] * (delta_t / 100)
+#     random_int = random_num // 1
+#     random_reminder = random_num % 1
+#
+#     rn = random.random()
+#     if rn < random_reminder:
+#         request_num = random_int + 1
+#     else:
+#         request_num = random_int
+#     return int(request_num)
+#
 
-    rn = random.random()
-    if rn < random_reminder:
-        request_num = random_int + 1
-    else:
-        request_num = random_int
-    return int(request_num)
-
-
-def skewed_normal_distribution(u, thegma, k, omega, a, input_size):
-    return skewnorm.rvs(a, loc=u, scale=thegma, size=input_size)
+# def skewed_normal_distribution(u, thegma, k, omega, a, input_size):
+#     return skewnorm.rvs(a, loc=u, scale=thegma, size=input_size)
 
 
 def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, dispatch_method='LD',
@@ -607,8 +557,6 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
             order_data = wait_requests.loc[:, ['origin_lng', 'origin_lat', 'order_id', 'weight']].values
             driver_data = idle_driver_table.loc[:, ['lng', 'lat', 'driver_id']].values
 
-            # ------------------ [关键修正开始] ------------------
-
             # [原始数据, 格式: [lng, lat]]
             order_coords_deg_lnglat = order_data[:, :2].astype(np.float64)
             driver_coords_deg_lnglat = driver_data[:, :2].astype(np.float64)
@@ -639,7 +587,7 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
             if len(m_indices) == 0:
                 return [], []
 
-                # 3. 阶段 2: distance_array 精筛 (需要 [lng, lat])
+            # 3. 阶段 2: distance_array 精筛 (需要 [lng, lat])
 
             # [FIX] 我们必须使用*原始的*、未翻转的 [lng, lat] 坐标
             candidate_order_coords = order_coords_deg_lnglat[m_indices]
@@ -647,8 +595,6 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
 
             # 现在 distance_array 得到了它期望的 [lng, lat] 格式
             dis_array_candidates = distance_array(candidate_order_coords, candidate_driver_coords)
-
-            # ------------------ [关键修正结束] ------------------
 
             # 使用精确距离进行最终过滤
             valid_mask = dis_array_candidates <= maximal_pickup_distance
@@ -720,17 +666,18 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
 
             # [新代码] 1. 提取 ID
             # (确保 LD 返回的 ID 是 int 或 float，如果不是，请转换)
-            request_indexs = np.array(matched_pair_actual_indexs)[:, 0].astype(int)
-            driver_indexs = np.array(matched_pair_actual_indexs)[:, 1].astype(int)
+            request_indexs = np.array(matched_pair_actual_indexs)[:, 0].astype(float).astype(int)
+            driver_indexs = np.array(matched_pair_actual_indexs)[:, 1].astype(float).astype(int)
 
             # [新代码] 2. 直接批量查找坐标 (替换所有 for 循环)
             # .loc[id_list] 使用哈希索引，速度极快
             request_array_new = request_array_temp.loc[request_indexs, ['origin_lng', 'origin_lat']].values
+            request_array_node = request_array_temp.loc[request_indexs, 'origin_id'].values
             driver_loc_array_new = driver_loc_array_temp.loc[driver_indexs, ['lng', 'lat']].values
 
             # 3. 调用路由生成 (不变)
             itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(
-                driver_loc_array_new, request_array_new)
+                driver_loc_array_new, request_array_new,request_array_node)
 
             matched_itinerary = np.array(
                     [itinerary_node_list, itinerary_segment_dis_list, dis_array],
@@ -741,44 +688,44 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
     return matched_pair_actual_indexs, np.array(matched_itinerary)
 
 # Andrew: modified cruising function 
-def cruising(eligible_driver_table, mode):
-    """
-    :param eligible_driver_table: information of eligible driver.
-    :type eligible_driver_table: pandas.DataFrame
-    :param mode: the type of both-rg-cruising, if type is random; it can cruise to every node with equal
-                probability; if the type is nearby, it will cruise to the node in adjacent grid or
-                just stay at the original region.
-    :type mode: string
-    :return: itinerary_node_list, itinerary_segment_dis_list, dis_array
-    :rtype: tuple
-    """
-    dest_array = []
-    grid_id_list = eligible_driver_table.loc[:, 'grid_id'].values
-
-    for grid_id in grid_id_list:
-        if mode == "global-random":
-            np.random.seed(42)
-            random_number = random.choice(df_neighbor_centroid['zone_id'].values)
-        elif mode == 'random':
-            target = [grid_id]
-            neighbors = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == grid_id].iloc[0]
-            for direction in ['up', 'down', 'left', 'right']:
-                neighbor_id = neighbors[direction]
-                if neighbor_id != grid_id:
-                    target.append(neighbor_id)
-            random_number = choice(target)
-        
-        record = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == random_number]
-        if len(record) > 0:
-            dest_array.append([record.iloc[0]['centroid_lng'], record.iloc[0]['centroid_lat']])
-        else:
-            dest_array.append([df_neighbor_centroid.iloc[0]['centroid_lng'], df_neighbor_centroid.iloc[0]['centroid_lat']])
-    
-    coord_array = eligible_driver_table.loc[:, ['lng', 'lat']].values
-    # 注意：如果想要加速，那么距离计算可以换一种方法
-    # 现在方法是rg，换成ma会加速
-    itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array, np.array(dest_array))
-    return itinerary_node_list, itinerary_segment_dis_list, dis_array
+# def cruising(eligible_driver_table, mode):
+#     """
+#     :param eligible_driver_table: information of eligible driver.
+#     :type eligible_driver_table: pandas.DataFrame
+#     :param mode: the type of both-rg-cruising, if type is random; it can cruise to every node with equal
+#                 probability; if the type is nearby, it will cruise to the node in adjacent grid or
+#                 just stay at the original region.
+#     :type mode: string
+#     :return: itinerary_node_list, itinerary_segment_dis_list, dis_array
+#     :rtype: tuple
+#     """
+#     dest_array = []
+#     grid_id_list = eligible_driver_table.loc[:, 'grid_id'].values
+#
+#     for grid_id in grid_id_list:
+#         if mode == "global-random":
+#             np.random.seed(42)
+#             random_number = random.choice(df_neighbor_centroid['zone_id'].values)
+#         elif mode == 'random':
+#             target = [grid_id]
+#             neighbors = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == grid_id].iloc[0]
+#             for direction in ['up', 'down', 'left', 'right']:
+#                 neighbor_id = neighbors[direction]
+#                 if neighbor_id != grid_id:
+#                     target.append(neighbor_id)
+#             random_number = choice(target)
+#
+#         record = df_neighbor_centroid[df_neighbor_centroid['zone_id'] == random_number]
+#         if len(record) > 0:
+#             dest_array.append([record.iloc[0]['centroid_lng'], record.iloc[0]['centroid_lat']])
+#         else:
+#             dest_array.append([df_neighbor_centroid.iloc[0]['centroid_lng'], df_neighbor_centroid.iloc[0]['centroid_lat']])
+#
+#     coord_array = eligible_driver_table.loc[:, ['lng', 'lat']].values
+#     # 注意：如果想要加速，那么距离计算可以换一种方法
+#     # 现在方法是rg，换成ma会加速
+#     itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array, np.array(dest_array))
+#     return itinerary_node_list, itinerary_segment_dis_list, dis_array
 
 def driver_online_offline_decision(driver_table, current_time):
     # 车辆状态：0 cruise, 1 delivery, 2 pickup, 3 offline, 4 reposition
@@ -823,35 +770,35 @@ def driver_online_offline_decision(driver_table, current_time):
 # define the function to get zone_id of segment node
 
 
-def get_nodeId_from_coordinate(lng, lat):
-    """
-
-    :param lat: latitude
-    :type lat:  float
-    :param lng: longitute
-    :type lng:  float
-    :return:  id of node
-    :rtype: string
-    """
-    node_list = []
-    for i in range(len(lat)):
-        if lng[i] not in lng_list or lat[i] not in lat_list:
-            x = int(ox.nearest_nodes(G, lng[i], lat[i]))
-        else:
-            x = int(node_coord_to_id[(lng[i], lat[i])])
-        node_list.append(x)
-    return node_list
-
-
-def KM_for_agent():
-    # KM used in agent.py for KDD competition
-    pass
+# def get_nodeId_from_coordinate(lng, lat):
+#     """
+#
+#     :param lat: latitude
+#     :type lat:  float
+#     :param lng: longitute
+#     :type lng:  float
+#     :return:  id of node
+#     :rtype: string
+#     """
+#     node_list = []
+#     for i in range(len(lat)):
+#         if lng[i] not in lng_list or lat[i] not in lat_list:
+#             x = int(ox.nearest_nodes(G, lng[i], lat[i]))
+#         else:
+#             x = int(node_coord_to_id[(lng[i], lat[i])])
+#         node_list.append(x)
+#     return node_list
 
 
-def random_actions(possible_directions):
-    # make random move and generate a one hot vector
-    action = random.sample(possible_directions, 1)[0]
-    return action
+# def KM_for_agent():
+#     # KM used in agent.py for KDD competition
+#     pass
+
+
+# def random_actions(possible_directions):
+#     # make random move and generate a one hot vector
+#     action = random.sample(possible_directions, 1)[0]
+#     return action
 
 # rl for matching
 # state for sarsa
@@ -898,16 +845,16 @@ class StrategyTracker:
         return self.switch_counts
 
 # 每轮仿真结束后调用一次，保存为图片或记录数值。
-def plot_grid_rewards(grid_rewards, episode):
-    plt.figure(figsize=(10, 4))
-    plt.plot(range(len(grid_rewards)), grid_rewards, marker='o')
-    plt.title(f'Grid Reward Distribution - Episode {episode}')
-    plt.xlabel('Grid ID')
-    plt.ylabel('Cumulative Reward')
-    plt.grid(True)
-    plt.tight_layout()
-    plt.savefig(f'reward_plot_episode_{episode}.png')
-    plt.close()
+# def plot_grid_rewards(grid_rewards, episode):
+#     plt.figure(figsize=(10, 4))
+#     plt.plot(range(len(grid_rewards)), grid_rewards, marker='o')
+#     plt.title(f'Grid Reward Distribution - Episode {episode}')
+#     plt.xlabel('Grid ID')
+#     plt.ylabel('Cumulative Reward')
+#     plt.grid(True)
+#     plt.tight_layout()
+#     plt.savefig(f'reward_plot_episode_{episode}.png')
+#     plt.close()
 
 def calculate_evaluate_table(wait_requests,df_new_matched_requests):
     # 假设 env_params 已定义
@@ -980,3 +927,101 @@ def calculate_evaluate_table(wait_requests,df_new_matched_requests):
     final_df = pd.merge(all_grids, final_df, on='origin_grid_id', how='left').fillna(0)
 
     return final_df
+
+# def get_airport_veh(airport_grid_id,current_pred_demand,next_pred_demand,driver_table):
+#
+#     extra_veh = 0
+#     access_to_airport_index = []
+#     access_to_airport_2_index = []
+#
+#
+#     # stage 1
+#     dest_is_airport = driver_table.loc[(driver_table['status']==1) & (driver_table['target_grid_id']==airport_grid_id) & (driver_table['remaining_time']<=15) ]
+#     already_in_airport = driver_table.loc[((driver_table['status']==0) | (driver_table['status']==4)) & (driver_table['grid_id']==airport_grid_id) ]
+#     total_available_number = len(dest_is_airport) + len(already_in_airport)
+#
+#     dest_location = df_neighbor_centroid[['centroid_lon', 'centroid_lat']].loc[
+#         df_neighbor_centroid['zone_id'] == airport_grid_id].values
+#     dest_array = [dest_location[0] for _ in range(len(driver_table))]
+#     coord_array = driver_table[['lng', 'lat']].values
+#     distance_to_airport = distance_array(coord_array, np.array(dest_array))
+#     driver_table[f'time_to_airport{airport_grid_id}'] = distance_to_airport / 22.788 * 3600
+#
+#     if current_pred_demand > total_available_number:
+#         # cruising and update
+#         need_repo_num = current_pred_demand - total_available_number
+#         access_to_airport = driver_table.loc[
+#             ((driver_table['status'] == 0) & (driver_table[f'time_to_airport{airport_grid_id}'] <= 7*60)) | (
+#                         (driver_table['status'] == 4) & (driver_table['target_grid_id'] == airport_grid_id) & (
+#                             driver_table['remaining_time'] <= 7))]
+#
+#         if len(access_to_airport) > 0:
+#             print(f"机场{airport_grid_id}的供给缺口:{need_repo_num}")
+#             if len(access_to_airport)>=need_repo_num:
+#                 print(f"调度车辆数:{need_repo_num}")
+#                 access_to_airport =  access_to_airport.sample(n=need_repo_num,random_state=42)
+#             else:
+#                 print(f"调度车辆数:{len(access_to_airport)}")
+#         else:
+#             print(f"附近没有7-15分钟可抵达机场{airport_grid_id}的车辆")
+#
+#     else:
+#         print(f"机场{airport_grid_id}该时段供给大于需求，无需调度")
+#         extra_veh = total_available_number - current_pred_demand
+#
+#     # stage 2
+#     dest_is_airport_2 = driver_table.loc[
+#         (driver_table['status'] == 1) & (driver_table['target_grid_id'] == airport_grid_id) & (
+#                 driver_table['remaining_time'] > 15) & (driver_table['remaining_time'] <= 30)]
+#
+#     total_available_number_2 = extra_veh + len(dest_is_airport_2)
+#     if next_pred_demand > total_available_number_2: # 需要调度
+#         need_repo_num_2 = next_pred_demand - total_available_number_2
+#
+#         access_to_airport_2 = driver_table.loc[
+#             ((driver_table['status'] == 0) & (driver_table[f'time_to_airport{airport_grid_id}'] >15*60) & (driver_table[f'time_to_airport{airport_grid_id}'] <=20*60)) | (
+#                     (driver_table['status'] == 4) & (driver_table['target_grid_id'] == airport_grid_id) & (
+#                     driver_table['remaining_time'] <= 20) & (driver_table['remaining_time'] > 15))]
+#         if len(access_to_airport_2) > 0:
+#             print(f"机场{airport_grid_id}下一时段的供给缺口:{need_repo_num_2}")
+#             if len(access_to_airport_2) >= need_repo_num_2:
+#                 print(f"下一时段调度车辆数:{need_repo_num_2}")
+#                 access_to_airport_2 =  access_to_airport_2.sample(n=need_repo_num_2,random_state=42)
+#             else:
+#                 print(f"下一调度车辆数:{len(access_to_airport_2)}")
+#         else:
+#             print(f"下一时段附近没有15-20分钟可抵达机场{airport_grid_id}的车辆")
+#     else:
+#         print(f"机场{airport_grid_id}下一时段供给大于需求，无需调度")
+#
+#     try:
+#         access_to_airport_index = access_to_airport.index.tolist()
+#     except:
+#         pass
+#     try:
+#         access_to_airport_2_index = access_to_airport_2.index.tolist()
+#     except:
+#         pass
+#
+#     return access_to_airport_index, access_to_airport_2_index  # 返回两个index
+#
+#
+#     # 这里修改机场的cruising mode
+# def airport_cruising(airport_eligible_driver_index,airport_num, driver_table,mode):
+    """
+    :param eligible_driver_table: information of eligible driver.
+    :type eligible_driver_table: pandas.DataFrame
+    :param mode: the type of both-rg-cruising, if type is random; it can cruise to every node with equal
+                probability; if the type is nearby, it will cruise to the node in adjacent grid or
+                just stay at the original region.
+    :type mode: string
+    :return: itinerary_node_list, itinerary_segment_dis_list, dis_array
+    :rtype: tuple
+    """
+    dest_location = df_neighbor_centroid[['centroid_lon','centroid_lat']].loc[df_neighbor_centroid['zone_id'] == airport_num].values
+
+    dest_array = [dest_location[0] for _ in range(len(airport_eligible_driver_index))]
+    coord_array = driver_table.loc[airport_eligible_driver_index, ['lng', 'lat']].values
+    itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array,
+                                                                                        np.array(dest_array))
+    return itinerary_node_list, itinerary_segment_dis_list, dis_array

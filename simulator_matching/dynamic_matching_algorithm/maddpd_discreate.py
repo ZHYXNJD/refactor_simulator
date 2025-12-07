@@ -1,10 +1,9 @@
 # maddpg_discrete.py
 import copy
-import os
+import math
 import pickle
 import random
 from collections import deque, namedtuple
-
 import joblib
 import numpy as np
 import torch
@@ -107,73 +106,84 @@ class MADDPG:
         self,
         obs_dims,            # list of obs dims per agent
         n_actions,           # list of action counts per agent
-        date,
         driver_num,
-        actor_hidden=[32,32],
-        critic_hidden=[64,64],
-        lr_actor=1e-4,
-        lr_critic=1e-4,
-        gamma=0.99,
-        tau=0.005, # 0.005
-        buffer_size=100000,
-        batch_size=256,
-        device=None,
-        seed = 42,
-        # 必须热启动 以节约时间
-        load_offline_warmup = True,  # <-- 新增一个控制开关
+        transitions=None,
+        state_scaler=None,
+        **HYPERPARAMS
     ):
-        warmup_data_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data_5min.pkl"
-        scaler_file = f"./dynamic_matching_algorithm/warmup_transitions/{date}/{driver_num}/transition_data_state_scaler_5min.pkl"
-        self.device = device or torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.actor_hidden = [64, 64]
+        self.critic_hidden = [128, 128]
+        self.lr_actor = HYPERPARAMS['lr_actor']  # 1e-5
+        self.lr_critic = HYPERPARAMS['lr_critic'] # 5e-5
+        self.gamma = HYPERPARAMS['gamma']  # 0.95为原始值
+        self.tau = 0.005  # 0.005
+        self.buffer_size = HYPERPARAMS['buffer_size']  # 5000为原始值
+        self.batch_size = HYPERPARAMS['batch_size']  # 原来为32
+        self.action_var = HYPERPARAMS['action_var']
+        self.update_num = HYPERPARAMS['update']
+
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # 必须热启动 以节约时间
+        self.load_offline_warmup = True  # <-- 新增一个控制开关
+
         self.n = len(obs_dims)
         self.n_actions = n_actions
-        self.gamma = gamma
-        self.tau = tau
-        self.batch_size = batch_size
-        self.entropy_coef = 0.02  # 可调参数
 
         # Replay
-        self.buffer = ReplayBuffer(buffer_size, self.device)
+        self.buffer = ReplayBuffer(self.buffer_size, self.device)
 
-        if load_offline_warmup:
-            print(f"--- 正在从文件加载热启动数据... ---")
-            print(f"---load file {warmup_data_file} ---")
-            try:
-                # 1. 加载并填充 Buffer
-                with open(warmup_data_file, 'rb') as f:
-                    transitions = pickle.load(f)
+        if transitions is not None:
+            for t in transitions:
+                self.buffer.push(*t)
 
-                # (你需要根据你的 buffer.add() 逻辑来填充)
-                for t in transitions:
-                    self.buffer.push(*t)  #
+            self.state_scaler = state_scaler
+            self.is_scaler_fitted = True  # <-- 关键：标记为已拟合
+            self.warmup_states = []  # 不需要再收集了
 
-                # 2. 加载拟合好的 Scaler
-                self.state_scaler = joblib.load(scaler_file)
-                self.is_scaler_fitted = True  # <-- 关键：标记为已拟合
-                self.warmup_states = []  # 不需要再收集了
+            # 3. 让训练立即开始
+            self.learning_starts = self.batch_size  # 确保Buffer至少有一个Batch
 
-                # 3. 让训练立即开始
-                self.learning_starts = self.batch_size  # 确保Buffer至少有一个Batch
+            print(f"--- 外部加载完毕! Buffer size: {len(self.buffer)} ---")
+        else:
+            if self.load_offline_warmup:
+                warmup_data_file = f"./dynamic_matching_algorithm/warmup_transitions/all_day/{driver_num}/transition_data_brand_new.pkl"
+                scaler_file = f"./dynamic_matching_algorithm/warmup_transitions/all_day/{driver_num}/transition_data_state_scaler_brand_new.pkl"
+                print(f"--- 正在从文件加载热启动数据... ---")
+                print(f"---load file {warmup_data_file} ---")
+                try:
+                    # 1. 加载并填充 Buffer
+                    with open(warmup_data_file, 'rb') as f:
+                        transitions = pickle.load(f)
 
-                print(f"--- 加载完毕! Buffer size: {len(self.buffer)} ---")
+                    # (你需要根据你的 buffer.add() 逻辑来填充)
+                    for t in transitions:
+                        self.buffer.push(*t)  #
 
-            except FileNotFoundError:
-                print(f"--- [警告] 未找到热启动文件，将执行在线热启动... ---")
-                load_offline_warmup = False  # 文件不存在，退回旧模式
+                    # 2. 加载拟合好的 Scaler
+                    self.state_scaler = joblib.load(scaler_file)
+                    self.is_scaler_fitted = True  # <-- 关键：标记为已拟合
+                    self.warmup_states = []  # 不需要再收集了
 
-        if not load_offline_warmup:
-            # --- 你原来的“在线热启动”逻辑 ---
-            print("--- 将执行在线热启动... ---")
-            self.state_scaler = StandardScaler()
-            self.is_scaler_fitted = False
-            self.warmup_states = []  # (或者 deque)
+                    # 3. 让训练立即开始
+                    self.learning_starts = self.batch_size  # 确保Buffer至少有一个Batch
 
-            # **(关键)**
-            # 我们仍然需要一个大的热启动期来 fit Scaler
-            self.learning_starts = 2000  # (或 5000)
-            print(f"--- 训练将在 {self.learning_starts} 步后开始 ---")
+                    print(f"--- 加载完毕! Buffer size: {len(self.buffer)} ---")
 
-        # set_global_seed(seed=seed, use_cuda=(self.device.type == 'cuda'))
+                except FileNotFoundError:
+                    print(f"--- [警告] 未找到热启动文件，将执行在线热启动... ---")
+                    self.load_offline_warmup = False  # 文件不存在，退回旧模式
+
+            if not self.load_offline_warmup:
+                # --- 你原来的“在线热启动”逻辑 ---
+                print("--- 将执行在线热启动... ---")
+                self.state_scaler = StandardScaler()
+                self.is_scaler_fitted = False
+                self.warmup_states = []  # (或者 deque)
+
+                # **(关键)**
+                # 我们仍然需要一个大的热启动期来 fit Scaler
+                self.learning_starts = 1500  # (或 5000)
+                print(f"--- 训练将在 {self.learning_starts} 步后开始 ---")
 
         # Actors and targets (per agent)
         self.actors = []
@@ -181,24 +191,24 @@ class MADDPG:
         self.actor_optims = []
         for i in range(self.n):
             actor_input_dim = obs_dims[i]  # global state + grid ID one-hot
-            a = Actor(actor_input_dim, actor_hidden, n_actions[i]).to(self.device)
+            a = Actor(actor_input_dim, self.actor_hidden, self.n_actions[i]).to(self.device)
             ta = copy.deepcopy(a).to(self.device)
-            opt = optim.Adam(a.parameters(), lr=lr_actor)
+            opt = optim.Adam(a.parameters(), lr=self.lr_actor)
             self.actors.append(a)
             self.target_actors.append(ta)
             self.actor_optims.append(opt)
 
         # Critics and target (one centralized critic)
         total_obs = obs_dims[0]-self.n
-        total_act = len(n_actions)*n_actions[0]
+        total_act = len(n_actions)*self.n_actions[0]
 
         # double q network
-        self.critic1 = Critic(total_obs, total_act, critic_hidden).to(self.device)
+        self.critic1 = Critic(total_obs, total_act, self.critic_hidden).to(self.device)
         self.target_critic1 = copy.deepcopy(self.critic1).to(self.device)
-        self.critic_optim1 = optim.Adam(self.critic1.parameters(), lr=lr_critic)
-        self.critic2 = Critic(total_obs, total_act, critic_hidden).to(self.device)
+        self.critic_optim1 = optim.Adam(self.critic1.parameters(), lr=self.lr_critic)
+        self.critic2 = Critic(total_obs, total_act, self.critic_hidden).to(self.device)
         self.target_critic2 = copy.deepcopy(self.critic2).to(self.device)
-        self.critic_optim2 = optim.Adam(self.critic2.parameters(), lr=lr_critic)
+        self.critic_optim2 = optim.Adam(self.critic2.parameters(), lr=self.lr_critic)
 
         # losses
         self.actor_losses_history = [[] for _ in range(self.n)]  # per-agent step-level list
@@ -216,10 +226,19 @@ class MADDPG:
         self.strategy_tracker = StrategyTracker(self.n)  # last_actions, switch_counts
         self.grid_rewards = np.zeros(self.n)
 
-        self.entropy_start = 0.05
-        self.entropy_end = 0.005
 
         self.current_episode = 0
+
+        # ----- Entropy decay scheduler -----
+        self.entropy_start = 0.05
+        self.entropy_end = 0.005
+        self.max_epochs = 800
+
+    def get_entropy_coef(self):
+        # Linear decay
+        progress = min(self.current_episode / self.max_epochs, 1.0)
+        entropy_coef = self.entropy_end + (self.entropy_start - self.entropy_end) * (1 - progress)
+        return float(entropy_coef)
 
     def select_actions(self, global_state,deterministic=False):
         """
@@ -249,8 +268,15 @@ class MADDPG:
             logits = logits.squeeze(0)
 
             if deterministic:
+                # ε-greedy: 以 epsilon 的概率随机选动作，否则选 argmax
+                # epsilon = self.epsilon_by_epoch()
+                # if torch.rand(1).item() < epsilon:
+                #     act = int(torch.randint(0, self.n_actions[0], (1,), device=device).item())
+                # else:
+                #     act = int(torch.argmax(logits).item())
+                # logp = 0
                 act = int(torch.argmax(logits).item())
-                logp = 0.0
+                logp = 0
             else:
                 dist = torch.distributions.Categorical(logits=logits)
                 act = int(dist.sample().item())
@@ -302,132 +328,141 @@ class MADDPG:
             self.warmup_states = []  # 释放内存
             print("--- Scaler fitted. Starting training. ---")
 
-        global_state, acts_b,acts_b_log, rews_b, next_global_state, dones_b = self.buffer.sample(self.batch_size)
-        batch_size = global_state.shape[0]
+        # --- 开始多次更新循环 ---
+        for _ in range(self.update_num):  # <--- 修改点 2: 循环开始
 
-        # 4. (新！) 对采样的 batch 数据进行标准化
-        #    使用 .transform()，而不是 .fit()！
-        global_state = self.state_scaler.transform(global_state.cpu().numpy())
-        next_global_state = self.state_scaler.transform(next_global_state.cpu().numpy())
+            global_state, acts_b,acts_b_log, rews_b, next_global_state, dones_b = self.buffer.sample(self.batch_size)
+            batch_size = global_state.shape[0]
 
-        # 5. (新！) 把它们转回 Tensor
-        global_state = torch.tensor(global_state, dtype=torch.float32, device=self.device)
-        next_global_state = torch.tensor(next_global_state, dtype=torch.float32, device=self.device)
+            # 4. (新！) 对采样的 batch 数据进行标准化
+            #    使用 .transform()，而不是 .fit()！
+            global_state = self.state_scaler.transform(global_state.cpu().numpy())
+            next_global_state = self.state_scaler.transform(next_global_state.cpu().numpy())
 
-        # --- Critic update ---
-        # critic_input = self._build_critic_input(global_state, acts_b)
-        # q_values = self.critic(critic_input)  # [batch]
+            # 5. (新！) 把它们转回 Tensor
+            global_state = torch.tensor(global_state, dtype=torch.float32, device=self.device)
+            next_global_state = torch.tensor(next_global_state, dtype=torch.float32, device=self.device)
 
-        # --- Critic forward (current) ---
-        critic_input = self._build_critic_input(global_state, acts_b)  # shape: [batch, total_obs+total_act]
-        q1_values = self.critic1(critic_input)  # [batch]
-        q2_values = self.critic2(critic_input)  # [batch]
+            # --- Critic forward (current) ---
+            critic_input = self._build_critic_input(global_state, acts_b)  # shape: [batch, total_obs+total_act]
+            q1_values = self.critic1(critic_input)  # [batch]
+            q2_values = self.critic2(critic_input)  # [batch]
 
-        # 构造 target Q
-        next_actions = []
-        for i in range(self.n):
-            # 构造 agent-specific 输入：next_global_state + grid_id one-hot
-            grid_onehot = F.one_hot(torch.tensor(i), num_classes=self.n).float().to(self.device)
-            grid_onehot_batch = grid_onehot.unsqueeze(0).repeat(batch_size, 1)
-            agent_input = torch.cat([next_global_state, grid_onehot_batch], dim=-1)  # [batch, state_dim + n]
+            # 构造 target Q
+            next_actions = []
+            for i in range(self.n):
+                # 构造 agent-specific 输入：next_global_state + grid_id one-hot
+                grid_onehot = F.one_hot(torch.tensor(i), num_classes=self.n).float().to(self.device)
+                grid_onehot_batch = grid_onehot.unsqueeze(0).repeat(batch_size, 1)
+                agent_input = torch.cat([next_global_state, grid_onehot_batch], dim=-1)  # [batch, state_dim + n]
 
-            logits = self.target_actors[i](agent_input)  # [batch, n_actions]
-            next_act = torch.argmax(logits, dim=-1)  # [batch]
-            next_actions.append(next_act)
+                logits = self.target_actors[i](agent_input)  # [batch, n_actions]
+                dist = torch.distributions.Categorical(logits=logits)
+                next_act = dist.sample()  # [batch]
+                next_actions.append(next_act)
 
-        # --- Target Q (clipped double Q) ---
-        target_input = self._build_critic_input(next_global_state, next_actions)
-        with torch.no_grad():
-            q1_next = self.target_critic1(target_input)  # [batch]
-            q2_next = self.target_critic2(target_input)  # [batch]
-            q_next_min = torch.min(q1_next, q2_next)  # clipped double Q
+                # next_act = torch.argmax(logits, dim=-1)  # [batch]
+                # next_actions.append(next_act)
 
-            # 汇总奖励与终止（与你的设计保持一致）
-            rewards_sum = sum(rews_b)  # [batch]，各 agent 奖励之和
-            dones_any = torch.max(torch.stack(dones_b, dim=0), dim=0)[0]  # [batch]
-            target_q = rewards_sum + self.gamma * (1.0 - dones_any) * q_next_min
-
-        # --- Critic losses and updates ---
-        critic1_loss = F.mse_loss(q1_values, target_q)
-        critic2_loss = F.mse_loss(q2_values, target_q)
-        self.critic1_losses_history.append(critic1_loss.item())
-        self.critic2_losses_history.append(critic2_loss.item())
-
-        self.critic_optim1.zero_grad()
-        critic1_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 0.5)
-        self.critic_optim1.step()
-
-        self.critic_optim2.zero_grad()
-        critic2_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 0.5)
-        self.critic_optim2.step()
-
-        # --- Actor updates ---
-        for i in range(self.n):
-            # 构造 agent-specific 输入：global_state + grid_id one-hot
-            grid_onehot = F.one_hot(torch.tensor(i), num_classes=self.n).float().to(self.device)
-            grid_onehot_batch = grid_onehot.unsqueeze(0).repeat(batch_size, 1)
-            agent_input = torch.cat([global_state, grid_onehot_batch], dim=-1)  # [batch, state_dim + n]
-
-            logits = self.actors[i](agent_input)  # [batch, n_actions]
-            dist = torch.distributions.Categorical(logits=logits)
-            sampled_actions = dist.sample()  # [batch]
-            logp = dist.log_prob(sampled_actions)  # [batch]
-            entropy = dist.entropy()
-
-            # 替换第 i 个动作为 sampled，其他用原来的
-            actions_for_q = []
-            for j in range(self.n):
-                if j == i:
-                    actions_for_q.append(sampled_actions)
-                else:
-                    actions_for_q.append(acts_b[j])
-            critic_input_pi = self._build_critic_input(global_state, actions_for_q)
-            q_pi = self.critic1(critic_input_pi)  # [batch]
-
+            # --- Target Q (clipped double Q) ---
+            target_input = self._build_critic_input(next_global_state, next_actions)
             with torch.no_grad():
-                critic_input_base = self._build_critic_input(global_state, acts_b)
-                q_base = self.critic1(critic_input_base)
+                q1_next = self.target_critic1(target_input)  # [batch]
+                q2_next = self.target_critic2(target_input)  # [batch]
+                q_next_min = torch.min(q1_next, q2_next)  # clipped double Q
 
-            advantage = q_pi - q_base
+                # 汇总奖励与终止（与你的设计保持一致）
+                rewards_sum = sum(rews_b)  # [batch]，各 agent 奖励之和
+                dones_any = torch.max(torch.stack(dones_b, dim=0), dim=0)[0]  # [batch]
+                target_q = rewards_sum + self.gamma * (1.0 - dones_any) * q_next_min
 
-            actor_loss = self.compute_actor_loss(i,logp,entropy,advantage,episode=self.current_episode)
+            # --- Critic losses and updates ---
+            critic1_loss = F.mse_loss(q1_values, target_q)
+            critic2_loss = F.mse_loss(q2_values, target_q)
+            self.critic1_losses_history.append(critic1_loss.item())
+            self.critic2_losses_history.append(critic2_loss.item())
 
-            self.actor_optims[i].zero_grad()
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), 0.5)
-            self.actor_optims[i].step()
+            self.critic_optim1.zero_grad()
+            critic1_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 0.5)
+            self.critic_optim1.step()
 
-        self.q_pi_history.append(q_pi.mean().item())
+            self.critic_optim2.zero_grad()
+            critic2_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 0.5)
+            self.critic_optim2.step()
+
+            # --- Actor updates ---
+            for i in range(self.n):
+                # 构造 agent-specific 输入：global_state + grid_id one-hot
+                grid_onehot = F.one_hot(torch.tensor(i), num_classes=self.n).float().to(self.device)
+                grid_onehot_batch = grid_onehot.unsqueeze(0).repeat(batch_size, 1)
+                agent_input = torch.cat([global_state, grid_onehot_batch], dim=-1)  # [batch, state_dim + n]
+
+                logits = self.actors[i](agent_input)  # [batch, n_actions]
+                dist = torch.distributions.Categorical(logits=logits)
+                sampled_actions = dist.sample()  # [batch]
+                logp = dist.log_prob(sampled_actions)  # [batch]
+                entropy = dist.entropy()
+
+                # 替换第 i 个动作为 sampled，其他用原来的
+                actions_for_q = []
+                for j in range(self.n):
+                    if j == i:
+                        actions_for_q.append(sampled_actions)
+                    else:
+                        actions_for_q.append(acts_b[j])
+                critic_input_pi = self._build_critic_input(global_state, actions_for_q)
+                q_pi = self.critic1(critic_input_pi)  # [batch]
+
+                with torch.no_grad():
+                    critic_input_base = self._build_critic_input(global_state, acts_b)
+                    q1_base = self.critic1(critic_input_base)
+                    q2_base = self.critic2(critic_input_base)
+                    q_base = torch.min(q1_base, q2_base)
+
+                advantage = q_pi - q_base
+                actor_loss = self.compute_actor_loss(i,logp,entropy,advantage,episode=self.current_episode)
+
+                self.actor_optims[i].zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), 0.5)
+                self.actor_optims[i].step()
+
+            self.q_pi_history.append(q_pi.mean().item())
 
         # --- Soft updates for targets ---
-        self._soft_update(self.critic1, self.target_critic1, self.tau)
-        self._soft_update(self.critic2, self.target_critic2, self.tau)
+        self._soft_update(self.critic1, self.target_critic1)
+        self._soft_update(self.critic2, self.target_critic2)
         for i in range(self.n):
-            self._soft_update(self.actors[i], self.target_actors[i], self.tau)
+            self._soft_update(self.actors[i], self.target_actors[i])
 
-        # --- Soft update ---
-        # self._soft_update(self.critic, self.target_critic, self.tau)
-        # for i in range(self.n):
-        #     self._soft_update(self.actors[i], self.target_actors[i], self.tau)
 
-    def _soft_update(self, source, target, tau):
+    def _soft_update(self, source, target):
         for p_s, p_t in zip(source.parameters(), target.parameters()):
-            p_t.data.copy_(tau * p_s.data + (1.0 - tau) * p_t.data)
+            p_t.data.copy_(self.tau * p_s.data + (1.0 - self.tau) * p_t.data)
 
-    def save(self, path,epoch,driver_num):
+    # def save(self, path,epoch):
+    #
+    #     if not os.path.exists(path):
+    #         os.makedirs(path)  # create a folder
+    #     file_path = os.path.join(path, 'epoch_'+str(epoch) + '.pt')
+    #     state = {
+    #         'actors': [a.state_dict() for a in self.actors],
+    #         'crit1': self.critic1.state_dict(),
+    #         'crit2': self.critic2.state_dict()
+    #     }
+    #     torch.save(state, file_path)
+    #     torch.save(state, file_path)
 
-        if not os.path.exists(path):
-            os.makedirs(path)  # create a folder
-        file_path = os.path.join(path, 'epoch_'+str(epoch) + '.pt')
+    def save(self, path):
         state = {
             'actors': [a.state_dict() for a in self.actors],
             'crit1': self.critic1.state_dict(),
             'crit2': self.critic2.state_dict()
         }
-        torch.save(state, file_path)
-        torch.save(state, file_path)
+        torch.save(state, path)
+        torch.save(state, path)
 
     def load(self, path):
         state = torch.load(path, map_location=self.device)
@@ -441,7 +476,7 @@ class MADDPG:
         self.target_critic1.load_state_dict(self.critic1.state_dict())
         self.target_critic2.load_state_dict(self.critic2.state_dict())
 
-    def compute_actor_loss(self, i, logp, entropy, advantage, episode,max_episode=301):
+    def compute_actor_loss(self, i, logp, entropy, advantage, episode,max_episode=800):
         """
         计算单个 agent 的 actor loss，包含 advantage 标准化和自适应 entropy 衰减。
         """
@@ -457,17 +492,27 @@ class MADDPG:
         # 这里假设你在外部维护了 self.action_freq[i]，记录最近一个 episode 的动作频率
         if hasattr(self, "last_action_freq") and len(self.last_action_freq[i]) > 0 and self.last_action_freq[i][
             0] is not None:
-            action_var = np.var(self.last_action_freq[i])  # 越小越稳定
+            self.action_var = np.var(self.last_action_freq[i])  # 越小越稳定
         else:
-            action_var = 0.5  # 默认中等波动
+            # 改动1
+            self.action_var = 0.5  # 默认中等波动为0.5
 
         # 基础 schedule: 线性衰减
         ratio = min(episode / max_episode, 1.0)
         base_entropy_coef = self.entropy_start + (self.entropy_end - self.entropy_start) * ratio
 
+        # 指数衰减
+        # 改动2
+        # 改动3 把max episode改成了800
+        # decay_rate = self.entropy_end / self.entropy_start  # 衰减比例
+        # decay_progress = episode / max_episode  # 归一化进度 (0~1)
+        # base_entropy_coef = self.entropy_start * (decay_rate ** decay_progress)
+
         # 自适应调整：波动大的区域保持更高熵
-        adapt_factor = 1.0 + action_var  # 方差大 → 系数放大
+        adapt_factor = 1.0 + self.action_var  # 方差大 → 系数放大
         entropy_coef = base_entropy_coef * adapt_factor
+
+        # entropy_coef = self.get_entropy_coef()
 
         # --- Actor loss ---
         actor_loss = -(logp * advantage_norm).mean() - entropy_coef * entropy.mean()
@@ -479,18 +524,14 @@ class MADDPG:
             self.entropy_coef_history[i].append(entropy_coef)
 
         return actor_loss
-def set_global_seed(seed: int, use_cuda: bool = True):
-    """
-    将所有常见随机源设为固定种子。
-    调用时应在创建网络、DataLoader worker 之前执行。
-    """
-    os.environ['PYTHONHASHSEED'] = str(seed)  # 固定 Python hash 随机化
-    random.seed(seed)
-    # np.random.seed(seed)
-    torch.manual_seed(seed)
-    if use_cuda and torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+
+    def epsilon_by_epoch(self, eps_start=0.3, eps_end=0.01, decay_rate=0.005):
+        """
+        decay_rate 控制衰减速度，越大衰减越快
+        """
+        epsilon = eps_end + (eps_start - eps_end) * math.exp(-decay_rate * self.current_episode)
+        return max(eps_end, epsilon)
+
 
 
 

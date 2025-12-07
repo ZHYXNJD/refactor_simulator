@@ -1,16 +1,10 @@
-import datetime
-from torch.utils.tensorboard import SummaryWriter
-from simulator_pricing.agent_model.A2C import a2c_config
-from simulator_pricing.agent_model.A2C.A2C import A2C
-from utilities.utilities import *
 from simulator_env import Simulator
-import numpy as np
 from config import *
-from path import *
-import time
 import warnings
+
+from simulator_pricing.simulator_trainer import SimulatorTrainer
+
 warnings.filterwarnings("ignore")
-import os
 from pricing_agent import PricingAgent
 
 
@@ -23,7 +17,7 @@ if __name__ == "__main__":
     delivery_flag = ['rg']
 
     env_params['experiment_mode'] = 'train'  #
-    env_params['rl_mode'] = 'matching'  # matching,dynamic_matching
+    env_params['rl_mode'] = 'pricing'  #
     env_params['method'] = '' # static, spatial, temporal, st, llm-select(select a given multiplier)
     driver_num = [100]
     order_sample_ratio = [0.1]
@@ -60,7 +54,7 @@ if __name__ == "__main__":
                                 llm_select_params = {'agent_type':'llm-select',}
                                 pricing_agent = PricingAgent(**llm_select_params)
 
-                            simulator = Simulator(**env_params,pricing_agent=pricing_agent)
+                            simulator = Simulator(**env_params,pricing_agent=pricing_agent,matching_agent=None,dynamic_matching_agent=None)
                             trainer = SimulatorTrainer(
                                 simulator=simulator,
                                 pricing_agent=simulator.pricing_agent
