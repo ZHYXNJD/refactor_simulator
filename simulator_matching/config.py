@@ -52,11 +52,8 @@ env_params = {
 #  rl for matching
 # global variable and parameters for sarsa
 START_TIMESTAMP = 18000  # the start timestamp. !note:need to be same as 't_initial'
-LEN_TIME_SLICE = 300  # the length of a time slice, 5 minute (300 seconds) in this experiment
 LEN_TIME = 5 * 60 * 60  # 3 hours
-NUM_EPOCH = 3000  # 4001 / 3001
 
-FLAG_LOAD = True
 qTable_params = dict(learning_rate=0.005, discount_rate=0.95)  # parameters in sarsa/q-learning algorithm
 #  rl for matching
 

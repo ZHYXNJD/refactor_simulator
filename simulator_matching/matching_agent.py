@@ -49,30 +49,6 @@ class MatchingAgent:
         # else:
         #     raise ValueError(f"Unsupported strategy type: {strategy_type}")
 
-    def get_action_and_execute(self, matching_state):
-        """
-        Generate matching actions based on the current state.
-        :param matching_state: Dictionary containing the state information (e.g., requests, drivers, distances).
-        :param epsilon: Exploration rate for RL-based decision-making.
-        :return: Matched order-driver pairs.
-        """
-        wait_requests = matching_state['wait_requests']
-        driver_table = matching_state['driver_table']
-        maximal_pickup_distance = matching_state['maximal_pickup_distance']
-        dispatch_method = matching_state['dispatch_method']
-        method = matching_state['method']
-
-        idle_driver_table = driver_table[(driver_table['status'] == 0) | (driver_table['status'] == 4)]
-
-        # If no requests or no idle drivers, return empty actions
-        if wait_requests.shape[0] == 0 or idle_driver_table.shape[0] == 0:
-            # print("No requests or no idle drivers,LD matching is not performed.")
-            return [],[]   # Return an empty list
-
-        matched_pair_actual_indexs,matched_itinerary = order_dispatch(wait_requests, driver_table, maximal_pickup_distance, dispatch_method, method)
-
-        return matched_pair_actual_indexs,matched_itinerary
-
     def update(self, transitions):
         """
         Update the agent's strategy based on the feedback from the environment.

@@ -4,7 +4,6 @@ from sklearn.neighbors import BallTree
 from simulator_matching.matching_algorithm.dispatch_alg import LD
 from math import acos
 import pandas as pd
-from simulator_matching.config import env_params
 from math import sin, cos, radians
 
 """
@@ -27,9 +26,10 @@ Here, we load the information of graph network from graphml file.
 # result.set_index('node_id', inplace=True,drop=False)
 # node_id_to_coord = result.set_index('node_id')[['lng', 'lat']].apply(tuple, axis=1).to_dict()
 # node_coord_to_id = {value: key for key, value in node_id_to_coord.items()}
-
-result = pd.read_csv('my_data/new_grids_35.csv',index_col='node_id', dtype={'node_id': float})
-
+# try:
+#     result = pd.read_csv('my_data/new_grids_35.csv',index_col='node_id', dtype={'node_id': float})
+# except FileNotFoundError:
+#     result = pd.read_csv('simulator_matching/my_data/new_grids_35.csv', index_col='node_id', dtype={'node_id': float})
 # map_from_node_to_grid = {}
 # map_from_grid_to_nodes = defaultdict(list)
 # map_from_grid_to_centroid = {}
@@ -385,22 +385,24 @@ def route_generation_array(origin_coord_array, dest_coord_array,dest_node, repos
 #     return ret
 
 
-class road_network:
+class RoadNetwork:
 
-    def __init__(self, **kwargs):
-        self.params = kwargs
+    def __init__(self,grid_num):
+        self.grid_num = grid_num
 
-    def load_data(self):
-        """
-        :param data_path: the path of road_network file
-        :type data_path:  string
-        :param file_name: the filename of road_network file
-        :type file_name:  string
-        :return: None
-        :rtype:  None
-        """
-        # 路网格式：节点数字编号（从0开始），节点经度，节点纬度，所在grid id
-        self.df_road_network = result
+    def load_data(self,result=None):
+        if not result:
+            try:
+                result = pd.read_csv(f'my_data/new_grids_{self.grid_num}.csv', index_col='node_id', dtype={'node_id': float})
+            except FileNotFoundError:
+                result = pd.read_csv(f'simulator_matching/my_data/new_grids_{self.grid_num}.csv', index_col='node_id',
+                                     dtype={'node_id': float})
+
+            self.df_road_network = result
+        else:
+            # 并行仿真 从外部加载
+            self.df_road_network = result[self.grid_num]
+
 
     def get_information_for_nodes(self, node_id_array):
         """
@@ -526,7 +528,7 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
     :type driver_table:  pandas.DataFrame
 
     :param maximal_pickup_distance: maximum of pickup distance
-    :type maximal_pickup_distance: int
+    :type maximal_pickup_distance:
 
     :param dispatch_method: the method of order dispatch
     :type dispatch_method: string
@@ -619,7 +621,7 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
 
             order_driver_pair_list = []
 
-            if method in ['dynamic_matching','static_multi']:
+            if method in ['dynamic_matching','static_multi_choice']:
                 # reward_unit 是 (max_dist - dist), flag 是 原始 weight
                 # 需要找到权重为1的order 并将权重替换为相应的distance
                 # 按照之前的分析 还需要用一个大数减去distance
@@ -856,9 +858,7 @@ class StrategyTracker:
 #     plt.savefig(f'reward_plot_episode_{episode}.png')
 #     plt.close()
 
-def calculate_evaluate_table(wait_requests,df_new_matched_requests):
-    # 假设 env_params 已定义
-    grid_num = env_params['grid_num']  # 35
+def calculate_evaluate_table(grid_num,wait_requests,df_new_matched_requests):
 
     # -------------------
     # Step 1: 分类函数
@@ -1025,3 +1025,40 @@ def calculate_evaluate_table(wait_requests,df_new_matched_requests):
     itinerary_node_list, itinerary_segment_dis_list, dis_array = route_generation_array(coord_array,
                                                                                         np.array(dest_array))
     return itinerary_node_list, itinerary_segment_dis_list, dis_array
+
+
+def apply_mapping(df, mapping_dict, rule_name):
+    """
+    根据指定的映射规则，把 node_id 映射到 grid_id
+    参数:
+    df : pd.DataFrame
+        包含 'origin_node_id' 和 'dest_node_id' 的 DataFrame
+    mapping_dict : dict
+        节点到不同规则下 grid 的映射字典
+        格式: {node_id: {rule_name: grid_id}}
+    rule_name : str
+        指定使用的规则，比如 'grid_id_8', 'grid_id_35', 'grid_id_63'
+
+    返回:
+    pd.DataFrame
+        在原 df 基础上增加 'origin_grid_id' 和 'dest_grid_id'
+    """
+
+    # 映射函数
+    def map_node(node_id):
+        return mapping_dict.get(node_id, {}).get(rule_name, None)
+    df = df.copy()
+    df['origin_grid_id'] = df['origin_id'].map(map_node)
+    df['dest_grid_id'] = df['dest_id'].map(map_node)
+
+    return df
+
+def apply_mapping_driver(df, mapping_dict, rule_name):
+    # 映射函数
+    def map_node(node_id):
+        return mapping_dict.get(node_id, {}).get(rule_name, None)
+    df = df.copy()
+    df['origin_grid_id'] = df['origin_id'].map(map_node)
+    df['dest_grid_id'] = df['dest_id'].map(map_node)
+
+    return df

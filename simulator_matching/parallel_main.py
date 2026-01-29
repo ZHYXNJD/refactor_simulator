@@ -10,11 +10,11 @@ import multiprocessing as mp
 import pickle
 import joblib
 import torch
-from config import env_params
-from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import MADDPG
-from simulator_matching.simulator_env import Simulator
-from simulator_matching.simulator_trainer import SimulatorTrainer
-from simulator_matching.utilities.utilities import State
+from .config import env_params
+from .dynamic_matching_algorithm.maddpd_discreate import MADDPG
+from .simulator_env import Simulator
+from .simulator_trainer import SimulatorTrainer
+from .utilities.utilities import State
 
 # --- 1. 全局变量区域 ---
 # 这个变量将由父进程加载，所有子进程共享
@@ -24,25 +24,25 @@ DRIVER_NUM = 1000
 SAMPLE_RATIO = 1
 REQUEST_DICT = {}
 for date in TRAIN_DATE:
-    data_path = f"my_data/cleaned_orders_pickle/orders_grid35_{date}.pkl"
+    data_path = f"simulator_matching/my_data/cleaned_orders_pickle/orders_grid35_{date}.pkl"
     with open(data_path, 'rb') as f:
         print(f"load request file: {data_path}")
         REQUEST_DICT[date] = pickle.load(f)
-driver_path = f"my_data/drivers_grid35_{DRIVER_NUM}.pickle"
+driver_path = f"simulator_matching/my_data/drivers_grid35_{DRIVER_NUM}.pickle"
 with open(driver_path, 'rb') as f:
     DRIVER_INFO = pickle.load(f)
 DRIVER_INFO = DRIVER_INFO.sample(n=DRIVER_NUM,replace=False, random_state=42)
 
 # transition data and state scaler
-warmup_data_file = f"dynamic_matching_algorithm/warmup_transitions/all_day/{DRIVER_NUM}/transition_data_brand_new.pkl"
-scaler_file = f"dynamic_matching_algorithm/warmup_transitions/all_day/{DRIVER_NUM}/transition_data_state_scaler_brand_new.pkl"
+warmup_data_file = f"simulator_matching/dynamic_matching_algorithm/warmup_transitions/all_day/{DRIVER_NUM}/transition_data_brand_new.pkl"
+scaler_file = f"simulator_matching/dynamic_matching_algorithm/warmup_transitions/all_day/{DRIVER_NUM}/transition_data_state_scaler_brand_new.pkl"
 with open(warmup_data_file, 'rb') as f:
     TRANSITIONS = pickle.load(f)
 STATE_SCALER = joblib.load(scaler_file)
 
 # matching agent
 matching_agent_params = {'strategy_params': dict(learning_rate=0.005, discount_rate=0.95),
-                          'load_path': "New-Q-table/1000/sarsa_q_value_table_epoch_150.pickle",
+                          'load_path': "simulator_matching/New-Q-table/1000/sarsa_q_value_table_epoch_150.pickle",
                           'flag_load': True}
 class SarsaAgent(object):
     def __init__(self):
@@ -98,7 +98,7 @@ def run_simulation_and_train(config,worker_id):
             'num_epochs': 801,
             'train_dates': TRAIN_DATE,
             'driver_num': DRIVER_NUM,
-            'output_path': "Dynamic-matching/parallel_output_test",
+            'output_path': "simulator_matching/Dynamic-matching/parallel_output_version_2",
             'flag_load': True,
             'parallel': True,
             'worker_id':worker_id,
@@ -178,7 +178,7 @@ if __name__ == "__main__":
         {'lr_actor': 5e-5, 'lr_critic': 5e-3, 'gamma': 0.95, 'tau': 0.005, 'buffer_size': 10000, 'batch_size': 32, #14
          'action_var': 0.3, 'update': 3}, # 在该情境下，提高buffer size没有卵用
         {'lr_actor': 5e-5, 'lr_critic': 5e-3, 'gamma': 0.95, 'tau': 0.005, 'buffer_size': 15000, 'batch_size': 32, #15
-         'action_var': 0.3, 'update': 3},
+         'action_var': 0.3, 'update': 3}
     ]
 
     # >>> 3. 填充任务队列 <<<

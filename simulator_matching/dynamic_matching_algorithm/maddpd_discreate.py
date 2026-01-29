@@ -11,6 +11,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from sklearn.preprocessing import StandardScaler
+# from ..utilities.utilities import StrategyTracker
 from simulator_matching.utilities.utilities import StrategyTracker
 # -----------------------
 # Utilities / Replay
@@ -106,27 +107,29 @@ class MADDPG:
         self,
         obs_dims,            # list of obs dims per agent
         n_actions,           # list of action counts per agent
-        driver_num,
         transitions=None,
         state_scaler=None,
         **HYPERPARAMS
     ):
-        self.actor_hidden = [64, 64]
-        self.critic_hidden = [128, 128]
-        self.lr_actor = HYPERPARAMS['lr_actor']  # 1e-5
-        self.lr_critic = HYPERPARAMS['lr_critic'] # 5e-5
-        self.gamma = HYPERPARAMS['gamma']  # 0.95为原始值
+        self.load_path = HYPERPARAMS.get('load_dynamic_path',None)
+        self.actor_hidden = HYPERPARAMS.get('actor_hidden',[64, 64])
+        self.critic_hidden = HYPERPARAMS.get('critic_hidden',[128, 128])
+        self.lr_actor = HYPERPARAMS.get('lr_actor',1e-5)
+        self.lr_critic = HYPERPARAMS.get('lr_critic',5e-5) # 5e-5
+        self.gamma = HYPERPARAMS.get('gamma',0.95)  # 0.95为原始值
         self.tau = 0.005  # 0.005
-        self.buffer_size = HYPERPARAMS['buffer_size']  # 5000为原始值
-        self.batch_size = HYPERPARAMS['batch_size']  # 原来为32
-        self.action_var = HYPERPARAMS['action_var']
-        self.update_num = HYPERPARAMS['update']
+        self.buffer_size = HYPERPARAMS.get('buffer_size',5000)  # 5000为原始值
+        self.batch_size = HYPERPARAMS.get('batch_size',32) # 原来为32
+        self.action_var = HYPERPARAMS.get('action_var',0.3)
+        self.update_num = HYPERPARAMS.get('update',3)
+        self.driver_num = HYPERPARAMS.get('driver_num',1000)
 
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # 必须热启动 以节约时间
         self.load_offline_warmup = True  # <-- 新增一个控制开关
 
-        self.n = len(obs_dims)
+        # self.n = len(obs_dims)
+        self.n = HYPERPARAMS.get('grid_num',35)
         self.n_actions = n_actions
 
         # Replay
@@ -146,8 +149,8 @@ class MADDPG:
             print(f"--- 外部加载完毕! Buffer size: {len(self.buffer)} ---")
         else:
             if self.load_offline_warmup:
-                warmup_data_file = f"./dynamic_matching_algorithm/warmup_transitions/all_day/{driver_num}/transition_data_brand_new.pkl"
-                scaler_file = f"./dynamic_matching_algorithm/warmup_transitions/all_day/{driver_num}/transition_data_state_scaler_brand_new.pkl"
+                warmup_data_file = f"./dynamic_matching_algorithm/warmup_transitions/all_day/{self.driver_num}/transition_data_brand_new.pkl"
+                scaler_file = f"./dynamic_matching_algorithm/warmup_transitions/all_day/{self.driver_num}/transition_data_state_scaler_brand_new.pkl"
                 print(f"--- 正在从文件加载热启动数据... ---")
                 print(f"---load file {warmup_data_file} ---")
                 try:
@@ -442,19 +445,6 @@ class MADDPG:
         for p_s, p_t in zip(source.parameters(), target.parameters()):
             p_t.data.copy_(self.tau * p_s.data + (1.0 - self.tau) * p_t.data)
 
-    # def save(self, path,epoch):
-    #
-    #     if not os.path.exists(path):
-    #         os.makedirs(path)  # create a folder
-    #     file_path = os.path.join(path, 'epoch_'+str(epoch) + '.pt')
-    #     state = {
-    #         'actors': [a.state_dict() for a in self.actors],
-    #         'crit1': self.critic1.state_dict(),
-    #         'crit2': self.critic2.state_dict()
-    #     }
-    #     torch.save(state, file_path)
-    #     torch.save(state, file_path)
-
     def save(self, path):
         state = {
             'actors': [a.state_dict() for a in self.actors],
@@ -464,17 +454,21 @@ class MADDPG:
         torch.save(state, path)
         torch.save(state, path)
 
-    def load(self, path):
-        state = torch.load(path, map_location=self.device)
-        for a, st in zip(self.actors, state['actors']):
-            a.load_state_dict(st)
-        self.critic1.load_state_dict(state['crit1'])
-        self.critic2.load_state_dict(state['crit2'])
-        # update targets
-        for i in range(self.n):
-            self.target_actors[i].load_state_dict(self.actors[i].state_dict())
-        self.target_critic1.load_state_dict(self.critic1.state_dict())
-        self.target_critic2.load_state_dict(self.critic2.state_dict())
+    def load(self,grid_num,decision_freq):
+        if self.load_path:
+            print(f"Loading saved model, test dynamic matching model: grid_{grid_num}_freq_{decision_freq}")
+            state = torch.load(self.load_path, map_location=self.device)
+            for a, st in zip(self.actors, state['actors']):
+                a.load_state_dict(st)
+            self.critic1.load_state_dict(state['crit1'])
+            self.critic2.load_state_dict(state['crit2'])
+            # update targets
+            for i in range(self.n):
+                self.target_actors[i].load_state_dict(self.actors[i].state_dict())
+            self.target_critic1.load_state_dict(self.critic1.state_dict())
+            self.target_critic2.load_state_dict(self.critic2.state_dict())
+        else:
+            print("No specified loading path, not test dynamic matching")
 
     def compute_actor_loss(self, i, logp, entropy, advantage, episode,max_episode=800):
         """

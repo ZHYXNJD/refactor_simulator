@@ -1,39 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" serverName="hy" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="161">
+      <paths name="hy">
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
-      <paths name="189">
+      <paths name="root@root@connect.nmb1.seetacloud.com:35786 password">
         <serverdata>
           <mappings>
-            <mapping local="$PROJECT_DIR$" web="/" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="root@root@qdai.scnet.cn:50161 password">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="root@root@qdai.scnet.cn:50179 password">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
-          </mappings>
-        </serverdata>
-      </paths>
-      <paths name="root@root@qdai.scnet.cn:50189 password">
-        <serverdata>
-          <mappings>
-            <mapping deploy="/work/home/zhaojiahao/hongyang/Transportation_Simulator" local="$PROJECT_DIR$" />
+            <mapping deploy="/Transportation_Simulator" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>

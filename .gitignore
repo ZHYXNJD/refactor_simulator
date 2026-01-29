@@ -53,4 +53,6 @@ simulator_matching/output_dynamic_match
 simulator_matching/Q-table
 simulator_matching/Dynamic-matching
 simulator_matching/New-Q-table
+evaluate_results/*
+simulator_matching/MRL4_Order_dispath_upload.docx
 

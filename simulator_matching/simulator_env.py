@@ -1,25 +1,26 @@
 from copy import deepcopy
 import pandas as pd
 from simulator_matching.dynamic_matching_algorithm.maddpd_discreate import *
-from simulator_matching.utilities.utilities import road_network, sample_all_drivers, State,order_dispatch
-from simulator_pattern import *
+from simulator_matching.utilities.utilities import RoadNetwork, sample_all_drivers, State,order_dispatch,apply_mapping
 from simulator_matching.utilities.utilities import driver_online_offline_decision, calculate_evaluate_table
-from config import qTable_params
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 class Simulator:
-    def __init__(self, matching_agent,dynamic_matching_agent, **kwargs):
+    def __init__(self, matching_agent,dynamic_matching_agent=None,mapping_dict=None,road_network=None, **kwargs):
 
         # basic parameters: time & sample
-        self.t_initial = kwargs['t_initial']
-        self.t_end = kwargs['t_end']
-        self.delta_t = kwargs['delta_t']
-        self.vehicle_speed = kwargs['vehicle_speed']
-        self.repo_speed = kwargs.pop('repo_speed', 3)
+        self.price_per_km = 5
+        self.seed = None
+        self.seed_list = [0, 42, 3407, 1024, 215]
+        self.t_initial = 18000
+        self.t_end = 36000
+        self.delta_t = 60
+        self.vehicle_speed = 22.788
+        self.repo_speed = 22.788
         self.time = None
         self.current_step = None
-        self.rl_mode = kwargs['rl_mode']
+        self.rl_mode = kwargs.get('rl_mode','dynamic_matching')
 
         # Andrew :RL agents(RL module)
         self.matching_agent = matching_agent
@@ -28,61 +29,62 @@ class Simulator:
         # register dynamic matching agent
         self.dynamic_matching_agent = dynamic_matching_agent
 
+        self.mapping_dict = mapping_dict
+
         self.requests = None
         self.record = ""
 
         # order generation
-        self.order_sample_ratio = kwargs['order_sample_ratio']
-        self.order_generation_mode = kwargs['order_generation_mode']
-        self.request_interval = kwargs['request_interval']
+        self.order_sample_ratio = kwargs.get('order_sample_ratio',1)
+        self.order_generation_mode = 'sample_from_base'
+        self.request_interval = 60
 
         # wait cancel
-        self.maximum_wait_time_mean = kwargs.pop('maximum_wait_time_mean', 120)
-        self.maximum_wait_time_std = kwargs.pop('maximum_wait_time_std', 0)
+        self.maximum_wait_time_mean = 300
+        self.maximum_wait_time_std = 0
 
         # driver cancel after matching based on maximal pickup distance
-        self.maximal_pickup_distance = kwargs['maximal_pickup_distance']
+        self.maximal_pickup_distance = 1.25
+
+        #
+        self.maximum_pickup_time_passenger_can_tolerate_mean = float('inf')
+        self.maximum_pickup_time_passenger_can_tolerate_std = 0
+        self.maximum_price_passenger_can_tolerate_mean = float('inf')
+        self.maximum_price_passenger_can_tolerate_std = 0
 
         # track recording
-        self.track_recording_flag = kwargs['track_recording_flag']
+        self.track_recording_flag = False
         self.new_tracks = {}
         self.match_and_cancel_track = {}
         self.passenger_track = {}
 
-        # pattern
-        # self.simulator_mode = kwargs.pop('simulator_mode', 'simulator_mode')
-        # self.experiment_mode = kwargs.pop('experiment_mode', 'train')
-        # self.experiment_date = kwargs.pop('experiment_date', '')
         self.experiment_date = None
-        # pattern = SimulatorPattern()
-        # self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
 
-        '''
-        plan to delete
-        '''
-        self.RN = road_network()
-        self.RN.load_data()
-        self.zone_id_array = np.array([i for i in range(kwargs['grid_num'])])
+        self.grid_num = kwargs.get('grid_num', 35)
+        self.decision_freq = kwargs.get('decision_freq', 10) # 单位：min
+        self.experiment_mode = kwargs.get('experiment_mode','train_dynamic_matching')
+        self.pickup_mode = kwargs.get('pickup_mode','ma')
+        self.method = kwargs.get('method', 'dynamic_matching')
         # dispatch method
-        self.dispatch_method = kwargs['dispatch_method']
-        self.method = kwargs['method']
+        self.dispatch_method = 'LD'
+
+        self.RN = RoadNetwork(self.grid_num)
+        self.RN.load_data(result=road_network)
+        self.zone_id_array = np.array([i for i in range(self.grid_num)])
 
         # cruise and reposition related parameters
-        self.cruise_flag = kwargs['cruise_flag']
-        self.cruise_mode = kwargs['cruise_mode']
-        self.max_idle_time = kwargs['max_idle_time']
+        self.cruise_flag = False
+        self.cruise_mode = 'global-random'
+        self.max_idle_time = 300
 
-        self.reposition_flag = kwargs['reposition_flag']
-        self.reposition_mode = kwargs['reposition_mode']
-        self.eligible_time_for_reposition = kwargs['eligible_time_for_reposition']
+        self.reposition_flag = False
+        self.reposition_mode = ''
+        self.eligible_time_for_reposition = 300
+
+        self.score_discount_rate = kwargs.get('score_discount_rate', 0.9)
 
         # get steps
         self.finish_run_step = int((self.t_end - self.t_initial) // self.delta_t)
-        # print("steps", self.finish_run_step)
-
-        self.grid_num = kwargs['grid_num']
-        self.experiment_mode = kwargs['experiment_mode']
-        self.pickup_mode = kwargs['pickup_mode']
 
         # request tables
         # driver status:cruising/repositioning, pick-up, delivery, idling (unmatched and not cruising)
@@ -103,23 +105,15 @@ class Simulator:
                                'current_road_node_index',
                                'remaining_time_for_current_node', 'itinerary_node_list', 'itinerary_segment_dis_list']
         self.driver_table = None
-        self.driver_sample_ratio = kwargs['driver_sample_ratio']
-        self.driver_num = kwargs['driver_num']
+        self.driver_sample_ratio = 1
+        self.driver_num = kwargs.get('driver_num', 1000)
 
-        # order and driver databases
-        # self.driver_info = pattern.driver_info
-        # self.driver_info['grid_id'] = self.driver_info['grid_id'].values.astype(int)
-
-        # TJ
         self.total_reward = 0
-        # TJ
-        if self.rl_mode == 'reposition':
-            self.reposition_method = kwargs['reposition_method']  # rl for repositioning
-
-        self.AGENT_DECISION_FREQUENCY = 10 * 60  # 后期把这个参数改为可以调整的
 
         # 创建一个私有的随机生成器实例，初始为 None
         self.rng = None
+
+        self.penalty_alpha = kwargs.get('penalty_alpha', 0.001)
 
         # pattern = SimulatorPattern('2015-05-05')
         # self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
@@ -135,15 +129,16 @@ class Simulator:
             self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
             self.driver_info = pattern.driver_info
         else:
-            print("并行训练，从外部加载数据")
             self.request_databases = request_databases
-            self.driver_info = driver_info
+            self.driver_info = driver_info.sample(n=self.driver_num,replace=False, random_state=42)
 
         self.time = deepcopy(self.t_initial)
         self.current_step = int((self.time - self.t_initial) // self.delta_t)
         self.grid_value = {}
         # construct driver table
         self.driver_table = sample_all_drivers(self.driver_info, self.t_initial, self.t_end, self.driver_sample_ratio)
+
+
         self.driver_table['target_grid_id'] = self.driver_table['target_grid_id'].values.astype(int)
 
         if self.rl_mode == 'matching':
@@ -178,7 +173,6 @@ class Simulator:
         self.matched_short_requests_num = 0
         self.matched_requests_num = 0.0000001
 
-        self.sampled_total_request = []
         self.transfer_request_num = 0
         self.long_requests_num = 0.0000001
         self.medium_requests_num = 0.0000001
@@ -210,10 +204,14 @@ class Simulator:
         # 0 instant | 1 pickup distance | 2 RL
         self.held_action_tuple = ([0]* int(self.grid_num),[0] * int(self.grid_num))
 
+        # heuristic strategy
+        self.strategy_vector = None
+
 
     def reset(self,seed,given_data=False,request_databases=None,driver_info=None):
         if seed is not None:
             self.rng = np.random.RandomState(seed)
+            self.seed = seed
         self.initial_base_tables(given_data,request_databases,driver_info)
 
     def update_info_after_matching_multi_process(self, matched_pair_actual_indexes, matched_itinerary):
@@ -346,20 +344,9 @@ class Simulator:
                     lambda x: x[0]).values / self.vehicle_speed * 3600
 
             if self.rl_mode == 'matching' and self.experiment_mode == 'train':
-                #  rl for matching
-                # generate transitions
-                # self.time + np.zeros(new_matched_requests.shape[0])
-                # 获取当前时间 self.time，并扩展为数组（长度等于匹配的订单数）
-                # 所有订单的时间都是 self.time
-                # self.driver_table.loc[cor_driver[con_remain], 'grid_id'].values
-                # 获取成功匹配的司机的当前位置（grid_id）
-                # 每个匹配订单的 state 包含 [time, grid_id]
-                # np.vstack([...]).T
-                # 最终 state_array 形状： (num_matched_orders, 2)
-                # 每行表示一个匹配订单的 state = [时间, 网格 ID]
+
                 state_array = np.vstack([self.time + np.zeros(new_matched_requests.shape[0]),
                                          self.driver_table.loc[cor_driver[con_remain], 'grid_id'].values]).T
-                # TODO: 如果使用Q-learning，应该引入 epsilon-greedy 算法或者是reposition_agent去指导动作
                 action_array = np.ones(new_matched_requests.shape[0])
                 next_state_array = np.vstack([new_matched_requests['t_end'].values,
                                               new_matched_requests['dest_grid_id'].values]).T
@@ -371,7 +358,7 @@ class Simulator:
                 else:
                     # reward_array = new_matched_requests['designed_reward'].values
 
-                    # 如果要考虑空车的惩罚 可以在这里添加
+                    # 空车的惩罚
                     idle_drivers = self.driver_table[
                         (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)].copy()
                     grid_total_wait = idle_drivers.groupby('grid_id')['total_idle_time'].sum()
@@ -382,11 +369,11 @@ class Simulator:
                     # 惩罚系数 ALPHA 需要重新调整。
                     # 因为 Penalty 现在包含了 (N_idle / N_match) 的倍数，数值可能会很大。
                     # 建议 ALPHA 设得比之前更小，例如 0.001 或 0.01，视你的 time 单位（秒/分）而定
-                    ALPHA = 0.001 # large:0.001
+                    penalty_alpha = self.penalty_alpha # large:0.001
                     original_rewards = new_matched_requests['designed_reward'].values
-                    final_rewards = original_rewards - (ALPHA * penalties)
+                    final_rewards = original_rewards - (penalty_alpha * penalties)
                     # print(f"Max original: {np.max(original_rewards):.2f}, Mean original: {np.mean(original_rewards):.2f}")
-                    # print(f"Max Penalty: {np.max(ALPHA * penalties):.2f}, Mean Penalty: {np.mean(ALPHA * penalties):.2f}")
+                    # print(f"Max Penalty: {np.max(penalty_alpha * penalties):.2f}, Mean Penalty: {np.mean(penalty_alpha * penalties):.2f}")
                     # print(f"Max final: {np.max(final_rewards):.2f}, Mean final: {np.mean(final_rewards):.2f}")
 
                 self.dispatch_transitions_buffer[0] = np.concatenate([self.dispatch_transitions_buffer[0], state_array])
@@ -445,8 +432,6 @@ class Simulator:
         This function used to generate initial order by different time
         :return:
         """
-        # TJ
-        # TO DO: 将train data 保存到本地 训练时直接读取 彻底杜绝随机性
         if self.order_generation_mode == 'sample_from_base':
             # directly sample orders from the historical order database
             temp_request = []
@@ -460,8 +445,6 @@ class Simulator:
             # sample a portion of historical orders
             num_request = int(np.rint(self.order_sample_ratio * database_size))
             if num_request < database_size:
-                # np.random.seed(43) # 训练的随机种子
-                # np.random.seed(1578) # 测试的随机种子
                 sampled_request_index = self.rng.choice(database_size, num_request, replace=False).tolist()
                 sampled_requests = [temp_request[index] for index in sampled_request_index]
             else:
@@ -479,34 +462,36 @@ class Simulator:
                 wait_info['trip_time'] = wait_info['trip_distance'] / self.vehicle_speed * 3600
                 wait_info['designed_reward'] = 2.5 + 0.5 * (
                         (wait_info['trip_distance'] * 1000 - 322).clip(lower=0) / 322)
+
+                if self.grid_num == 8:
+                    wait_info = apply_mapping(wait_info, self.mapping_dict, 'grid_id_8')
+                elif self.grid_num == 63:
+                    wait_info = apply_mapping(wait_info, self.mapping_dict, 'grid_id_63')
+
                 dynamic_matching_array = np.zeros(len(sampled_requests)) + 0.01
 
-                self.sampled_total_request.append(sampled_requests)
+
 
                 # Andrew
                 # assign weight array
                 if self.rl_mode == 'matching':
-                    # TODO: 后续对于不同的reward计算方式进行封装
-                    #  rl for matching
-                    #  如果是测试baseline，修改config即可
-                    # ✅ 放在所有策略判断之前
-                    current_time_slice = int((self.time - self.t_initial - 1) / LEN_TIME_SLICE)
-                    num_slices = int(LEN_TIME / LEN_TIME_SLICE)
+                    current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq*60))
+                    num_slices = int( 18000 / (self.decision_freq*60))
 
-                    if self.method in ['instant_reward','ir','ir_d']:
+                    if self.method in ['instant_reward','ir']:
                         weight_array = wait_info['designed_reward'].values
 
                     elif self.method in ['pickup_distance','d']:
                         # distance 在LD中进行计算
                         pass
 
-                    elif self.method in ['sarsa', 'sarsa_no_subway','rl','rl_d','d_rl']:
+                    elif self.method in ['sarsa','rl']:
                         for i, (travel_time, reward, dest_grid_id) in enumerate(zip(
                                 wait_info['trip_time'].values.tolist(),
                                 wait_info['designed_reward'].values.tolist(),
                                 wait_info['dest_grid_id'].values.tolist())):
 
-                            end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / LEN_TIME_SLICE)
+                            end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (self.decision_freq*60))
 
                             if end_time_slice >= num_slices:
                                 original_trip_score = reward
@@ -522,55 +507,48 @@ class Simulator:
                                     scale_coeff = 0.5
                                 elif self.driver_num == 1000:
                                     scale_coeff = 1.0
-                                # original_trip_score = reward + scale_coeff * (
-                                #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
-                                #                       score_agent.strategy.q_value_table[next_state]
                                 original_trip_score = reward + scale_coeff * (
-                                        qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
+                                        self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
                                                       score_agent.q_value_table[next_state]
                             weight_array[i] = original_trip_score
                             self.transfer_request_num += 1
-                    elif self.method == 'static_multi':
-                        for i, (travel_time, reward, dest_grid_id, origin_grid_id) in enumerate(zip(
+
+                    elif self.method == 'static_multi_choice':
+                        for i, (travel_time, reward, origin_grid_id,dest_grid_id) in enumerate(zip(
                                 wait_info['trip_time'].values.tolist(),
                                 wait_info['designed_reward'].values.tolist(),
-                                wait_info['dest_grid_id'].values.tolist(),
-                                wait_info['origin_grid_id'])):
-                            if int(origin_grid_id) in [9,14,15,20]:
-                                dynamic_matching_array[i] = 1
-                                pass
-                            else:  # RL
-                                current_time_slice = int((self.time - self.t_initial - 1) / LEN_TIME_SLICE)
-                                num_slices = int(LEN_TIME / LEN_TIME_SLICE)
-                                end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / LEN_TIME_SLICE)
+                                wait_info['origin_grid_id'].values.tolist(),
+                                wait_info['dest_grid_id'].values.tolist())):
+                            if origin_grid_id in [0,1,2]:
+                                weight_array[i] = reward
+                            elif origin_grid_id in [3,4,5,6,7,20,21,22]:
+                                end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (
+                                                      self.decision_freq * 60))
                                 if end_time_slice >= num_slices:
                                     original_trip_score = reward
                                 else:
                                     next_state = State(end_time_slice, int(dest_grid_id))
                                     original_trip_score = reward + (
-                                            qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
-                                                          score_agent.strategy.q_value_table[next_state]
+                                            self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
+                                                          score_agent.q_value_table[next_state]
                                 weight_array[i] = original_trip_score
-                                dynamic_matching_array[i] = 2
-                    elif self.method == 'new_dqn':
-                        for i, (travel_time, reward, dest_grid_id) in enumerate(zip(
-                                wait_info['trip_time'], wait_info['designed_reward'], wait_info['dest_grid_id'])):
-                            end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / LEN_TIME_SLICE)
-                            next_state = [end_time_slice * LEN_TIME_SLICE + self.t_initial + 1, dest_grid_id]
+                            else:
+                                pass
 
-                            future_value = score_agent.strategy.agent.get_q_value(next_state)
-                            weight_array[i] = reward + (qTable_params['discount_rate'] ** (
-                                        end_time_slice - current_time_slice)) * future_value
-                            self.transfer_request_num += 1
 
-                elif self.rl_mode == 'dynamic_matching':
+
+                elif self.rl_mode in ['dynamic_matching','heuristic_matching']:
 
                     for i, (travel_time, reward, dest_grid_id,origin_grid_id) in enumerate(zip(
                             wait_info['trip_time'].values.tolist(),
                             wait_info['designed_reward'].values.tolist(),
                             wait_info['dest_grid_id'].values.tolist(),
                             wait_info['origin_grid_id'])):
-                        matching_method = self.held_action_tuple[0][int(origin_grid_id)]
+                        if self.rl_mode == 'dynamic_matching':
+                            matching_method = self.held_action_tuple[0][int(origin_grid_id)]
+                        elif self.rl_mode == 'heuristic_matching':
+                            matching_method = self.strategy_vector[int(origin_grid_id)]
+
                         if matching_method == 0: # instant reward
                             weight_array[i] = reward
                             dynamic_matching_array[i] = 0
@@ -582,9 +560,9 @@ class Simulator:
                             dynamic_matching_array[i] = 1
                             pass
                         else: # RL
-                            current_time_slice = int((self.time - self.t_initial - 1) / LEN_TIME_SLICE)
-                            num_slices = int(LEN_TIME / LEN_TIME_SLICE)
-                            end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / LEN_TIME_SLICE)
+                            current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq*60))
+                            num_slices = int(18000 / (self.decision_freq*60))
+                            end_time_slice = int((self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (self.decision_freq*60))
                             if end_time_slice >= num_slices:
                                 original_trip_score = reward
                             else:
@@ -597,12 +575,13 @@ class Simulator:
                                     scale_coeff = 0.5
                                 elif self.driver_num == 1000:
                                     scale_coeff = 1.0
-                                original_trip_score = reward + scale_coeff * (
-                                        qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
-                                                      score_agent.strategy.q_value_table[next_state]
                                 # original_trip_score = reward + scale_coeff * (
                                 #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
-                                #                       score_agent.q_value_table[next_state]
+                                #                       score_agent.strategy.q_value_table[next_state]
+                                # train dynamic matching的时候打开这个
+                                original_trip_score = reward + scale_coeff * (
+                                        self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
+                                                      score_agent.q_value_table[next_state]
                             weight_array[i] = original_trip_score
                             dynamic_matching_array[i] = 2
 
@@ -613,16 +592,14 @@ class Simulator:
                 # Andrew: 司机和乘客最大等待时间
                 wait_info['maximum_wait_time'] = self.maximum_wait_time_mean
                 wait_info['maximum_price_passenger_can_tolerate'] = np.random.normal(
-                    env_params['maximum_price_passenger_can_tolerate_mean'],
-                    env_params['maximum_price_passenger_can_tolerate_std'],
+                    self.maximum_price_passenger_can_tolerate_mean,
+                    self.maximum_price_passenger_can_tolerate_std,
                     len(wait_info))
                 wait_info = wait_info[
-                    wait_info['maximum_price_passenger_can_tolerate'] >= wait_info['trip_distance'] * env_params[
-                        'price_per_km']]
+                    wait_info['maximum_price_passenger_can_tolerate'] >= wait_info['trip_distance'] * self.price_per_km]
                 wait_info['maximum_pickup_time_passenger_can_tolerate'] = np.random.normal(
-                    env_params['maximum_pickup_time_passenger_can_tolerate_mean'],
-                    env_params['maximum_pickup_time_passenger_can_tolerate_std'],
-                    len(wait_info))
+                    self.maximum_pickup_time_passenger_can_tolerate_mean,
+                    self.maximum_pickup_time_passenger_can_tolerate_std,len(wait_info))
 
                 dfs = [self.wait_requests, wait_info]
                 self.wait_requests = pd.concat([df for df in dfs if df is not None and not df.empty],
@@ -636,7 +613,6 @@ class Simulator:
                 self.short_requests_num += short_
                 self.medium_requests_num += wait_info.shape[0]-long_-short_
                 self.total_request_num += wait_info.shape[0]
-
 
         return
 
@@ -806,16 +782,6 @@ class Simulator:
         loc_pickup = self.driver_table['status'] == 2
         loc_reposition = self.driver_table['status'] == 4
         loc_road_node_transfer = self.driver_table['remaining_time_for_current_node'].values - self.delta_t <= 0
-
-        # for order_id, remaining_time in self.driver_table.loc[
-        #     loc_finished & loc_pickup, ['matched_order_id', 'remaining_time']].values.tolist():
-        #     self.requests.loc[self.requests['order_id'] == order_id, 'pickup_end_time'] = self.time + remaining_time + \
-        #                                                                                   env_params['delta_t']
-        #
-        # for order_id, remaining_time in self.driver_table.loc[
-        #     loc_finished & loc_delivery, ['matched_order_id', 'remaining_time']].values.tolist():
-        #     self.requests.loc[self.requests['order_id'] == order_id, 'delivery_end_time'] = self.time + remaining_time + \
-        #                                                                                     env_params['delta_t']
 
         # for unfinished tasks
         self.driver_table.loc[loc_cruise, 'total_idle_time'] += self.delta_t
@@ -1006,7 +972,7 @@ class Simulator:
 
         # 在这里对完成匹配的数据进行聚合分析
         if len(df_new_matched_requests) > 0:
-            self.evaluate_df = calculate_evaluate_table(wait_requests, df_new_matched_requests)
+            self.evaluate_df = calculate_evaluate_table(self.grid_num,wait_requests, df_new_matched_requests)
             self.evaluate_table[self.current_step] = self.evaluate_df.values
         else:
             # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
@@ -1043,7 +1009,7 @@ class Simulator:
 
     def rl_step_test_dynamic(self):  # rl for matching
 
-        if self.time % self.AGENT_DECISION_FREQUENCY == 0:
+        if self.time % (self.decision_freq * 60) == 0:
 
             matching_state_current = self.get_global_state()
             self.state_at_decision_time = matching_state_current
@@ -1080,12 +1046,16 @@ class Simulator:
 
         # 在这里对完成匹配的数据进行聚合分析
         if len(df_new_matched_requests) > 0:
-            self.evaluate_df = calculate_evaluate_table(wait_requests, df_new_matched_requests)
+            self.evaluate_df = calculate_evaluate_table(self.grid_num,wait_requests, df_new_matched_requests)
             self.evaluate_table[self.current_step] = self.evaluate_df.values
         else:
             # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
             self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
 
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 2].shape[0]
+        self.occupancy_rate = self.cumulative_on_trip_driver_num / (
+                (1 + self.current_step) * self.driver_table.shape[0])
         # TJ
         if self.end_of_episode == 0:
             self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0)
@@ -1109,23 +1079,6 @@ class Simulator:
         # Step 7: update time
         self.update_time()
 
-    # Add changes for matching module: Andrew
-    def get_matching_state(self):
-        """
-        Get the current state for the matching process.
-        :return: A dictionary containing the state information.
-        """
-        # Extract required information
-        state = {
-            'wait_requests': deepcopy(self.wait_requests),
-            'driver_table': deepcopy(self.driver_table),
-            'time': self.time,
-            'current_step': self.current_step,
-            'dispatch_method': self.dispatch_method,
-            'method': self.method,
-            'maximal_pickup_distance': self.maximal_pickup_distance,
-        }
-        return state
 
     def get_matching_reward(self, df_new_matched_requests):
         """
@@ -1182,67 +1135,20 @@ class Simulator:
 
     # rl_step for training: Andrew
     def rl_step_train(self):  # rl for matching
-        """
-        RL step for matching module in the simulator.
-        :param matching_agent: Instance of MatchingAgent or similar RL agent.
-        :param epsilon: Exploration rate for the matching agent.
-        :return: Transitions for the RL agent to update.
-        """
 
         self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]), np.array([]).reshape([0, 2]),
                                             np.array([]).astype(float)]  # rl for matching
 
-        # MATCHING:GET STATE
-        # Step 1: Retrieve matching state
-        matching_state = self.get_matching_state()
-
-        # MATCHING:GET ACTION
-        # Step 2: Agent selects an action
-        matched_pair_actual_indexs,matched_itinerary = self.matching_agent.get_action_and_execute(matching_state)
-
-        # MATCHING:EXECUTE ACTION
-        # Step 3: Execute the matching action：get matched_itinerary
-        # matched_itinerary = self.execute_matching_action(matching_action)
-
-        # MATCHING:ENVIRONMENT UPDATE(GET REWARD;PRICING)
-        # Step 4: driver/passenger reaction after dispatching\
-        # matched_pair_actual_indexs = matching_action['matched_pair_actual_indexs']
+        matched_pair_actual_indexs,matched_itinerary = self.get_action_and_execute()
         self.update_environment_after_matching(matched_pair_actual_indexs, matched_itinerary)
-
-        # TODO: Step 5: pricing module (该模块目前融合在matching模块的bootstrap_new_order函数中)
-        # pricing_state = self.get_pricing_state()
-        # pricing_action = self.pricing_agent.get_action(pricing_state)
-        # self.exectue_pricing_action(pricing_action)
-
-        # Step 6.1: both-rg-cruising and/or repositioning decision
-        # if self.time % (15*60) == 0:
-        #     self.cruise_and_reposition()  # self.dispatch_transitions_buffer updated here
-
-        # Step 6.2: track recording
-        if self.track_recording_flag:
-            self.real_time_track_recording()
-
-            # Step 7: update next state for drivers
-        self.update_state()  # occupancy rate calculated here(maybe wrong)
-
-        # Step 8： online/offline update()
+        self.update_state()
         self.driver_online_offline_update()
-
-        # Step 9: update time
         self.update_time()
 
-        # 返回值：状态-动作-奖励-下一状态转移信息
+        if self.dispatch_transitions_buffer[0].shape[0]>0:
+            self.matching_agent.perceive(self.dispatch_transitions_buffer)  # Andrew
 
-        # MATCHING:AGENT UPDATE
-        # step 10: update matching agent
-        step_loss = None
-        if self.matching_agent is not None:
-            if self.dispatch_transitions_buffer[0].shape[0]>0:
-                step_loss = self.matching_agent.update(self.dispatch_transitions_buffer)  # Andrew
-        return step_loss
 
-    def calculate_current_time_slice(self):
-        return int((self.time - self.t_initial) /  self.AGENT_DECISION_FREQUENCY) # 后期把这个参数改为可以调整的
 
     # hong-yang step train for dynamic matching method selection
     def rl_step_train_matching_method(self):  # rl for matching method selection
@@ -1257,9 +1163,8 @@ class Simulator:
         2. 仿真执行步 (其他 step):      使用已持有的动作执行1分钟仿真, 并累积奖励。
         """
 
-        # --- 1. Agent 决策与数据存储 (每 15 分钟执行一次) ---
-        # self.time为仿真的时间； AGENT_DECISION_FREQUENCY为rl的决策间隔
-        if self.time % self.AGENT_DECISION_FREQUENCY == 0:
+        # --- 1. Agent 决策与数据存储 ---
+        if self.time % (self.decision_freq * 60) == 0:
 
             # --- A. 存储上一个 15 分钟的 (S_k, A_k, R_sum, S_k+1) ---
             # (跳过第一次, 因为那时还没有 S_k)
@@ -1353,6 +1258,24 @@ class Simulator:
         self.driver_online_offline_update()
         # Step 7: update time
         self.update_time()
+
+
+    def get_action_and_execute(self):
+
+        wait_requests = deepcopy(self.wait_requests)
+        driver_table = deepcopy(self.driver_table)
+
+        idle_driver_table = driver_table[(driver_table['status'] == 0) | (driver_table['status'] == 4)]
+
+        # If no requests or no idle drivers, return empty actions
+        if wait_requests.shape[0] == 0 or idle_driver_table.shape[0] == 0:
+            # print("No requests or no idle drivers,LD matching is not performed.")
+            return [],[]   # Return an empty list
+
+        matched_pair_actual_indexs,matched_itinerary = order_dispatch(wait_requests, driver_table, self.maximal_pickup_distance, self.dispatch_method, self.method)
+
+        return matched_pair_actual_indexs,matched_itinerary
+
 
     def get_global_state(self):
 

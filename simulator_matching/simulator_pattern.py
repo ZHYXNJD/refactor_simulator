@@ -11,14 +11,12 @@ input information:
 
 ** All the inputs are obtained from env, thus we do not need to alter parameters here
 """
-from config import *
-from path import *
 import pickle
 import os
 
 class SimulatorPattern(object):
     def __init__(self,date):
-        self.request_file_name = f"my_data/cleaned_orders_pickle/orders_grid{env_params['grid_num']}_{date}.pkl"
+        self.request_file_name = f"simulator_matching/my_data/cleaned_orders_pickle/orders_grid{env_params['grid_num']}_{date}.pkl"
         self.driver_file_name = os.path.join(data_path, f"drivers_grid{env_params['grid_num']}_1000.pickle")
         with open(self.request_file_name, 'rb') as f:
             print(f"load request file: {self.request_file_name}")

@@ -2,8 +2,8 @@
 <project version="4">
   <component name="WebServers">
     <option name="servers">
-      <webServer id="f76beff7-640b-4dc3-9213-950ce3d9da0f" name="189">
-        <fileTransfer accessType="SFTP" host="root@qdai.scnet.cn" port="50189" sshConfigId="b684b2ea-8aca-404d-a158-40c21f210328" sshConfig="root@root@qdai.scnet.cn:50189 password">
+      <webServer id="3c9fb768-4c0a-49d3-97af-9e02cda72edd" name="hy">
+        <fileTransfer accessType="SFTP" sshConfigId="f0792169-fb78-4d48-8c6a-7733fd0326af" sshConfig="root@root@connect.nmb1.seetacloud.com:35786 password">
           <advancedOptions>
             <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
           </advancedOptions>
