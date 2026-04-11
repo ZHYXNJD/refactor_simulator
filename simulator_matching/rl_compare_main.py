@@ -1,10 +1,10 @@
 import os
 import time
-os.environ["OMP_NUM_THREADS"] = "15"
-os.environ["MKL_NUM_THREADS"] = "15"
-os.environ["OPENBLAS_NUM_THREADS"] = "15"
-os.environ["VECLIB_MAXIMUM_THREADS"] = "15"
-os.environ["NUMEXPR_NUM_THREADS"] = "15"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
 import multiprocessing as mp
 import pickle
@@ -65,9 +65,11 @@ matching_agent.load_parameters(matching_agent_params['load_path'])
 
 # agent参数
 M = 35  # grid 数量
-state_dim = M * 3 + 2
-obs_dim_per_agent = state_dim + M  # 加上 grid ID one-hot
-obs_dims = [obs_dim_per_agent for _ in range(M)]
+total_state_dim = M * 3 + 2
+local_feature_len = int((total_state_dim - 2) // M)
+per_agent_local_input = local_feature_len + 2
+per_agent_actor_input = total_state_dim + M  # 加上 grid ID one-hot
+obs_dims = [per_agent_actor_input for _ in range(M)]
 n_actions = [3 for _ in range(M)]
 
 
@@ -90,14 +92,21 @@ def run_simulation_and_train(config,worker_id):
 
     # ... 定义网络，开始训练 ...
 
+    # choose obs_dims compatible with the selected algorithm
+    agent_type = config.get('agent_type', 'MADDPG')
+    if agent_type == 'IDQN':
+        used_obs_dims = [per_agent_local_input for _ in range(M)]
+    else:
+        used_obs_dims = [per_agent_actor_input for _ in range(M)]
+
     if config['agent_type'] == 'MADDPG':
-        dynamic_matching_agent = MADDPG(obs_dims=obs_dims, n_actions=n_actions, driver_num=DRIVER_NUM,
+        dynamic_matching_agent = MADDPG(obs_dims=used_obs_dims, n_actions=n_actions, driver_num=DRIVER_NUM,
                                   transitions=TRANSITIONS, state_scaler=STATE_SCALER, **config)
     elif config['agent_type'] == 'IDQN':
-        dynamic_matching_agent = IDQN(obs_dims=obs_dims, n_actions=n_actions, driver_num=DRIVER_NUM,
+        dynamic_matching_agent = IDQN(obs_dims=used_obs_dims, n_actions=n_actions, driver_num=DRIVER_NUM,
                                 transitions=TRANSITIONS, state_scaler=STATE_SCALER, **config)
     elif config['agent_type'] == 'MAPPO':
-        dynamic_matching_agent = MAPPO(obs_dims=obs_dims, n_actions=n_actions, driver_num=DRIVER_NUM,
+        dynamic_matching_agent = MAPPO(obs_dims=used_obs_dims, n_actions=n_actions, driver_num=DRIVER_NUM,
                                  transitions=TRANSITIONS, state_scaler=STATE_SCALER, **config)
     simulator = Simulator(**env_params, matching_agent=matching_agent,dynamic_matching_agent=dynamic_matching_agent)
     # Initialize SimulatorTrainer
