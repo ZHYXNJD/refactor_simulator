@@ -1,0 +1,1924 @@
+"""
+网约车仿真器环境 (Simulator Environment)
+
+用于模拟网约车系统的核心环境，包含订单生成、司机调度、司乘匹配等功能。
+支持三种训练模式:
+- 'reposition': 车辆调度优化 (repositioning)
+- 'matching': 订单匹配优化
+- 'dynamic_matching': 动态匹配方法选择
+
+主要类:
+- Simulator: 核心仿真环境
+
+Author: 项目团队
+"""
+
+from collections import defaultdict
+from copy import deepcopy
+import numpy as np
+import pandas as pd
+import os
+import torch
+from dynamic_matching.dynamic_matching_agent.maddpd_discreate import *
+from src.repos.repo_util import get_centroid_coordinates, get_three_hop_neighbors
+from src.env.simulator_pattern import SimulatorPattern
+from src.agents.value_estimator import ValueNetwork
+from src.utils.utilities import *
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+
+# =============================================================================
+# Simulator 类
+# =============================================================================
+# 核心仿真环境类，提供统一的 RL 环境接口
+#
+# 使用方式:
+#   1. Repo 训练: 创建 Simulator(rl_mode='reposition', matching_agent=SarsaAgent)
+#   2. Matching 训练: 创建 Simulator(rl_mode='matching', matching_agent=agent)
+#   3. Dynamic Matching: 创建 Simulator(rl_mode='dynamic_matching', dynamic_matching_agent=MADDPG)
+#
+# 关键方法:
+#   - reset(): 初始化环境
+#   - rl_step_train(): 执行一步训练 (repo/matching 模式)
+#   - rl_step_train_matching_method(): 执行一步训练 (dynamic matching 模式)
+#   - get_global_state(): 获取全局状态 (用于 dynamic matching)
+# =============================================================================
+
+class Simulator:
+    # =========================================================================
+    # 初始化 (Initialization)
+    # =========================================================================
+    def __init__(self, matching_agent, reposition_agent=None, dynamic_matching_agent=None,
+                 dynamic_reposition_agent=None, mapping_dict=None, road_network=None, **kwargs):
+        """
+        初始化仿真环境
+
+        Args:
+            matching_agent: 匹配 Agent (用于价值估计，通常是 SarsaAgent)
+            reposition_agent: 重定位 Agent (预留)
+            dynamic_matching_agent: 动态匹配 Agent (MADDPG/IDQN)
+            dynamic_reposition_agent: 动态重定位 Agent (预留)
+            mapping_dict: 网格映射字典
+            road_network: 路网数据
+            **kwargs: 其他配置参数
+                - grid_num: 网格数量 (默认 35)
+                - decision_freq: 决策频率，单位分钟 (默认 10)
+                - rl_mode: RL 模式，可选 'reposition', 'matching', 'dynamic_matching'
+                - experiment_mode: 实验模式
+                - repo_mode: 重定位策略，可选 'random_repo', 'demand_greedy', 'rl_value'
+                - driver_num: 司机数量 (默认 1000)
+                - order_sample_ratio: 订单采样比例
+                - driver_sample_ratio: 司机采样比例
+        """
+
+        # basic parameters: time & sample
+        self.price_per_km = 5
+        self.seed = None
+        self.seed_list = [0, 42, 3407, 1024, 215]
+        self.t_initial = 18000
+        self.t_end = 36000
+        self.delta_t = 60
+        self.vehicle_speed = 22.788
+        self.repo_speed = 22.788
+        self.time = None
+        self.current_step = None
+        self.rl_mode = kwargs.get('rl_mode', 'dynamic_matching')
+
+        # Andrew :RL agents(RL module)
+        self.matching_agent = matching_agent
+        self.reposition_agent = reposition_agent
+        # self.pricing_agent = pricing_agent
+
+        # register dynamic matching agent
+        self.dynamic_matching_agent = dynamic_matching_agent
+        self.dynamic_reposition_agent = dynamic_reposition_agent
+
+        self.mapping_dict = mapping_dict
+
+        self.requests = None
+        self.record = ""
+
+        # order generation
+        self.order_sample_ratio = kwargs.get('order_sample_ratio', 1)
+        self.order_generation_mode = 'sample_from_base'
+        self.request_interval = 60
+
+        # wait cancel
+        self.maximum_wait_time_mean = 300
+        self.maximum_wait_time_std = 0
+
+        # driver cancel after matching based on maximal pickup distance
+        self.maximal_pickup_distance = 1.25
+
+        #
+        self.maximum_pickup_time_passenger_can_tolerate_mean = float('inf')
+        self.maximum_pickup_time_passenger_can_tolerate_std = 0
+        self.maximum_price_passenger_can_tolerate_mean = float('inf')
+        self.maximum_price_passenger_can_tolerate_std = 0
+
+        # track recording
+        self.track_recording_flag = False
+        self.new_tracks = {}
+        self.match_and_cancel_track = {}
+        self.passenger_track = {}
+
+        self.experiment_date = None
+
+        self.grid_num = kwargs.get('grid_num', 35)
+        self.decision_freq = kwargs.get('decision_freq', 10)  # 单位：min
+        self.experiment_mode = kwargs.get('experiment_mode', 'train_dynamic_matching')
+        self.pickup_mode = kwargs.get('pickup_mode', 'ma')
+        self.method = kwargs.get('method', 'd')
+        # dispatch method
+        self.dispatch_method = 'LD'
+
+        self.RN = RoadNetwork(self.grid_num)
+        self.RN.load_data(result=road_network)
+        self.zone_id_array = np.array([i for i in range(self.grid_num)])
+
+        # cruise and reposition related parameters
+        self.cruise_flag = False
+        self.cruise_mode = 'global-random'
+        self.max_idle_time = 600  # 10 min
+
+        if self.rl_mode == 'reposition':
+            self.reposition_flag = True
+            self.repo_mode = kwargs.get('repo_mode',
+                                        'random_repo')  # random_repo / demand_greedy / ratio_greedy / rl_value
+            self.eligible_time_for_reposition = 300
+            self.reposition_method = ''
+            # self.repo2any = self.reposition_agent.repo2any
+            self.df_neighbor_centroid = get_centroid_coordinates()
+            # _, self.df_neighbor_centroid = get_available_directions(grid_num=self.grid_num, repo2any=True)
+            # self.df_neighbor_centroid =self.reposition_agent.df_neighbor_centroid
+            # self.transitions = [[] for i in range(5)]
+
+        self.score_discount_rate = kwargs.get('score_discount_rate', self.matching_agent.discount_rate)
+
+        # V_ope 模型加载 (用于 reposition)
+        self.vope_model = None
+        self.vope_scaler = None
+        self.vope_hidden_dim = 64  # 默认值，会从checkpoint覆盖
+        vope_path = kwargs.get('vope_model_path', None)
+        if vope_path and os.path.exists(vope_path):
+            try:
+                checkpoint = torch.load(vope_path, map_location='cpu', weights_only=False)
+                hidden_dim = checkpoint.get('config', {}).get('hidden_dim', 64)
+                self.vope_hidden_dim = hidden_dim
+                self.vope_model = ValueNetwork(state_dim=6, hidden_dim=hidden_dim)
+                self.vope_model.load_state_dict(checkpoint['model'])
+                self.vope_model.eval()
+                self.vope_scaler = checkpoint['scaler']
+                print(f"V_ope model loaded from {vope_path} (hidden_dim={hidden_dim})")
+            except Exception as e:
+                print(f"Failed to load V_ope model: {e}")
+
+        # get steps
+        self.finish_run_step = int((self.t_end - self.t_initial) // self.delta_t)
+
+        # request tables
+        # driver status:cruising/repositioning, pick-up, delivery, idling (unmatched and not cruising)
+        self.request_columns = ['order_id', 'origin_id', 'origin_lat', 'origin_lng', 'dest_id', 'dest_lat', 'dest_lng',
+                                'trip_distance', 'start_time', 'origin_grid_id', 'dest_grid_id', 'itinerary_node_list',
+                                'itinerary_segment_dis_list', 'trip_time', 'cancel_prob', 't_matched',
+                                'pickup_time', 'wait_time', 't_end', 'status', 'driver_id', 'maximum_wait_time',
+                                'designed_reward',
+                                'pickup_distance']
+
+        self.wait_requests = None
+        self.matched_requests = None
+
+        # driver tables
+        self.driver_columns = ['driver_id', 'start_time', 'end_time', 'lng', 'lat', 'grid_id', 'status',
+                               'target_loc_lng', 'target_loc_lat', 'target_grid_id', 'remaining_time',
+                               'matched_order_id', 'total_idle_time', 'time_to_last_cruising',
+                               'current_road_node_index',
+                               'remaining_time_for_current_node', 'itinerary_node_list', 'itinerary_segment_dis_list']
+        self.driver_table = None
+        self.driver_sample_ratio = kwargs.get('driver_sample_ratio', 1)
+        self.driver_num = kwargs.get('driver_num', 1000)
+
+        self.total_reward = 0
+
+        # 创建一个私有的随机生成器实例，初始为 None
+        self.rng = None
+
+        self.penalty_alpha = kwargs.get('penalty_alpha', 0.001)
+
+        # pattern = SimulatorPattern(self.experiment_date)
+        # self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
+        # self.driver_info = pattern.driver_info.sample(n=1000, replace=False, random_state=42)
+
+    # =========================================================================
+    # 基础表初始化 (Base Table Initialization) - [共用]
+    # =========================================================================
+    def initial_base_tables(self, given_data=False, request_databases=None, driver_info=None):
+        """
+        初始化 driver table 和 order table
+
+        Args:
+            given_data: 是否使用外部传入的数据 (默认 False)
+            request_databases: 外部传入的请求数据库 (字典，key 为时间戳)
+            driver_info: 外部传入的司机信息 DataFrame
+
+        Returns:
+            None
+
+        Note:
+            - 若 given_data=True，从 request_databases 和 driver_info 加载数据
+            - 若 given_data=False，从 SimulatorPattern 加载历史数据
+            - 根据 rl_mode 初始化不同的数据结构
+        """
+        if not given_data:
+            # pass
+            pattern = SimulatorPattern(self.experiment_date)
+            self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
+            # self.driver_info = pattern.driver_info.sample(n=1000, replace=False, random_state=42)
+            self.driver_info = pattern.driver_info
+        else:
+            self.request_databases = request_databases
+            # self.driver_info = driver_info.sample(n=self.driver_num,replace=False, random_state=42)
+            self.driver_info = driver_info
+
+        self.time = deepcopy(self.t_initial)
+        self.current_step = int((self.time - self.t_initial) // self.delta_t)
+        self.grid_value = {}
+        # construct driver table
+        self.driver_table = sample_all_drivers(self.driver_info, self.t_initial, self.t_end, self.driver_sample_ratio)
+        self.driver_table['target_grid_id'] = self.driver_table['target_grid_id'].values.astype(int)
+
+        if self.rl_mode == 'matching':
+            self.end_of_episode = 0  # rl for matching
+            self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]),
+                                                np.array([]).reshape([0, 2]),
+                                                np.array([]).astype(float)]  # rl for matching
+        if self.rl_mode == 'reposition':
+            # rl for repositioning
+            # drivers that are repositioning
+            self.state_grid_array = np.array([])
+            self.state_time_array = np.array([])
+            self.action_array = np.array([])
+            self.next_state_grid_array = np.array([])
+            self.next_state_time_array = np.array([])
+            if self.reposition_method == 'A2C' or self.reposition_method == 'A2C_global_aware':
+                self.global_time = []
+                self.global_drivers_num = []
+                self.global_orders_num = []
+            self.con_long_idle = None
+
+            # finished transitions
+            self.state_grid_array_done = np.array([])
+            self.state_time_array_done = np.array([])
+            self.action_array_done = np.array([])
+            self.next_state_grid_array_done = np.array([])
+            self.next_state_time_array_done = np.array([])
+            self.reward_array_done = np.array([])
+            self.done_array = np.array([])
+
+            # average revenue in each grid
+            self.avg_revenue_by_grid = np.zeros(self.grid_num)
+
+            self.pending_transitions = None
+
+        self.end_of_episode = 0
+
+        self.wait_requests = pd.DataFrame(columns=self.request_columns)
+        self.matched_requests = pd.DataFrame(columns=self.request_columns)
+        # TJ
+        self.total_reward = 0
+        self.cumulative_on_trip_driver_num = 0
+        self.cumulative_on_reposition_driver_num = 0
+        self.occupancy_rate = 0
+        self.occupancy_rate_repo = 0
+        self.total_service_time = 0
+        self.occupancy_rate_no_pickup = 0
+        self.total_online_time = self.driver_table.shape[0] * (self.t_end - self.t_initial)
+        self.waiting_time = 0
+        self.pickup_time = 0
+
+        # self.matched_transferred_requests_num = 0
+        self.matched_long_requests_num = 0
+        self.matched_medium_requests_num = 0
+        self.matched_short_requests_num = 0
+        self.matched_requests_num = 0.0000001
+
+        self.transfer_request_num = 0
+        self.long_requests_num = 0.0000001
+        self.medium_requests_num = 0.0000001
+        self.short_requests_num = 0.0000001
+        self.total_request_num = 0.0000001
+        self.total = 0
+
+        # 添加一个维度为 时间步*区域数量*评估指标 的表
+        # 然后每一步进行更新
+        # 每次先更新df 再更新table
+        evaluate_indicator = ['origin_grid_id',
+                              'total_request_num', 'long_request_num', 'medium_request_num', 'short_request_num',
+                              'total_reward', 'matched_request_num',
+                              'matched_long_request_num', 'matched_medium_request_num', 'matched_short_request_num',
+                              'waiting_time', 'pickup_time', 'matched_long_request_ratio',
+                              'matched_medium_request_ratio',
+                              'matched_short_request_ratio', 'matched_request_ratio']
+        self.evaluate_df = pd.DataFrame(data=np.zeros((self.grid_num, len(evaluate_indicator))),
+                                        columns=evaluate_indicator)
+        self.evaluate_table = np.zeros((self.finish_run_step, self.grid_num, len(evaluate_indicator)))
+        self.total_reward_by_grid = pd.Series(data=np.zeros((self.grid_num)))
+
+        self.state_at_decision_time = None
+        self.reward_accumulator = []  # reward by grid
+        self.reward_by_grid_df = pd.Series(data=np.zeros((self.grid_num)))
+        # 初始化为instant method
+        # 0 instant | 1 pickup distance | 2 RL
+        self.held_action_tuple = ([0] * int(self.grid_num), [0] * int(self.grid_num))
+
+        # 存储action list
+        self.max_decision_index = int((self.t_end - self.t_initial) / self.delta_t / self.decision_freq)
+        self.current_decision_index = 0
+        self.choose_action = np.zeros((self.grid_num, self.max_decision_index))
+
+        # heuristic strategy
+        self.strategy_vector = None
+
+        # 跨区订单统计
+        self.cross_grid_count = 0
+
+        self.temp_total_request_record = pd.DataFrame(columns=self.request_columns)
+
+    # =========================================================================
+    # 环境重置 (Environment Reset) - [共用]
+    # =========================================================================
+    def reset(self, seed, given_data=False, request_databases=None, driver_info=None):
+        """
+        重置环境到初始状态
+
+        Args:
+            seed: 随机种子
+            given_data: 是否使用外部传入的数据
+            request_databases: 请求数据库
+            driver_info: 司机信息
+
+        Returns:
+            None
+        """
+        if seed is not None:
+            self.rng = np.random.RandomState(seed)
+            self.seed = seed
+        self.initial_base_tables(given_data, request_databases, driver_info)
+
+    # =========================================================================
+    # 匹配后信息更新 (Matching Update) - [Matching/Dynamic Matching]
+    # =========================================================================
+    def update_info_after_matching_multi_process(self, matched_pair_actual_indexes, matched_itinerary):
+        """
+        This function used to update driver table and wait requests after matching
+        :param matched_pair_actual_indexes: matched pair including driver id and order id
+        :param matched_itinerary: including driver pick up route info
+        :return: matched requests and wait requests
+        """
+
+        # if self.rl_mode == 'reposition' and len(self.wait_requests) > 0:
+        #     # record number of idle drivers
+        #     # rl for repositioning
+        #     """
+        #     计算每个 grid 的单位司机收益（更现代写法）
+        #     """
+        #
+        #     # === 1. 统计 idle + reposition 司机 ===
+        #     idle_mask = self.driver_table['status'].isin([0, 4])
+        #     idle_counts = (
+        #         self.driver_table.loc[idle_mask]
+        #         .groupby('grid_id')
+        #         .size()
+        #         .reindex(self.zone_id_array, fill_value=0)
+        #         .values
+        #     )  # shape: (G,)
+        #
+        #     # === 2. 统计订单总收益 ===
+        #     revenue_sum = (
+        #         self.wait_requests
+        #         .groupby('origin_grid_id')['designed_reward']
+        #         .sum()
+        #         .reindex(self.zone_id_array, fill_value=0)
+        #         .values
+        #     )  # shape: (G,)
+        #
+        #     # === 3. 防止除零（更合理）===
+        #     epsilon = 1e-6
+        #     avg_revenue_by_grid = revenue_sum / (idle_counts + epsilon)
+        #
+        #     self.avg_revenue_by_grid = avg_revenue_by_grid
+
+        new_matched_requests = pd.DataFrame([], columns=self.request_columns)
+        update_wait_requests = pd.DataFrame([], columns=self.request_columns)
+        matched_pair_index_df = pd.DataFrame(matched_pair_actual_indexes,
+                                             columns=['order_id', 'driver_id', 'weight', 'pickup_distance'])
+        # matched_pair_index_df = matched_pair_index_df.drop(columns=['flag'])
+        matched_itinerary_df = pd.DataFrame(
+            columns=['itinerary_node_list', 'itinerary_segment_dis_list', 'pickup_distance'])
+        if len(matched_itinerary) > 0:
+            matched_itinerary_df['itinerary_node_list'] = matched_itinerary[0]
+            matched_itinerary_df['itinerary_segment_dis_list'] = matched_itinerary[1]
+            matched_itinerary_df['pickup_distance'] = matched_itinerary[2]
+
+        matched_order_id_list = matched_pair_index_df['order_id'].values.tolist()
+        # print("matched_order_id_list",matched_order_id_list) # DEBUG: 为空!!!
+        con_matched = self.wait_requests['order_id'].isin(matched_order_id_list)
+        con_keep_wait = self.wait_requests['wait_time'] <= self.wait_requests['maximum_wait_time']
+
+        # price and pickup time info which used to judge whether cancel the order-driver pair
+        matched_itinerary_df['pickup_time'] = matched_itinerary_df['pickup_distance'].values / self.vehicle_speed * 3600
+
+        # extract the order is matched
+        df_matched = self.wait_requests[con_matched].reset_index(drop=True)
+        if df_matched.shape[0] > 0:
+            # print("matched_requests_num", df_matched.shape[0])
+            idle_driver_table = self.driver_table[
+                (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)]
+            # 匹配上的订单order_id列表
+            order_array = df_matched['order_id'].values
+            cor_order = []
+            cor_driver = []
+            for i in range(len(matched_pair_index_df)):
+                # order的索引
+                cor_order.append(np.argwhere(order_array == matched_pair_index_df['order_id'][i])[0][0])
+                # driver的索引
+                cor_driver.append(
+                    idle_driver_table[idle_driver_table['driver_id'] == matched_pair_index_df['driver_id'][i]].index[0])
+            cor_driver = np.array(cor_driver)
+            df_matched = df_matched.iloc[cor_order, :]
+            # driver decide whether cancelled（司机匹配后取消逻辑）
+            # 现在暂时不让其取消。需考虑时可用self.driver_cancel_prob_array来计算
+            driver_cancel_prob = np.zeros(len(matched_pair_index_df))
+            # np.random.seed(42)
+            prob_array = np.random.rand(len(driver_cancel_prob))
+            con_driver_remain = prob_array >= driver_cancel_prob
+
+            # price and pickup time moudle which used to judge whether cancel the order-driver pair
+            # matched_itinerary_df['pickup_time'].values
+            # con_passenge_keep_wait = df_matched['maximum_pickup_time_passenger_can_tolerate'].values > \
+            #                          matched_itinerary_df['pickup_time'].values
+            # con_passenger_remain = con_passenge_keep_wait
+
+            # ✅ 模拟乘客取消（基于定价和接驾距离）
+            designed_price_array = df_matched['designed_reward'].values
+            pickup_dis_array = matched_itinerary_df['pickup_distance'].values
+            designed_price_array = np.array(designed_price_array, dtype=float)
+            pickup_dis_array = np.array(pickup_dis_array, dtype=float)
+
+            cancel_prob_array = 0.05 + 0.005 * (designed_price_array - 2.5) + 0.05 * pickup_dis_array
+            cancel_prob_array = np.clip(cancel_prob_array, 0, 0.9)
+            # print(cancel_prob_array)
+            threshold = 0.9  # ✅ 越高，保留的订单越多
+            con_passenger_remain = cancel_prob_array < threshold
+
+            con_remain = con_driver_remain & con_passenger_remain
+            # order after cancelled
+            update_wait_requests = df_matched[~con_remain]
+
+            # driver after cancelled
+            # 若匹配上后又被取消，目前假定司机按原计划继续cruising or repositioning
+            self.driver_table.loc[cor_driver[~con_remain], ['status', 'remaining_time', 'total_idle_time']] = 0
+
+            # order not cancelled
+            new_matched_requests = df_matched[con_remain]
+            new_matched_requests['t_matched'] = self.time
+            new_matched_requests['pickup_distance'] = matched_itinerary_df[con_remain]['pickup_distance'].values
+            new_matched_requests['pickup_time'] = new_matched_requests[
+                                                      'pickup_distance'].values / self.vehicle_speed * 3600
+            new_matched_requests['t_end'] = self.time + new_matched_requests['pickup_time'].values + \
+                                            new_matched_requests['trip_time'].values
+            # driver_status更新
+            new_matched_requests['status'] = 1
+            new_matched_requests['driver_id'] = matched_pair_index_df[con_remain]['driver_id'].values
+            self.total_service_time += np.sum(new_matched_requests['trip_time'].values)
+            extra_time = new_matched_requests['t_end'].values - self.t_end
+            extra_time[extra_time < 0] = 0
+            self.total_service_time -= np.sum(extra_time)
+            self.occupancy_rate_no_pickup = self.total_service_time / self.total_online_time
+
+            # driver not cancelled
+            for grid_start in new_matched_requests['origin_grid_id'].values:
+                if grid_start not in self.grid_value.keys():
+                    self.grid_value[grid_start] = 1
+                else:
+                    self.grid_value[grid_start] += 1
+                # self.grid_value[grid_start] = self.grid_value.get(grid_start, 0) + 1
+
+            # driver_status更新
+            self.driver_table.loc[cor_driver[con_remain], 'status'] = 2
+            self.driver_table.loc[cor_driver[con_remain], 'target_loc_lng'] = new_matched_requests['dest_lng'].values
+            self.driver_table.loc[cor_driver[con_remain], 'target_loc_lat'] = new_matched_requests['dest_lat'].values
+            self.driver_table.loc[cor_driver[con_remain], 'target_grid_id'] = new_matched_requests[
+                'dest_grid_id'].values
+            self.driver_table.loc[cor_driver[con_remain], 'remaining_time'] = new_matched_requests['pickup_time'].values
+            self.driver_table.loc[cor_driver[con_remain], 'matched_order_id'] = new_matched_requests['order_id'].values
+            self.driver_table.loc[cor_driver[con_remain], 'total_idle_time'] = 0
+            self.driver_table.loc[cor_driver[con_remain], 'time_to_last_cruising'] = 0
+            self.driver_table.loc[cor_driver[con_remain], 'current_road_node_index'] = 0
+
+            # self.driver_table.loc[cor_driver[con_remain], 'itinerary_node_list'] = \
+            # (matched_itinerary_df[con_remain]['itinerary_node_list'] + new_matched_requests['itinerary_node_list']).apply(list).values
+
+            self.driver_table.loc[cor_driver[con_remain], 'itinerary_node_list'] = \
+                (matched_itinerary_df[con_remain]['itinerary_node_list'] + new_matched_requests[
+                    'itinerary_node_list']).values
+            self.driver_table.loc[cor_driver[con_remain], 'itinerary_segment_dis_list'] = \
+                (matched_itinerary_df[con_remain]['itinerary_segment_dis_list'] + new_matched_requests[
+                    'itinerary_segment_dis_list']).values
+            self.driver_table.loc[cor_driver[con_remain], 'remaining_time_for_current_node'] = \
+                matched_itinerary_df[con_remain]['itinerary_segment_dis_list'].map(
+                    lambda x: x[0]).values / self.vehicle_speed * 3600
+
+            if self.repo_mode in ['rl_value_greedy','rl_value_logit']:
+                if self.rl_mode in ['matching', 'reposition'] and self.experiment_mode == 'train':
+
+                    state_array = np.vstack([self.time + np.zeros(new_matched_requests.shape[0]),
+                                             self.driver_table.loc[cor_driver[con_remain], 'grid_id'].values]).T
+                    action_array = np.ones(new_matched_requests.shape[0])
+                    next_state_array = np.vstack([new_matched_requests['t_end'].values,
+                                                  new_matched_requests['dest_grid_id'].values]).T
+                    if self.method in ['sarsa_travel_time', 'sarsa_travel_time_no_subway']:
+                        reward_array = 5000. - new_matched_requests['trip_time'].values
+                    elif self.method in ['sarsa_total_travel_time', 'sarsa_total_travel_time_no_subway']:
+                        reward_array = 5151. - new_matched_requests['pickup_time'].values - new_matched_requests[
+                            'trip_time'].values
+                    else:
+                        # reward_array = new_matched_requests['designed_reward'].values / 20
+                        reward_array = new_matched_requests['designed_reward'].values
+
+                        # 空车的惩罚
+                        # idle_drivers = self.driver_table[
+                        #     (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)].copy()
+                        # grid_total_wait = idle_drivers.groupby('grid_id')['total_idle_time'].sum()
+                        # grid_match_counts = new_matched_requests['origin_grid_id'].value_counts()
+                        # grid_unit_penalty = grid_total_wait / grid_match_counts
+                        # matched_grids = new_matched_requests['origin_grid_id'].values
+                        # penalties = pd.Series(matched_grids).map(grid_unit_penalty).fillna(0).values
+                        # # 因为 Penalty 现在包含了 (N_idle / N_match) 的倍数，数值可能会很大。
+                        # penalty_alpha = self.penalty_alpha
+                        # original_rewards = new_matched_requests['designed_reward'].values
+                        # final_rewards = original_rewards - (penalty_alpha * penalties)
+                        # print(f"Max original: {np.max(original_rewards):.2f}, Mean original: {np.mean(original_rewards):.2f}")
+                        # print(f"Max Penalty: {np.max(penalty_alpha * penalties):.2f}, Mean Penalty: {np.mean(penalty_alpha * penalties):.2f}")
+                        # print(f"Max final: {np.max(final_rewards):.2f}, Mean final: {np.mean(final_rewards):.2f}")
+
+                    self.dispatch_transitions_buffer[0] = np.concatenate(
+                        [self.dispatch_transitions_buffer[0], state_array])
+                    self.dispatch_transitions_buffer[1] = np.concatenate(
+                        [self.dispatch_transitions_buffer[1], action_array])
+                    self.dispatch_transitions_buffer[2] = np.concatenate(
+                        [self.dispatch_transitions_buffer[2], next_state_array])
+                    # 将已匹配订单的reward_array与buffer连接
+                    self.dispatch_transitions_buffer[3] = np.concatenate(
+                        [self.dispatch_transitions_buffer[3], reward_array])
+                    # 更新 Buffer
+                    # self.dispatch_transitions_buffer[3] = np.concatenate(
+                    #     [self.dispatch_transitions_buffer[3], final_rewards]
+                    # )
+
+            # for j, index in enumerate(cor_driver[con_remain]):
+            #     driver_grid = self.driver_table.loc[index, 'grid_id']
+            #     order_id = self.driver_table.loc[index, 'matched_order_id']
+            #     origin_id = new_matched_requests.loc[new_matched_requests['order_id'] == order_id, 'origin_grid_id'].values[0]
+            #     if driver_grid != origin_id:
+            #         self.cross_grid_count += 1
+
+            if self.track_recording_flag:
+                for j, index in enumerate(cor_driver[con_remain]):
+                    driver_id = self.driver_table.loc[index, 'driver_id']
+                    node_id_list = self.driver_table.loc[index, 'itinerary_node_list']
+                    lng_array, lat_array, grid_id_array = self.RN.get_information_for_nodes(node_id_list)
+                    time_array = np.cumsum(
+                        self.driver_table.loc[index, 'itinerary_segment_dis_list']) / self.vehicle_speed * 3600
+                    time_array = np.concatenate([np.array([self.time]), self.time + time_array])
+                    delivery_time = len(new_matched_requests['itinerary_node_list'].values.tolist()[j])
+                    pickup_time = len(time_array) - delivery_time
+                    task_type_array = np.concatenate([2 + np.zeros(pickup_time), 1 + np.zeros(delivery_time)])
+                    order_id = self.driver_table.loc[index, 'matched_order_id']
+
+                    self.requests.loc[self.requests['order_id'] == order_id, 'matching_time'] = self.time
+
+                    self.new_tracks[driver_id] = np.vstack(
+                        [lat_array, lng_array, np.array([order_id] * len(lat_array)), np.array(node_id_list),
+                         grid_id_array, task_type_array,
+                         time_array]).T.tolist()
+
+                self.match_and_cancel_track[self.time] = [len(df_matched), len(new_matched_requests)]
+
+        update_wait_requests = pd.concat([update_wait_requests, self.wait_requests[~con_matched & con_keep_wait]],
+                                         axis=0)
+        self.waiting_time += np.sum(new_matched_requests['wait_time'].values)
+        self.pickup_time += np.sum(new_matched_requests['pickup_time'].values)
+
+        long_added = new_matched_requests[new_matched_requests['trip_time'] >= 600].shape[0]
+        short_added = new_matched_requests[new_matched_requests['trip_time'] <= 300].shape[0]
+        self.matched_long_requests_num += long_added
+        self.matched_short_requests_num += short_added
+        self.matched_medium_requests_num += (new_matched_requests.shape[0] - long_added - short_added)
+
+        return new_matched_requests, update_wait_requests
+
+    # =========================================================================
+    # 订单生成 (Order Generation) - [共用]
+    # =========================================================================
+    def step_bootstrap_new_orders(self, score_agent=None):
+        """
+        根据当前时间从历史订单数据库中采样生成新订单
+
+        Args:
+            score_agent: 计分 Agent (用于计算订单价值，可选)
+
+        Returns:
+            None (直接更新 self.wait_requests)
+        """
+        if self.order_generation_mode == 'sample_from_base':
+            # directly sample orders from the historical order database
+            temp_request = []
+            # TJ 当更换为按照日期训练时 进行调整
+            min_time = max(self.t_initial, self.time - self.request_interval)
+            for time in range(min_time, self.time):
+                temp_request.extend(self.request_databases[time])
+            if temp_request == []:
+                return
+            database_size = len(temp_request)
+            # sample a portion of historical orders
+            num_request = int(np.rint(self.order_sample_ratio * database_size))
+            if num_request < database_size:
+                sampled_request_index = self.rng.choice(database_size, num_request, replace=False).tolist()
+                sampled_requests = [temp_request[index] for index in sampled_request_index]
+            else:
+                sampled_requests = temp_request
+            weight_array = np.ones(len(sampled_requests))  # rl for matching
+            column_name = ['order_id', 'origin_id', 'origin_lat', 'origin_lng', 'dest_id', 'dest_lat', 'dest_lng',
+                           'trip_distance', 'start_time', 'origin_grid_id', 'dest_grid_id', 'itinerary_node_list',
+                           'itinerary_segment_dis_list', 'trip_time', 'designed_reward', 'cancel_prob']
+            if len(sampled_requests) > 0:
+                wait_info = pd.DataFrame(sampled_requests, columns=column_name)
+                wait_info['itinerary_node_list'] = [req[11] for req in sampled_requests]
+                wait_info['itinerary_segment_dis_list'] = [req[12] for req in sampled_requests]
+                wait_info['start_time'] = self.time
+                wait_info['trip_distance'] = [req[7] for req in sampled_requests]
+                wait_info['trip_time'] = wait_info['trip_distance'] / self.vehicle_speed * 3600
+                wait_info['designed_reward'] = 2.5 + 0.5 * (
+                        (wait_info['trip_distance'] * 1000 - 322).clip(lower=0) / 322)
+
+                if self.grid_num == 8:
+                    wait_info = apply_mapping(wait_info, self.mapping_dict, 'grid_id_8')
+                elif self.grid_num == 63:
+                    wait_info = apply_mapping(wait_info, self.mapping_dict, 'grid_id_63')
+                elif self.grid_num == 263:
+                    wait_info.drop(columns=['origin_grid_id', 'dest_grid_id'], inplace=True)
+                    wait_info = pd.merge(wait_info, self.mapping_dict[self.experiment_date], how='left', on='order_id')
+
+                dynamic_matching_array = np.zeros(len(sampled_requests)) + 0.01
+
+                self.temp_total_request_record = pd.concat([self.temp_total_request_record, wait_info], axis=0,
+                                                           ignore_index=True)
+
+                # Andrew
+                # assign weight array
+                if self.rl_mode == 'matching':
+                    current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq * 60))
+                    num_slices = int(18000 / (self.decision_freq * 60))
+
+                    if self.method in ['instant_reward', 'ir']:
+                        weight_array = wait_info['designed_reward'].values
+
+                    elif self.method in ['pickup_distance', 'd']:
+                        # distance 在LD中进行计算
+                        pass
+
+                    elif self.method in ['sarsa', 'rl']:
+                        for i, (travel_time, reward, dest_grid_id) in enumerate(zip(
+                                wait_info['trip_time'].values.tolist(),
+                                wait_info['designed_reward'].values.tolist(),
+                                wait_info['dest_grid_id'].values.tolist())):
+
+                            end_time_slice = int((
+                                                             self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (
+                                                             self.decision_freq * 60))
+
+                            if end_time_slice >= num_slices:
+                                original_trip_score = reward
+                            else:
+                                next_state = State(end_time_slice, int(dest_grid_id))
+                                # 只用一个qtable small size乘以的缩放系数为0.3
+                                # middle 系数0.5
+                                # 只用一个qtable small size乘以的缩放系数为0.3
+                                # middle size 系数0.5
+                                if self.driver_num == 100:
+                                    scale_coeff = 0.3
+                                elif self.driver_num == 500:
+                                    scale_coeff = 0.5
+                                elif self.driver_num == 1000:
+                                    scale_coeff = 1.0
+                                original_trip_score = reward + scale_coeff * (
+                                        self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
+                                                      score_agent.q_value_table[next_state]
+                            weight_array[i] = original_trip_score
+                            self.transfer_request_num += 1
+
+                    elif self.method == 'static_multi_choice':
+                        for i, (travel_time, reward, origin_grid_id, dest_grid_id) in enumerate(zip(
+                                wait_info['trip_time'].values.tolist(),
+                                wait_info['designed_reward'].values.tolist(),
+                                wait_info['origin_grid_id'].values.tolist(),
+                                wait_info['dest_grid_id'].values.tolist())):
+                            if origin_grid_id in [0, 1, 2]:
+                                weight_array[i] = reward
+                            elif origin_grid_id in [3, 4, 5, 6, 7, 20, 21, 22]:
+                                end_time_slice = int((
+                                                                 self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (
+                                                             self.decision_freq * 60))
+                                if end_time_slice >= num_slices:
+                                    original_trip_score = reward
+                                else:
+                                    next_state = State(end_time_slice, int(dest_grid_id))
+                                    original_trip_score = reward + (
+                                            self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
+                                                          score_agent.q_value_table[next_state]
+                                weight_array[i] = original_trip_score
+                            else:
+                                pass
+
+                elif self.rl_mode in ['dynamic_matching', 'heuristic_matching']:
+
+                    for i, (travel_time, reward, dest_grid_id, origin_grid_id) in enumerate(zip(
+                            wait_info['trip_time'].values.tolist(),
+                            wait_info['designed_reward'].values.tolist(),
+                            wait_info['dest_grid_id'].values.tolist(),
+                            wait_info['origin_grid_id'])):
+                        if self.rl_mode == 'dynamic_matching':
+                            matching_method = self.held_action_tuple[0][int(origin_grid_id)]
+                        elif self.rl_mode == 'heuristic_matching':
+                            matching_method = self.strategy_vector[int(origin_grid_id)]
+
+                        if matching_method == 0:  # instant reward
+                            weight_array[i] = reward
+                            dynamic_matching_array[i] = 0
+
+                        elif matching_method == 1:  # pickup distance
+                            # 如果在这里计算distance 会比较麻烦 所以还是放到order dynamic dispatch中去计算
+                            # 所以采用distanc的order 此时权重为1
+                            # 需要在order dynamic dispatch中找到这些order 并将权重替换为相应的distance
+                            dynamic_matching_array[i] = 1
+                            pass
+                        else:  # RL
+                            current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq * 60))
+                            num_slices = int(18000 / (self.decision_freq * 60))
+                            end_time_slice = int((
+                                                             self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (
+                                                             self.decision_freq * 60))
+                            if end_time_slice >= num_slices:
+                                original_trip_score = reward
+                            else:
+                                next_state = State(end_time_slice, int(dest_grid_id))
+                                # 只用一个qtable small size乘以的缩放系数为0.3
+                                # middle size 系数0.5
+                                if self.driver_num == 100:
+                                    scale_coeff = 0.3
+                                elif self.driver_num == 500:
+                                    scale_coeff = 0.5
+                                elif self.driver_num == 1000:
+                                    scale_coeff = 1.0
+                                # original_trip_score = reward + scale_coeff * (
+                                #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
+                                #                       score_agent.strategy.q_value_table[next_state]
+                                # train dynamic matching的时候打开这个
+                                original_trip_score = reward + scale_coeff * (
+                                        self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
+                                                      score_agent.q_value_table[next_state]
+                            weight_array[i] = original_trip_score
+                            dynamic_matching_array[i] = 2
+
+                elif self.rl_mode == 'reposition':
+                    pass
+                    # 权重在order matching中计算
+                    # 统一使用distance
+
+                wait_info['dynamic_matching_array'] = dynamic_matching_array
+                wait_info['weight'] = weight_array
+                wait_info['wait_time'] = 0
+                wait_info['status'] = 0
+                # Andrew: 司机和乘客最大等待时间
+                wait_info['maximum_wait_time'] = self.maximum_wait_time_mean
+                wait_info['maximum_price_passenger_can_tolerate'] = np.random.normal(
+                    self.maximum_price_passenger_can_tolerate_mean,
+                    self.maximum_price_passenger_can_tolerate_std,
+                    len(wait_info))
+                wait_info = wait_info[
+                    wait_info['maximum_price_passenger_can_tolerate'] >= wait_info['trip_distance'] * self.price_per_km]
+                wait_info['maximum_pickup_time_passenger_can_tolerate'] = np.random.normal(
+                    self.maximum_pickup_time_passenger_can_tolerate_mean,
+                    self.maximum_pickup_time_passenger_can_tolerate_std, len(wait_info))
+
+                dfs = [self.wait_requests, wait_info]
+                self.wait_requests = pd.concat([df for df in dfs if df is not None and not df.empty],
+                                               ignore_index=True)
+                # self.wait_requests = pd.concat([self.wait_requests, wait_info], ignore_index=True)
+
+                # statistics
+                long_ = wait_info[wait_info['trip_time'] >= 600].shape[0]
+                short_ = wait_info[wait_info['trip_time'] <= 300].shape[0]
+                self.long_requests_num += long_
+                self.short_requests_num += short_
+                self.medium_requests_num += wait_info.shape[0] - long_ - short_
+                self.total_request_num += wait_info.shape[0]
+
+        return
+
+    # =========================================================================
+    # 巡航决策 (Cruise Decision) - [预留/未使用]
+    # =========================================================================
+    def cruise_and_reposition(self):
+        """
+        司机巡航和重定位决策 (已废弃，目前未被使用)
+
+        Returns:
+            None
+        """
+        return  # Deprecated - not used
+        # [原始代码已移除]
+
+    # =========================================================================
+    # 状态更新 (State Update) - [共用]
+    # =========================================================================
+    def update_state(self):
+        """
+        更新所有司机的状态和信息
+
+        司机状态说明:
+        - 0: cruise (巡游/空闲)
+        - 1: delivery (送客中)
+        - 2: pickup (接客中)
+        - 3: offline (下线)
+        - 4: reposition (重定位中)
+
+        Returns:
+            None
+        """
+        # update next state
+        # 车辆状态：0 cruise (park 或正在cruise)， 1 表示delivery，2 pickup, 3 表示下线, 4 reposition
+        # 先更新未完成任务的，再更新已完成任务的
+        self.driver_table['current_road_node_index'] = self.driver_table['current_road_node_index'].values.astype(int)
+
+        loc_cruise = self.driver_table['status'] == 0
+        loc_reposition = self.driver_table['status'] == 4
+        loc_parking = loc_cruise & (self.driver_table['remaining_time'] == 0)
+        loc_actually_cruising = (loc_cruise | loc_reposition) & (self.driver_table['remaining_time'] > 0)
+        self.driver_table['remaining_time'] = self.driver_table['remaining_time'].values - self.delta_t
+        loc_finished = self.driver_table['remaining_time'] <= 0
+        loc_unfinished = ~loc_finished
+        loc_delivery = self.driver_table['status'] == 1
+        loc_pickup = self.driver_table['status'] == 2
+        loc_road_node_transfer = self.driver_table['remaining_time_for_current_node'].values - self.delta_t <= 0
+
+        # for unfinished tasks
+        self.driver_table.loc[loc_cruise, 'total_idle_time'] += self.delta_t
+        con_real_time_ongoing = loc_unfinished & (loc_cruise | loc_reposition | loc_delivery) | loc_pickup
+        self.driver_table.loc[
+            ~loc_road_node_transfer & con_real_time_ongoing, 'remaining_time_for_current_node'] -= self.delta_t
+
+        road_node_transfer_list = list(self.driver_table[loc_road_node_transfer & con_real_time_ongoing].index)
+        current_road_node_index_array = self.driver_table.loc[road_node_transfer_list, 'current_road_node_index'].values
+        current_remaining_time_for_node_array = self.driver_table.loc[
+            road_node_transfer_list, 'remaining_time_for_current_node'].values
+        transfer_itinerary_node_list = self.driver_table.loc[road_node_transfer_list, 'itinerary_node_list'].values
+        transfer_itinerary_segment_dis_list = self.driver_table.loc[
+            road_node_transfer_list, 'itinerary_segment_dis_list'].values
+        new_road_node_index_array = np.zeros(len(road_node_transfer_list))
+        new_road_node_array = np.zeros(new_road_node_index_array.shape[0])
+        new_remaining_time_for_node_array = np.zeros(new_road_node_index_array.shape[0])
+
+        # update the driver itinerary list
+        for i in range(len(road_node_transfer_list)):
+            current_node_index = current_road_node_index_array[i]
+            itinerary_segment_time = np.array(
+                transfer_itinerary_segment_dis_list[i][current_node_index:]) / self.vehicle_speed * 3600
+            itinerary_segment_time[0] = current_remaining_time_for_node_array[i]
+            itinerary_segment_cumsum_time = itinerary_segment_time.cumsum()
+            new_road_node_index = (itinerary_segment_cumsum_time > self.delta_t).argmax()
+            new_remaining_time = itinerary_segment_cumsum_time[new_road_node_index] - self.delta_t
+            if itinerary_segment_cumsum_time[-1] <= self.delta_t:
+                new_road_node_index = len(transfer_itinerary_segment_dis_list[i]) - 1
+            else:
+                new_road_node_index = new_road_node_index + current_node_index
+            try:
+                new_road_node = transfer_itinerary_node_list[i][new_road_node_index]
+            except TypeError as e:
+                print(e)
+                print(new_road_node_index)
+                print(transfer_itinerary_node_list[i])
+
+            new_road_node_index_array[i] = new_road_node_index
+            new_road_node_array[i] = new_road_node
+            new_remaining_time_for_node_array[i] = new_remaining_time
+
+        self.driver_table.loc[road_node_transfer_list, 'current_road_node_index'] = new_road_node_index_array.astype(
+            int)
+        self.driver_table.loc[
+            road_node_transfer_list, 'remaining_time_for_current_node'] = new_remaining_time_for_node_array
+
+        lng_array, lat_array, grid_id_array = self.RN.get_information_for_nodes(new_road_node_array)
+        self.driver_table.loc[road_node_transfer_list, 'lng'] = lng_array
+        self.driver_table.loc[road_node_transfer_list, 'lat'] = lat_array
+        self.driver_table.loc[road_node_transfer_list, 'grid_id'] = grid_id_array
+
+        # for all the finished tasks
+        self.driver_table.loc[loc_finished & (~ loc_pickup), 'remaining_time'] = 0
+        con_not_pickup = loc_finished & (loc_actually_cruising | loc_delivery | loc_reposition)
+        con_not_pickup_actually_cruising = loc_finished & (loc_delivery | loc_reposition)
+        self.driver_table.loc[con_not_pickup, 'lng'] = self.driver_table.loc[con_not_pickup, 'target_loc_lng'].values
+        self.driver_table.loc[con_not_pickup, 'lat'] = self.driver_table.loc[con_not_pickup, 'target_loc_lat'].values
+        self.driver_table.loc[con_not_pickup, 'grid_id'] = self.driver_table.loc[
+            con_not_pickup, 'target_grid_id'].values
+        self.driver_table.loc[con_not_pickup, ['status', 'time_to_last_cruising', 'current_road_node_index',
+                                               'remaining_time_for_current_node']] = 0
+        self.driver_table.loc[con_not_pickup_actually_cruising, 'total_idle_time'] = 0
+        shape = self.driver_table[con_not_pickup].shape[0]
+        empty_list = [[] for _ in range(shape)]
+        self.driver_table.loc[con_not_pickup, 'itinerary_node_list'] = np.array(empty_list + [[-1]], dtype=object)[:-1]
+        self.driver_table.loc[con_not_pickup, 'itinerary_segment_dis_list'] = np.array(empty_list + [[-1]],
+                                                                                       dtype=object)[:-1]
+
+        # for parking finished
+        self.driver_table.loc[loc_parking, 'time_to_last_cruising'] += self.delta_t
+
+        # for delivery finished
+        self.driver_table.loc[loc_finished & loc_delivery, 'matched_order_id'] = 'None'
+
+        # self.driver_table.loc[loc_finished & loc_delivery]
+        """
+        for pickup    delivery是载客  pickup是接客
+        分两种情况，一种是下一时刻pickup 和 delivery都完成，另一种是下一时刻pickup 完成，delivery没完成
+        当前版本delivery直接跳转，因此不需要做更新其中间路线的处理。车辆在pickup完成后，delivery完成前都实际处在pickup location。完成任务后直接跳转到destination
+        如果需要考虑delivery的中间路线，可以把pickup和delivery状态进行融合
+        """
+
+        finished_pickup_driver_index_array = np.array(self.driver_table[loc_finished & loc_pickup].index)
+        current_road_node_index_array = self.driver_table.loc[finished_pickup_driver_index_array,
+        'current_road_node_index'].values
+        itinerary_segment_dis_list = self.driver_table.loc[finished_pickup_driver_index_array,
+        'itinerary_segment_dis_list'].values
+        remaining_time_current_node_temp = self.driver_table.loc[finished_pickup_driver_index_array,
+        'remaining_time_for_current_node'].values
+
+        # load pickup time
+
+        remaining_time_array = np.zeros(len(finished_pickup_driver_index_array))
+        for i in range(remaining_time_array.shape[0]):
+            current_node_index = current_road_node_index_array[i]
+            remaining_time_array[i] = np.sum(
+                itinerary_segment_dis_list[i][current_node_index + 1:]) / self.vehicle_speed * 3600 + \
+                                      remaining_time_current_node_temp[i]
+        delivery_not_finished_driver_index = finished_pickup_driver_index_array[remaining_time_array > 0]
+        delivery_finished_driver_index = finished_pickup_driver_index_array[remaining_time_array <= 0]
+        self.driver_table.loc[delivery_not_finished_driver_index, 'status'] = 1
+        self.driver_table.loc[delivery_not_finished_driver_index, 'remaining_time'] = remaining_time_array[
+            remaining_time_array > 0]
+        if len(delivery_finished_driver_index > 0):
+            self.driver_table.loc[delivery_finished_driver_index, 'lng'] = \
+                self.driver_table.loc[delivery_finished_driver_index, 'target_loc_lng'].values
+            self.driver_table.loc[delivery_finished_driver_index, 'lat'] = \
+                self.driver_table.loc[delivery_finished_driver_index, 'target_loc_lat'].values
+            self.driver_table.loc[delivery_finished_driver_index, 'grid_id'] = \
+                self.driver_table.loc[delivery_finished_driver_index, 'target_grid_id'].values
+            self.driver_table.loc[delivery_finished_driver_index, ['status', 'time_to_last_cruising',
+                                                                   'current_road_node_index',
+                                                                   'remaining_time_for_current_node']] = 0
+            self.driver_table.loc[delivery_finished_driver_index, 'total_idle_time'] = 0
+            shape = self.driver_table.loc[delivery_finished_driver_index].values.shape[0]
+            empty_list = [[] for _ in range(shape)]
+            self.driver_table.loc[delivery_finished_driver_index, 'itinerary_node_list'] = np.array(empty_list + [[-1]],
+                                                                                                    dtype=object)[:-1]
+            self.driver_table.loc[delivery_finished_driver_index, 'itinerary_segment_dis_list'] = np.array(
+                empty_list + [[-1]], dtype=object)[:-1]
+            self.driver_table.loc[delivery_finished_driver_index, 'matched_order_id'] = 'None'
+        self.wait_requests['wait_time'] += self.delta_t
+
+        return
+
+    # =========================================================================
+    # 司机上下线更新 (Driver Online/Offline Update) - [共用]
+    # =========================================================================
+    def driver_online_offline_update(self):
+        """
+        更新司机的在线/离线状态
+
+        根据时间判断司机是否应该下线，并从司机表中移除离线司机
+
+        Returns:
+            None
+        """
+        next_time = self.time + self.delta_t
+        self.driver_table = driver_online_offline_decision(self.driver_table, next_time)
+        return
+
+    # =========================================================================
+    # 时间更新 (Time Update) - [共用]
+    # =========================================================================
+    def update_time(self):
+        """
+        更新仿真时间
+
+        每次调用将时间向前推进 delta_t (默认 60 秒)
+
+        Returns:
+            None
+        """
+        self.time += self.delta_t
+        self.current_step = int((self.time - self.t_initial) // self.delta_t)
+
+        # rl for matching
+        if self.current_step >= self.finish_run_step:
+            self.end_of_episode = 1
+        # rl for matching
+        return
+
+    # =========================================================================
+    # RL 单步执行 (RL Step) - [Matching]
+    # =========================================================================
+    def rl_step(self):  # rl for matching
+        """
+        执行一步仿真 (用于 Matching 模式的 RL 训练)
+
+        流程:
+        1. 订单分发 (order dispatching)
+        2. 更新匹配结果
+        3. 计算奖励
+        4. 生成新订单
+        5. 更新司机状态
+        6. 更新时间
+
+        Returns:
+            None
+        """
+        # Step 1: order dispatching
+        wait_requests = deepcopy(self.wait_requests)
+        driver_table = deepcopy(self.driver_table)
+
+        matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
+                                                                        self.maximal_pickup_distance,
+                                                                        self.dispatch_method, self.method)
+        # Step 2: driver/passenger reaction after dispatching
+        df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
+            matched_pair_actual_indexes, matched_itinerary)
+        if isinstance(self.record, str):
+            self.record = df_new_matched_requests
+        else:
+            self.record = pd.concat([self.record, df_new_matched_requests], axis=0, ignore_index=True)
+
+        # TJ
+        if len(df_new_matched_requests) != 0:
+            # TODO: pricing
+            self.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
+        else:
+            self.total_reward += 0
+
+        self.matched_requests_num += len(df_new_matched_requests)
+
+        # 在这里对完成匹配的数据进行聚合分析
+        if len(df_new_matched_requests) > 0:
+            self.evaluate_df = calculate_evaluate_table(self.grid_num, wait_requests, df_new_matched_requests)
+            self.evaluate_table[self.current_step] = self.evaluate_df.values
+        else:
+            # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
+            self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
+
+        # TJ
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 2].shape[0]
+        self.occupancy_rate = self.cumulative_on_trip_driver_num / (
+                    (1 + self.current_step) * self.driver_table.shape[0])
+        # print("occupancy_rate", self.occupancy_rate)
+        if self.end_of_episode == 0:
+            self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0)
+            self.matched_requests = self.matched_requests.reset_index(drop=True)
+            self.wait_requests = df_update_wait_requests.reset_index(drop=True)
+
+            # Step 3: bootstrap new orders
+            self.step_bootstrap_new_orders(self.matching_agent)
+
+        # Step 4: both-rg-cruising and/or repositioning decision
+        # self.cruise_and_reposition()
+
+        # Step 4.1: track recording
+        if self.track_recording_flag:
+            self.real_time_track_recording()
+
+        # Step 5: update next state for drivers
+        self.update_state()
+        # Step 6： online/offline update()
+        self.driver_online_offline_update()
+
+        # Step 7: update time
+        self.update_time()
+
+    # =========================================================================
+    # RL 测试步骤 (RL Test Step) - [Dynamic Matching]
+    # =========================================================================
+    def rl_step_test_dynamic(self):  # rl for matching
+
+        if self.time % (self.decision_freq * 60) == 0:
+            matching_state_current = self.get_global_state()
+            self.state_at_decision_time = matching_state_current
+            actions, _ = self.dynamic_matching_agent.select_actions(matching_state_current, deterministic=True)
+            self.held_action_tuple = (actions, _)
+            self.choose_action[:, self.current_decision_index] = actions
+            self.current_decision_index += 1
+
+        # Step 1: order dispatching
+        wait_requests = deepcopy(self.wait_requests)
+        # print("--------------------wait_requests----------------:",wait_requests.shape[0])
+        driver_table = deepcopy(self.driver_table)
+
+        # use RL's decision as the input
+        # 应该在抽取新订单时做修改
+        matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
+                                                                        self.maximal_pickup_distance,
+                                                                        self.dispatch_method, self.method)
+        # Step 2: driver/passenger reaction after dispatching
+        df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
+            matched_pair_actual_indexes, matched_itinerary)
+
+        if isinstance(self.record, str):
+            self.record = df_new_matched_requests
+        else:
+            self.record = pd.concat([self.record, df_new_matched_requests], axis=0, ignore_index=True)
+
+        if len(df_new_matched_requests) != 0:
+            # TODO: pricing
+            self.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
+        else:
+            self.total_reward += 0
+            # Update matched requests count
+
+        self.matched_requests_num += len(df_new_matched_requests)
+
+        # 在这里对完成匹配的数据进行聚合分析
+        if len(df_new_matched_requests) > 0:
+            self.evaluate_df = calculate_evaluate_table(self.grid_num, wait_requests, df_new_matched_requests)
+            self.evaluate_table[self.current_step] = self.evaluate_df.values
+        else:
+            # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
+            self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
+
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 2].shape[0]
+        self.occupancy_rate = self.cumulative_on_trip_driver_num / (
+                (1 + self.current_step) * self.driver_table.shape[0])
+        # TJ
+        if self.end_of_episode == 0:
+            self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0)
+            self.matched_requests = self.matched_requests.reset_index(drop=True)
+            self.wait_requests = df_update_wait_requests.reset_index(drop=True)
+
+            # Step 3: bootstrap new orders
+            # self.matching_agent是之前训练好的agent 用于加载未来区域价值
+            # 跟正在训练的rl agent不是一个
+            self.step_bootstrap_new_orders(self.matching_agent)
+
+        # Step 4: both-rg-cruising and/or repositioning decision
+        # self.cruise_and_reposition()
+
+        # Step 5: update next state for drivers
+        self.update_state()
+        # Step 6： online/offline update()
+        self.driver_online_offline_update()
+
+        # Step 7: update time
+        self.update_time()
+
+    # =========================================================================
+    # 获取匹配奖励 (Get Matching Reward) - [Matching/Dynamic Matching]
+    # =========================================================================
+    def get_matching_reward(self, df_new_matched_requests):
+        """
+        计算匹配订单的总奖励
+
+        Args:
+            df_new_matched_requests: 新匹配的订单 DataFrame
+
+        Returns:
+            float: 总奖励金额
+        """
+        if len(df_new_matched_requests) != 0:
+            # print("----------MATCHED REQUESTS IS NOT EMPTY------------")
+            # self.logger.debug("matched requests nums: {}".format(len(df_new_matched_requests)))
+            # self.logger.debug("Reward: {}".format(np.sum(df_new_matched_requests['designed_reward'].values)))
+            return np.sum(df_new_matched_requests['designed_reward'].values)
+        return 0
+
+
+    # =========================================================================
+    # 执行重定位 (Execute Reposition) - [Repo]
+    # =========================================================================
+    def repo_driver(self, score_agent):
+        """
+        执行车辆重定位决策
+
+        根据 repo_mode (random_repo, demand_greedy, rl_value 等) 为空闲司机选择目标网格
+
+        Args:
+            score_agent: 计分/价值估计 Agent (用于 rl_value 模式)
+
+        Returns:
+            None
+        """
+
+        # === 1. 筛选司机 ===
+        con_idle = self.driver_table['status'] == 0
+        con_long_idle = con_idle & (self.driver_table['total_idle_time'] >= self.max_idle_time)
+        repo_idx = self.driver_table.index[con_long_idle].to_numpy()
+
+        if len(repo_idx) == 0:
+            return
+
+        grid_id_array = self.driver_table.loc[con_long_idle,'grid_id'].values
+        driver_grid_id_dict = self.driver_table.loc[con_long_idle,['driver_id','grid_id']].groupby('grid_id')['driver_id'].apply(list).to_dict()
+        repo_candidate_by_grid = get_three_hop_neighbors(list(grid_id_array), driver_grid_id_dict) # 每个driver可选择的rep grid
+        # 获取去重后的网格，减少重复计算
+        unique_grids = np.unique(grid_id_array)
+        grid_choice_dict = {}
+        beta = 1.0  # Logit 的敏感度参数
+
+        # === 2. 基础数据 ===
+        current_xy = self.driver_table.loc[repo_idx, ['lng', 'lat']].to_numpy()  # (N,2)
+        if self.grid_num in [8, 35, 64]:
+            target_xy = self.df_neighbor_centroid[['centroid_x', 'centroid_y']].to_numpy()  # (M,2)
+        else:
+            target_xy = self.df_neighbor_centroid[['center_lon', 'center_lat']].to_numpy()
+
+        current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq * 60))
+        num_slices = int(300 / self.decision_freq)
+
+        N = current_xy.shape[0]
+
+        # === 3. 欧式距离（向量化）===
+        dist_matrix = haversine_batch(
+            current_xy[:, 1], current_xy[:, 0],  # lat, lng
+            target_xy[:, 1], target_xy[:, 0]
+        )
+
+        # === 5. 时间计算 ===
+        repo_time = dist_matrix / self.vehicle_speed * 3600
+
+        if self.repo_mode == 'random_repo':
+            # 从距离最近的5个中随机选一个
+            # K = 5
+            # topk_idx = np.argpartition(dist_matrix, K, axis=1)[:, :K]  # (N,K)
+            # # 为每一行生成一个随机索引（范围在 0~4）
+            # random_indices = np.random.randint(0, K, size=N)
+            # best_grid = topk_idx[np.arange(N), random_indices]
+            # best_dist = dist_matrix[np.arange(N), best_grid]  # (N,)
+            # remaining_time = best_dist / self.vehicle_speed * 3600
+
+            # 从备选集中随机选择
+            # === 3. 为每个去重的网格在候选集中随机选择一个目标 ===
+            for g in unique_grids:
+                candidates = repo_candidate_by_grid.get(g, [g])
+                if not candidates:
+                    grid_choice_dict[g] = g
+                    continue
+
+                # 从该网格的候选集中均匀随机抽样一个作为目标
+                grid_choice_dict[g] = np.random.choice(list(candidates))
+
+            # === 4. 生成与原代码一致的 (N,) 数组 ===
+            best_grid = np.array([grid_choice_dict[g] for g in grid_id_array])
+            best_dist = dist_matrix[np.arange(len(repo_idx)), best_grid]  # (N,)
+            remaining_time = best_dist / self.vehicle_speed * 3600
+
+
+        elif self.repo_mode in ['demand_greedy', 'demand_logit']:
+
+            # --- waiting orders ---
+            waiting_orders_by_grid = (
+                self.wait_requests
+                .groupby('origin_grid_id')
+                .size()
+                .reindex(self.zone_id_array, fill_value=0)
+                .values
+            )
+
+            # value = -repo_time / 3000 + waiting_orders_by_grid  # (N,M)
+            # # === 8. 选最优 grid ===
+            # best_grid = np.argmax(value, axis=1)  # (N,)
+            # best_dist = dist_matrix[np.arange(N), best_grid]  # (N,)
+            # remaining_time = best_dist / self.vehicle_speed * 3600
+
+            value = waiting_orders_by_grid
+            for g in unique_grids:
+                # candidates 本身就是 grid_id，也是索引
+                candidates = repo_candidate_by_grid.get(g, [g])
+                if not candidates:
+                    grid_choice_dict[g] = g
+                    continue
+                cand_array = np.array(list(candidates))
+                # 向量化直接提取候选区域的需求量
+                demands = value[cand_array]
+                if self.repo_mode == 'demand_greedy':
+                    # 贪心：选需求最大的 grid
+                    best_c_idx = np.argmax(demands)
+                    grid_choice_dict[g] = cand_array[best_c_idx]
+                elif self.repo_mode == 'demand_logit':
+                    # Logit：按需求概率选择，减去最大值防溢出
+                    exp_u = np.exp(beta * (demands - np.max(demands)))
+                    probs = exp_u / np.sum(exp_u)
+                    grid_choice_dict[g] = np.random.choice(cand_array, p=probs)
+            # === 4. 生成与原代码一致的 (N,) 数组 ===
+            # 利用字典将结果映射回 N 个司机
+            best_grid = np.array([grid_choice_dict[g] for g in grid_id_array])
+            best_dist = dist_matrix[np.arange(len(repo_idx)), best_grid]  # (N,)
+            remaining_time = best_dist / self.vehicle_speed * 3600
+
+
+        elif self.repo_mode in ['ratio_greedy','ratio_logit']:
+            # --- waiting orders ---
+            waiting_orders_by_grid = (
+                self.wait_requests
+                .groupby('origin_grid_id')
+                .size()
+                .reindex(self.zone_id_array, fill_value=0)
+                .values
+            )
+            # --- 空闲司机分布 ---
+            con_ready_to_dispatch = (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)
+            idle_driver_table = self.driver_table[con_ready_to_dispatch]
+            idle_driver_by_grid = (idle_driver_table
+                                   .groupby('grid_id')
+                                   .size()
+                                   .reindex(self.zone_id_array, fill_value=0)
+                                   .values)
+
+            # --- 正在配送司机分布 ---
+            occupied_driver_table = self.driver_table[self.driver_table['status'] == 1]
+            occupied_driver_by_grid = (
+                occupied_driver_table
+                .groupby('target_grid_id')
+                .size()
+                .reindex(self.zone_id_array, fill_value=0)
+                .values)
+
+            total_supply = idle_driver_by_grid + occupied_driver_by_grid
+            value = waiting_orders_by_grid / (total_supply + 0.001)
+
+            # value = -repo_time / 3000 + waiting_orders_by_grid / (total_supply + 0.001)
+            # best_grid = np.argmax(value, axis=1)  # (N,)
+            # best_dist = dist_matrix[np.arange(N), best_grid]  # (N,)
+            # remaining_time = best_dist / self.vehicle_speed * 3600
+
+            for g in unique_grids:
+                # candidates 本身就是 grid_id，也是索引
+                candidates = repo_candidate_by_grid.get(g, [g])
+                if not candidates:
+                    grid_choice_dict[g] = g
+                    continue
+                cand_array = np.array(list(candidates))
+                # 向量化直接提取候选区域的需求量
+                ratios = value[cand_array]
+                if self.repo_mode == 'ratio_greedy':
+                    # 贪心：选需求最大的 grid
+                    best_c_idx = np.argmax(ratios)
+                    grid_choice_dict[g] = cand_array[best_c_idx]
+                elif self.repo_mode == 'ratio_logit':
+                    # Logit：按需求概率选择，减去最大值防溢出
+                    exp_u = np.exp(beta * (ratios - np.max(ratios)))
+                    probs = exp_u / np.sum(exp_u)
+                    grid_choice_dict[g] = np.random.choice(cand_array, p=probs)
+            # === 4. 生成与原代码一致的 (N,) 数组 ===
+            # 利用字典将结果映射回 N 个司机
+            best_grid = np.array([grid_choice_dict[g] for g in grid_id_array])
+            best_dist = dist_matrix[np.arange(len(repo_idx)), best_grid]  # (N,)
+            remaining_time = best_dist / self.vehicle_speed * 3600
+
+        elif self.repo_mode in ['rl_value_greedy','rl_value_logit']:
+            end_time_slice = ((self.time + repo_time - self.t_initial - 1) //
+                              (self.decision_freq * 60)).astype(int)
+
+            end_time_slice = np.clip(end_time_slice, 0, num_slices - 1)
+
+            # === 6. Q-value 查询（必须是 numpy array: [T, G]）===
+            q_values = score_agent.q_value_table[end_time_slice, np.arange(self.grid_num)[None, :]]  # (N,M)
+
+            # === 7. discount ===
+            delta_t = end_time_slice - current_time_slice
+            discount = self.score_discount_rate ** delta_t
+
+            # --- waiting orders ---
+            waiting_orders_by_grid = (
+                self.wait_requests
+                .groupby('origin_grid_id')
+                .size()
+                .reindex(self.zone_id_array, fill_value=0)
+                .values
+            )
+            # --- 空闲司机分布 ---
+            # con_ready_to_dispatch = (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)
+            # idle_driver_table = self.driver_table[con_ready_to_dispatch]
+            # idle_driver_by_grid = (idle_driver_table
+            #                        .groupby('grid_id')
+            #                        .size()
+            #                        .reindex(self.zone_id_array, fill_value=0)
+            #                        .values)
+
+            # --- 正在配送司机分布 ---
+            # occupied_driver_table = self.driver_table[self.driver_table['status'] == 1]
+            # occupied_driver_by_grid = (
+            #     occupied_driver_table
+            #     .groupby('target_grid_id')
+            #     .size()
+            #     .reindex(self.zone_id_array, fill_value=0)
+            #     .values)
+
+            # total_supply = idle_driver_by_grid + occupied_driver_by_grid
+            # immediate_reward = -repo_time / 3000 + waiting_orders_by_grid / (total_supply + 0.001)
+            # value = immediate_reward + discount * q_values  # (N,M)
+            # # === 8. 选最优 grid ===
+            # best_grid = np.argmax(value, axis=1)  # (N,)
+            # best_dist = dist_matrix[np.arange(N), best_grid]  # (N,)
+
+            # --- 1. 预处理候选集 (建议在初始化或外层只做一次) ---
+            # 将 dict 转换为固定长度的 array，不足位补 -1 或原位 grid
+            # 假设 max_cand 是最大候选数
+            max_cand = max(len(v) for v in repo_candidate_by_grid.values())
+            cand_matrix = np.full((self.grid_num, max_cand), -1, dtype=int)
+            for g, cands in repo_candidate_by_grid.items():
+                cand_matrix[g, :len(cands)] = list(cands)
+
+            # --- 2. 核心逻辑 ---
+            N = len(grid_id_array)
+            value = discount * q_values  # (N, grid_num)
+
+            # 获取所有司机当前 grid 对应的候选 grid 集合
+            cands_per_driver = cand_matrix[grid_id_array.astype(int)]
+            # 提取这些候选位置对应的 Q 值
+            # 使用 np.take_along_axis 在 value 矩阵中按行提取候选列的值
+            # rows_idx: [0,0,0, 1,1,1...]
+            rows_idx = np.arange(N)[:, None]
+            # 过滤掉 -1 的无效候选（指向第 0 个 grid 作为 dummy，后续靠 mask 屏蔽）
+            mask = cands_per_driver != -1
+            safe_cands = np.where(mask, cands_per_driver, 0)
+            cvals = np.take_along_axis(value, safe_cands, axis=1)
+            cvals[~mask] = -np.inf  # 屏蔽无效候选的 Q 值
+
+            if self.repo_mode == 'rl_value_greedy':
+                chosen_col_idx = np.argmax(cvals, axis=1)
+                best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
+
+            elif self.repo_mode == 'rl_value_logit':
+                # 数值稳定化 log-sum-exp trick (保持不变)
+                max_u = np.max(cvals, axis=1, keepdims=True)
+                with np.errstate(over='ignore', invalid='ignore'):
+                    exp_u = np.exp(beta * (cvals - max_u))
+                    exp_u[~mask] = 0
+
+                sum_exp = np.sum(exp_u, axis=1, keepdims=True)
+                probs = np.divide(exp_u, sum_exp, out=np.zeros_like(exp_u), where=sum_exp > 0)
+
+                # 计算累积概率 (保持不变)
+                cum_probs = np.cumsum(probs, axis=1)
+                # 1. 找出当前所有司机所在的 unique grids 以及它们在原数组中的映射索引
+                unique_g, inverse_idx = np.unique(grid_id_array.astype(int), return_inverse=True)
+                # 2. 仅为每个 unique grid 生成一次随机数
+                u_unique = np.random.default_rng().random((len(unique_g), 1))
+                # 3. 将随机数映射回 N 个司机。同网格的司机将获得完全相同的随机数 u
+                u = u_unique[inverse_idx]
+                # 由于同网格司机的 cum_probs 相同，且 u 也相同，argmax 必然选出同一个候选列
+                chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
+                best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
+
+        elif self.repo_mode in ['vope_greedy', 'vope_logit']:
+            # === V_ope 模式: 使用神经网络估计价值 ===
+            if self.vope_model is None:
+                raise ValueError("V_ope model not loaded! Set vope_model_path in config.")
+
+            # 计算目标到达时间片
+            end_time_slice = ((self.time + repo_time - self.t_initial - 1) //
+                              (self.decision_freq * 60)).astype(int)
+            end_time_slice = np.clip(end_time_slice, 0, num_slices - 1)
+
+            # 折扣因子
+            delta_t = end_time_slice - current_time_slice
+            discount = self.score_discount_rate ** delta_t
+
+            # --- 1. 预处理候选集 ---
+            max_cand = max(len(v) for v in repo_candidate_by_grid.values())
+            cand_matrix = np.full((self.grid_num, max_cand), -1, dtype=int)
+            for g, cands in repo_candidate_by_grid.items():
+                cand_matrix[g, :len(cands)] = list(cands)
+
+            # --- 2. 计算每个候选网格的 V 值 ---
+            N = len(grid_id_array)
+            num_grids = self.grid_num
+
+            # 获取当前需求特征
+            waiting_orders_by_grid = (
+                self.wait_requests
+                .groupby('origin_grid_id')
+                .size()
+                .reindex(self.zone_id_array, fill_value=0)
+                .values
+            )
+
+            # 为所有网格计算V值 (向量化)
+            all_v_values = np.zeros(num_grids)
+            with torch.no_grad():
+                for g in range(num_grids):
+                    state = self._encode_state_for_vope(g, end_time_slice, waiting_orders_by_grid)
+                    if state is not None:
+                        state_scaled = self.vope_scaler.transform([state])
+                        v = self.vope_model(torch.FloatTensor(state_scaled)).item()
+                        all_v_values[g] = v
+
+            # 折扣后的价值
+            value = discount * all_v_values  # (grid_num,)
+
+            # 获取候选网格的价值
+            cands_per_driver = cand_matrix[grid_id_array.astype(int)]
+            mask = cands_per_driver != -1
+            safe_cands = np.where(mask, cands_per_driver, 0)
+            cvals = np.take_along_axis(np.tile(value, (N, 1)), safe_cands, axis=1)
+            cvals[~mask] = -np.inf
+
+            if self.repo_mode == 'vope_greedy':
+                chosen_col_idx = np.argmax(cvals, axis=1)
+                best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
+            elif self.repo_mode == 'vope_logit':
+                max_u = np.max(cvals, axis=1, keepdims=True)
+                with np.errstate(over='ignore', invalid='ignore'):
+                    exp_u = np.exp(beta * (cvals - max_u))
+                    exp_u[~mask] = 0
+                sum_exp = np.sum(exp_u, axis=1, keepdims=True)
+                probs = np.divide(exp_u, sum_exp, out=np.zeros_like(exp_u), where=sum_exp > 0)
+                cum_probs = np.cumsum(probs, axis=1)
+                unique_g, inverse_idx = np.unique(grid_id_array.astype(int), return_inverse=True)
+                u_unique = np.random.default_rng().random((len(unique_g), 1))
+                u = u_unique[inverse_idx]
+                chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
+                best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
+
+            # --- 3. 统一计算距离与状态转换 ---
+            # 确保 best_grid 在有效范围内
+            best_grid = np.where(best_grid >= 0, best_grid, grid_id_array.astype(int))
+            # 计算距离 (利用广播机制或向量化索引)
+            best_dist = dist_matrix[np.arange(N), best_grid]
+            remaining_time = (best_dist / self.vehicle_speed) * 3600
+            next_time = self.time + remaining_time
+
+            # 构建结果数组  === 10. transitions ===
+            current_state_array = np.column_stack([np.full(N, self.time), grid_id_array])
+            next_state_array = np.column_stack([next_time, best_grid])
+            action_array = np.zeros(N)
+            reward_array = np.zeros(N)
+
+            self.dispatch_transitions_buffer[0] = np.concatenate(
+                [self.dispatch_transitions_buffer[0], current_state_array])
+            self.dispatch_transitions_buffer[1] = np.concatenate([self.dispatch_transitions_buffer[1], action_array])
+            self.dispatch_transitions_buffer[2] = np.concatenate(
+                [self.dispatch_transitions_buffer[2], next_state_array])
+            self.dispatch_transitions_buffer[3] = np.concatenate([self.dispatch_transitions_buffer[3], reward_array])
+
+        # === 9. 更新 driver_table（批量）===
+        self.driver_table.loc[repo_idx, 'status'] = 4
+
+        self.driver_table.loc[repo_idx, 'target_grid_id'] = best_grid
+
+        self.driver_table.loc[repo_idx, ['target_loc_lng', 'target_loc_lat']] = target_xy[best_grid]
+
+        self.driver_table.loc[repo_idx, 'remaining_time'] = remaining_time
+
+        self.driver_table.loc[repo_idx, 'total_idle_time'] = 0
+        self.driver_table.loc[repo_idx, 'time_to_last_cruising'] = 0
+        self.driver_table.loc[repo_idx, 'current_road_node_index'] = 0
+
+        self.driver_table.loc[repo_idx, 'itinerary_node_list'] = [
+            np.array([g], dtype=object) for g in best_grid
+        ]
+        self.driver_table.loc[repo_idx, 'itinerary_segment_dis_list'] = [
+            np.array([d], dtype=object) for d in best_dist
+        ]
+
+        self.driver_table.loc[repo_idx, 'remaining_time_for_current_node'] = remaining_time
+
+    # rl_step for training: Andrew
+    # =========================================================================
+    # RL 训练步骤 (RL Training Step) - [Repo/Matching]
+    # =========================================================================
+    def rl_step_train(self):  # rl for matching
+        """
+        执行一步 RL 训练
+
+        用于 repo 模式或基础 matching 模式的训练:
+        - 执行订单匹配
+        - 更新状态和奖励
+        - 执行重定位 (如果 rl_mode='reposition')
+        - 更新 transition buffer
+
+        Returns:
+            None
+        """
+
+        self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]), np.array([]).reshape([0, 2]),
+                                            np.array([]).astype(float)]  # rl for matching
+
+        wait_requests = deepcopy(self.wait_requests)
+        driver_table = deepcopy(self.driver_table)
+
+        matched_pair_actual_indexs, matched_itinerary = order_dispatch(wait_requests, driver_table,
+                                                                       self.maximal_pickup_distance,
+                                                                       self.dispatch_method, self.method)
+
+        # Update matched and waiting requests
+        df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
+            matched_pair_actual_indexs, matched_itinerary)
+
+        # Update record
+        # if isinstance(self.record, str):  # Initialize record if it's a string
+        #     self.record = df_new_matched_requests
+        # else:
+        #     self.record = pd.concat([self.record, df_new_matched_requests], axis=0, ignore_index=True)
+
+        # Update matched requests count
+        self.matched_requests_num += len(df_new_matched_requests)
+
+        # Process matching results
+        # Calculate total reward
+        self.total_reward += self.get_matching_reward(df_new_matched_requests)
+
+        # 在这里对完成匹配的数据进行聚合分析
+        if len(df_new_matched_requests) > 0:
+            self.evaluate_df = calculate_evaluate_table(self.grid_num, wait_requests, df_new_matched_requests)
+            self.evaluate_table[self.current_step] = self.evaluate_df.values
+        else:
+            # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
+            self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
+
+        # Andrew: Update on-trip driver count and occupancy rate
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
+        self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 2].shape[0]
+        self.occupancy_rate = self.cumulative_on_trip_driver_num / (
+                (1 + self.current_step) * self.driver_table.shape[0])
+
+        # Update matched and waiting requests if not end of episode
+        if self.end_of_episode == 0:
+            self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0).reset_index(
+                drop=True)
+            self.wait_requests = df_update_wait_requests.reset_index(drop=True)
+            # Bootstrap new orders
+            self.step_bootstrap_new_orders(self.matching_agent)
+
+        # reposition
+        if self.rl_mode == 'reposition':
+            self.repo_driver(self.matching_agent)
+
+        # 这里还有一类transition就是没有match到，也没有到repo时间的司机
+        # 也作为idle transitions
+        # idle_driver = self.driver_table.loc[driver_table.index[self.driver_table.status == 0]]
+        # state_array = np.vstack([self.time+np.zeros(idle_driver.shape[0]), idle_driver['grid_id'].values]).T
+        # action_array = np.zeros(len(driver_table.index))
+        # next_state_array = np.vstack([self.time+self.delta_t+np.zeros(idle_driver.shape[0]), idle_driver['grid_id'].values]).T
+        # reward_array = np.zeros(len(driver_table.index))
+        # self.dispatch_transitions_buffer[0] = np.concatenate(
+        #     [self.dispatch_transitions_buffer[0], state_array])
+        # self.dispatch_transitions_buffer[1] = np.concatenate(
+        #     [self.dispatch_transitions_buffer[1], action_array])
+        # self.dispatch_transitions_buffer[2] = np.concatenate(
+        #     [self.dispatch_transitions_buffer[2], next_state_array])
+        # # 将已匹配订单的reward_array与buffer连接
+        # self.dispatch_transitions_buffer[3] = np.concatenate(
+        #     [self.dispatch_transitions_buffer[3], reward_array])
+
+        self.update_state()
+        self.driver_online_offline_update()
+        self.update_time()
+
+        if self.dispatch_transitions_buffer[0].shape[0] > 0:
+            self.matching_agent.perceive(self.dispatch_transitions_buffer)  # Andrew
+
+    # hong-yang step train for dynamic matching method selection
+    # =========================================================================
+    # RL 训练步骤 - 匹配方法选择 (RL Training Step - Matching Method) - [Dynamic Matching]
+    # =========================================================================
+    def rl_step_train_matching_method(self):  # rl for matching method selection
+        """
+        执行一步 RL 训练 (用于动态匹配方法选择)
+
+        用于 dynamic_matching 模式:
+        - 在决策时刻选择匹配方法
+        - 执行订单匹配
+        - 更新全局状态和奖励
+
+        Returns:
+            None
+        """
+        """
+        此函数现在处理两种情况：
+        1. Agent 决策步 (例如 step % update_freq == 0): 存储上一个15分钟的经验, 并获取新动作。
+        2. 仿真执行步 (其他 step):      使用已持有的动作执行1分钟仿真, 并累积奖励。
+        """
+
+        # --- 1. Agent 决策与数据存储 ---
+        if self.time % (self.decision_freq * 60) == 0:
+
+            # --- A. 存储上一个 15 分钟的 (S_k, A_k, R_sum, S_k+1) ---
+            # (跳过第一次, 因为那时还没有 S_k)
+            if self.state_at_decision_time is not None:
+                s0 = self.state_at_decision_time
+                # 获取 S_k+1 (当前状态)
+                s1 = self.get_global_state()
+
+                reward = (self.reward_by_grid_df / 100).values.tolist()
+
+                # 存储15分钟的聚合数据
+                self.dynamic_matching_agent.buffer.push(s0,
+                                                        self.held_action_tuple[0],  # a
+                                                        self.held_action_tuple[1],  # log_a
+                                                        reward,
+                                                        s1,
+                                                        [1 if self.time == self.t_end else 0] * self.grid_num)
+                if not self.dynamic_matching_agent.is_scaler_fitted:
+                    self.dynamic_matching_agent.warmup_states.append(s0)
+
+                # 检查agent是否更新
+                if len(self.dynamic_matching_agent.buffer) >= self.dynamic_matching_agent.batch_size:
+                    self.dynamic_matching_agent.update()
+
+                if self.time == self.t_end:
+                    return
+
+            # --- B. 为下一个 15 分钟获取新动作 A_k+1 ---
+            # 获取 S_k (当前状态)
+            matching_state_current = self.get_global_state()
+
+            # 存储 S_k, 用于 15 分钟后
+            self.state_at_decision_time = matching_state_current
+
+            # 调用 Agent 获取新动作，并“持有”它
+            actions, log_probs = self.dynamic_matching_agent.select_actions(matching_state_current, deterministic=False)
+            self.held_action_tuple = (actions, log_probs)
+
+            # 重置 5 分钟的奖励累加器
+            self.reward_by_grid_df = pd.Series(data=np.zeros(self.grid_num))
+
+        # Step 1: order dispatching
+        wait_requests = deepcopy(self.wait_requests)
+        # print("--------------------wait_requests----------------:",wait_requests.shape[0])
+        driver_table = deepcopy(self.driver_table)
+
+        # use RL's decision as the input
+        matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
+                                                                        self.maximal_pickup_distance,
+                                                                        self.dispatch_method, self.method)
+        # Step 2: driver/passenger reaction after dispatching
+        df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
+            matched_pair_actual_indexes, matched_itinerary)
+        if isinstance(self.record, str):
+            self.record = df_new_matched_requests
+        else:
+            dfs_to_concat = [df for df in (self.record, df_new_matched_requests)
+                             if df is not None and not df.empty]
+            if dfs_to_concat:
+                self.record = pd.concat(dfs_to_concat, ignore_index=True)
+            # self.record = pd.concat([self.record, df_new_matched_requests], axis=0, ignore_index=True)
+
+        if len(df_new_matched_requests) != 0:
+            self.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
+        else:
+            self.total_reward += 0
+            # Update matched requests count
+
+        # RL agent reward
+        matched_requests_by_grid = df_new_matched_requests.groupby('origin_grid_id')['designed_reward'].sum()
+        matched_requests_li = matched_requests_by_grid.reindex([i for i in range(self.grid_num)], fill_value=0)
+        self.total_reward_by_grid += matched_requests_li  # 不清零 作为平台的累计收益
+        self.reward_by_grid_df += matched_requests_li
+
+        self.matched_requests_num += len(df_new_matched_requests)
+
+        if self.end_of_episode == 0:
+            self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0)
+            self.matched_requests = self.matched_requests.reset_index(drop=True)
+            self.wait_requests = df_update_wait_requests.reset_index(drop=True)
+
+            # Step 3: bootstrap new orders
+            # self.matching_agent是之前训练好的agent 用于加载未来区域价值
+            # 跟正在训练的rl agent不是一个,是一个训练好的给未来区域打分的agent
+            # 根据这个分数作为order-driver匹配的权重
+            # 也就是在这里，会根据目前正在训练的agent给出的动作，为各个区域选则合适的打分机制
+            self.step_bootstrap_new_orders(self.matching_agent)
+
+        # Step 5: update next state for drivers
+        self.update_state()
+        # Step 6： online/offline update()
+        self.driver_online_offline_update()
+        # Step 7: update time
+        self.update_time()
+
+    # =========================================================================
+    # 获取全局状态 (Get Global State) - [Dynamic Matching]
+    # =========================================================================
+    def get_global_state(self):
+        """
+        获取全局状态向量
+
+        用于 Dynamic Matching 的状态表示，包含:
+        - 各网格的订单起点分布
+        - 各网格的空闲司机数量
+        - 当前时间特征
+
+        Returns:
+            np.ndarray: 全局状态向量，shape 为 (state_dim,)
+        """
+
+        grid_num = self.grid_num
+        grid_ids = list(range(grid_num))
+
+        # --- 1. 订单起点分布 ---
+        wait_requests_by_grid = self.wait_requests.groupby('origin_grid_id')['origin_grid_id'].count()
+        wait_requests_vector = wait_requests_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
+
+        # --- 2. 订单终点分布 ---
+        # wait_requests_dest_by_grid = self.wait_requests.groupby('dest_grid_id')['dest_grid_id'].count()
+        # wait_requests_dest_vector = wait_requests_dest_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
+        #
+        # # --- 2. 订单行程时间分布 (平均值) ---
+        # # 新版fill value改成了0。 原来是999
+        # wait_requests_time_by_grid = self.wait_requests.groupby('origin_grid_id')['trip_time'].mean().astype(float)
+        # wait_requests_time_vector = wait_requests_time_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
+
+        # --- 3. 空闲司机分布 ---
+        con_ready_to_dispatch = (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)
+        idle_driver_table = self.driver_table[con_ready_to_dispatch]
+        idle_driver_by_grid = idle_driver_table.groupby('grid_id')['grid_id'].count()
+        idle_driver_vector = idle_driver_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
+
+        # --- 4. 正在配送司机分布 ---
+        occupied_driver_table = self.driver_table[self.driver_table['status'] == 1]
+        occupied_driver_by_grid = occupied_driver_table.groupby('target_grid_id')['target_grid_id'].count()
+        occupied_driver_vector = occupied_driver_by_grid.reindex(grid_ids, fill_value=0).values.reshape(-1, 1)
+
+        # --- 4. 拼接为 [grid_num, 5] 的状态矩阵 ---
+        state_matrix = np.concatenate([
+            wait_requests_vector,  # 订单数
+            # wait_requests_dest_vector,
+            # wait_requests_time_vector,
+            idle_driver_vector,  # 空车数
+            occupied_driver_vector  # 配送车数
+        ], axis=1)  # shape: [35, 5]
+
+        time_scalar = self.current_step
+        time_sin = np.sin(2 * np.pi * time_scalar / 1440)
+        time_cos = np.cos(2 * np.pi * time_scalar / 1440)
+        time_encoding = np.array([time_sin, time_cos])
+
+        # --- 6. 展平为一维状态向量 + 时间编码 ---
+        state_vector = state_matrix.flatten()  # shape: [175]
+        final_state = np.concatenate([state_vector, time_encoding])  # shape: [177]
+
+        return final_state
+
+    # =========================================================================
+    # V_ope 状态编码 (V_ope State Encoding)
+    # =========================================================================
+    def _encode_state_for_vope(self, grid_id, time_slice, demand_by_grid):
+        """
+        为 V_ope 网络编码状态
+
+        Args:
+            grid_id: 网格ID
+            time_slice: 时间片
+            demand_by_grid: 各网格的需求数数组
+
+        Returns:
+            state: 状态特征向量 (6维)
+        """
+        grid_num = self.grid_num
+        max_time_slice = int(300 / self.decision_freq)
+
+        # 归一化
+        grid_id_norm = grid_id / grid_num
+        time_slice_norm = time_slice / max_time_slice if max_time_slice > 0 else 0
+
+        # 小时 (从18:00开始)
+        hour = (time_slice * self.decision_freq * 60 + 18000) / 3600
+        hour = hour % 24
+        hour_sin = np.sin(2 * np.pi * hour / 24)
+        hour_cos = np.cos(2 * np.pi * hour / 24)
+
+        # 需求特征
+        demand_now = demand_by_grid[grid_id] if grid_id < len(demand_by_grid) else 0
+        # 历史需求简化：用当前需求代替
+        demand_hist = demand_now
+
+        state = [
+            grid_id_norm,
+            time_slice_norm,
+            hour_sin,
+            hour_cos,
+            demand_now / 100,
+            demand_hist / 100,
+        ]
+
+        return state
