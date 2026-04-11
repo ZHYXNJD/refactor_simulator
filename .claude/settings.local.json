@@ -1,0 +1,39 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import pickle; f=open\\(''my_data/cleaned_orders_pickle/orders_grid35_2015-05-05.pkl'',''rb''\\); d=pickle.load\\(f\\); print\\(type\\(d\\)\\); print\\(list\\(d.items\\(\\)\\)[:5] if isinstance\\(d,dict\\) else d[:5]\\)\")",
+      "Bash(E:Anacondaenvstrans_simulator_torchpython.exe dynamic_repo/main_repo_windows.py)",
+      "Bash(where python:*)",
+      "Bash(/e/Anaconda/python.exe dynamic_repo/main_repo_windows.py)",
+      "Bash(timeout 20 /e/Anaconda/python.exe -c \":*)",
+      "Bash(grep -rn \"simulator\\\\.\" dynamic_matching/*.py)",
+      "Bash(timeout 30 /e/Anaconda/python.exe -c \":*)",
+      "Bash(/e/Anaconda/python.exe -c \":*)",
+      "Bash(xxd)",
+      "Bash(cp simulator_trainer.py simulator_trainer_backup.py)",
+      "Bash(cp simulator_trainer_fixed.py simulator_trainer.py)",
+      "Bash(cd:*)",
+      "Bash(python -c \"import simulator_trainer\")",
+      "Bash(python -c \"with open\\(''simulator_trainer.py'', ''rb''\\) as f: content = f.read\\(\\); print\\(''Length:'', len\\(content\\)\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(python main_repo_windows.py)",
+      "Bash(python dynamic_repo/main_repo_windows.py)",
+      "Read(//c/Users/Administrator/.claude/**)",
+      "Bash(rm simulator_trainer_backup.py simulator_trainer_fixed.py)",
+      "Bash(ls *.py)",
+      "Bash(grep -v \"^\\\\.$\")",
+      "Bash(mv simulator_env.py src/env/)",
+      "Bash(mv simulator_pattern.py src/env/)",
+      "Bash(mv simulator_trainer.py src/env/)",
+      "Bash(mv utilities.py src/utils/)",
+      "Bash(mv dispatch_alg.py src/utils/)",
+      "Bash(mv value_estimatior/ src/agents/)",
+      "Bash(mv value_estimatior/*.py src/agents/)",
+      "Bash(mv value_estimatior sarsa)",
+      "Bash(mv sarsa/*.py .)",
+      "Bash(rm -rf sarsa)",
+      "Bash(gh auth:*)",
+      "Bash(gh repo:*)"
+    ]
+  }
+}

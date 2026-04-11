@@ -2,10 +2,10 @@
 <project version="4">
   <component name="WebServers">
     <option name="servers">
-      <webServer id="3c9fb768-4c0a-49d3-97af-9e02cda72edd" name="hy">
-        <fileTransfer accessType="SFTP" sshConfigId="f0792169-fb78-4d48-8c6a-7733fd0326af" sshConfig="root@root@connect.nmb1.seetacloud.com:35786 password">
+      <webServer id="df922241-a060-468d-bee4-e5b84c2bae5b" name="hy">
+        <fileTransfer accessType="SFTP" host="root@connect.nmb1.seetacloud.com" port="39122" sshConfigId="6adde18b-72c2-4075-b01e-5911ba4f5c3c" sshConfig="root@root@connect.nmb1.seetacloud.com:39122 password">
           <advancedOptions>
-            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
           </advancedOptions>
         </fileTransfer>
       </webServer>

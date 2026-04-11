@@ -9,7 +9,7 @@
           </mappings>
         </serverdata>
       </paths>
-      <paths name="root@root@connect.nmb1.seetacloud.com:35786 password">
+      <paths name="root@root@connect.nmb1.seetacloud.com:39122 password">
         <serverdata>
           <mappings>
             <mapping deploy="/Transportation_Simulator" local="$PROJECT_DIR$" />

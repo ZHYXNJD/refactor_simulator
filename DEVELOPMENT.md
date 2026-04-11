@@ -32,19 +32,28 @@
 
 ## 开发任务
 
-### Phase 1: V(s) 离线预训练 [待开始]
+### Phase 1: V(s) 离线预训练 [已完成]
 
-**目标**: 用需求数据训练 V_ope
+**目标**: 用需求数据训练 V_ope ✅
 
-**方案**:
-1. 提取订单的 (origin_grid, time) → future_reward
-2. 用监督学习训练 V(s)
-3. 作为 Value Function 的初始化
+**已实现**:
+1. `src/agents/value_estimator.py` - 离线V_ope训练代码
+2. 数据加载和预处理
+3. 网络架构: Input(6) → FC(128) → FC(64) → FC(1)
+4. 训练了 freq=5 模型: `vope_freq5.pth`
 
-**待确认**:
-- [ ] 状态特征设计
-- [ ] 网络架构
-- [ ] 训练数据准备
+**状态特征 (6维)**:
+- grid_id_norm: 0-1
+- time_slice_norm: 0-1
+- hour_sin, hour_cos: 24h周期编码
+- demand_now, demand_hist: 需求特征
+
+**已验证**:
+- [x] 模型推理正确
+- [x] V值输出合理 (7-8左右)
+
+**待完成**:
+- [x] freq=5, 10, 20, 30 模型训练 (全部完成)
 
 ### Phase 2: 在线持续更新 [待定]
 
