@@ -19,7 +19,7 @@ def repo_value_estimate(grid_num,decision_freq,experiment_mode,rl_mode,method,re
     experiment_mode: train_single_agent_repo, train_dgw_repo, test_dgw_repo,test_single_agent_repo,test_heuristic_repo
     rl_mode: single_agent_repo, dgw_repo,reposition
     method (repo method): random, greedy1,greedy2, greedy3, single_rl, single_rl_global,dgw
-    # random_repo / demand_greedy / ratio_greedy / rl_value
+    # random_repo / demand_greedy / ratio_greedy / sarsa_value
     date: ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08','2015-05-11'] # train date
     date: ['2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15','2015-05-18'] # test date
     '''
@@ -97,4 +97,4 @@ if __name__ == '__main__':
     with open(driver_path, 'rb') as f:
         DRIVER_INFO = pickle.load(f)
 
-    repo_value_estimate(grid_num=263, decision_freq=10, rl_mode='reposition', method='d',experiment_mode='train',repo_mode='rl_value_greedy')
+    repo_value_estimate(grid_num=263, decision_freq=10, rl_mode='reposition', method='d',experiment_mode='train',repo_mode='sarsa_value_greedy')

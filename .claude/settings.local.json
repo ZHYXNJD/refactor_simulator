@@ -33,7 +33,12 @@
       "Bash(mv sarsa/*.py .)",
       "Bash(rm -rf sarsa)",
       "Bash(gh auth:*)",
-      "Bash(gh repo:*)"
+      "Bash(gh repo:*)",
+      "Bash(tasklist)",
+      "Bash(find D:/project/Transportation_Simulator/test_result -name *.csv -o -name *.json -o -name *.npy)",
+      "Bash(find D:/project/Transportation_Simulator/test_result -name *vope* -type d)",
+      "Bash(find D:/project/Transportation_Simulator/test_result/vope_compare/ -name heatmap_*.csv)",
+      "Bash(git add:*)"
     ]
   }
 }
