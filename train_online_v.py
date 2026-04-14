@@ -88,7 +88,7 @@ def train_online_vope(repo_mode='online_vope_greedy', num_epochs=50, save_path=M
         decision_freq=DECISION_FREQ,
         order_sample_ratio=1,
         driver_sample_ratio=1,
-        experiment_mode='train_single_agent_repo',
+        experiment_mode='train_value',
         rl_mode='reposition',
         method='d',
         repo_mode=repo_mode,

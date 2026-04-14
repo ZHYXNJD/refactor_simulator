@@ -209,7 +209,7 @@ from value_estimatior import SarsaAgent
 ### 测试验证
 
 ```bash
-$ python dynamic_repo/main_repo_windows.py
+$ python dynamic_repo/train_sarsa.py
 # 运行成功
 ```
 

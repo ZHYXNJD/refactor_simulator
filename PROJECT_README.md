@@ -11,7 +11,7 @@ Transportation_Simulator/
 │   │   ├── simulator_env.py       # Simulator 类 (核心)
 │   │   ├── simulator_trainer.py   # SimulatorTrainer (训练控制)
 │   │   └── simulator_pattern.py   # 仿真模式
-│   ├── agents/                   # RL Agents
+│   ├── agents/                   # score Agents
 │   │   ├── sarsa.py              # SARSA Agent
 │   │   ├── Q_learning.py         # Q-Learning Agent
 │   │   └── value_estimator.py    # V_ope 价值网络
@@ -22,9 +22,9 @@ Transportation_Simulator/
 │       └── repo_util.py          # 调度工具函数
 │
 ├── dynamic_repo/                 # 调度训练入口
-│   └── main_repo_windows.py
+│   └──
 │
-├── dynamic_matching/             # 动态匹配模块
+├── dynamic_matching/             # 动态匹配模块(暂时可忽略)
 │   ├── dynamic_matching_agent/
 │   │   ├── idqn.py
 │   │   └── maddpd_discreate.py
@@ -32,16 +32,17 @@ Transportation_Simulator/
 │
 ├── train_v1d3.py                 # V1D3 训练脚本
 ├── train_online_v.py             # 在线 V_ope 训练脚本
+├── train_sarsa.py                # 在线 sarsa 训练脚本
 ├── METHOD_DESIGN.md              # 方法设计文档
 ├── DEVELOPMENT.md                # 开发进度记录
-└── REFACTORING.md               # 重构记录
+└── REFACTORING.md                # 重构记录
 ```
 
 ## 快速开始
 
 ### 调度训练
 ```bash
-python dynamic_repo/main_repo_windows.py
+python train_sarsa.py
 ```
 
 ### V1D3 训练
@@ -55,11 +56,11 @@ python train_v1d3.py --epochs 50 --test
 
 仿真环境核心类，提供三种训练模式：
 
-| 方法 | 模式 | 用途 |
-|------|------|------|
-| `rl_step()` | - | 基础仿真步 |
-| `rl_step_train()` | Repo/Matching | 强化学习训练 |
-| `rl_step_train_matching_method()` | Dynamic Matching | 动态匹配训练 |
+| 方法 | 模式 | 用途            |
+|------|------|---------------|
+| `rl_step()` | - | 基础仿真步         |
+| `rl_step_train()` | Repo/Matching | 基于价值的强化学习训练   |
+| `rl_step_train_matching_method()` | Dynamic Matching | 动态匹配训练（暂时可忽略） |
 
 ### SimulatorTrainer (src/env/simulator_trainer.py)
 
@@ -76,28 +77,27 @@ python train_v1d3.py --epochs 50 --test
 
 价值函数估计器，支持多种方法：
 
-| 类 | 状态维度 | 训练方式 |
-|----|----------|----------|
-| `ValueNetwork` | 6D/10D | 监督学习 |
-| `ValueNetwork2D` | 2D | TD 学习 |
-| `OnlineVopeModel` | 6D/10D | 在线 TD |
+| 类 | 状态维度   | 训练方式 |
+|----|--------|----------|
+| `ValueNetwork` | 10D    | 监督学习 |
+| `ValueNetwork2D` | 2D     | 监督学习 |
+| `OnlineVopeModel` | 10D/2D | 在线 TD |
 
-### SARSA Agent (src/agents/sarsa.py)
-
-SARSA 强化学习代理，用于车辆调度 (reposition)。
 
 ## 调度模式 (repo_mode)
 
-| 模式 | 说明 |
-|------|------|
-| `sarsa_value_greedy` | SARSA 表格 (贪婪) |
-| `sarsa_value_logit` | SARSA 表格 (概率) |
-| `vope_greedy` | 离线 V_ope (贪婪) |
-| `vope_logit` | 离线 V_ope (概率) |
-| `online_vope_greedy` | 在线 V_ope (贪婪) |
-| `online_vope_logit` | 在线 V_ope (概率) |
-| `demand_greedy` | 需求贪婪基线 |
-| `random_repo` | 随机调度基线 |
+| 模式                   | 说明               |
+|----------------------|------------------|
+| `sarsa_value_greedy` | SARSA 表格 (贪婪)    |
+| `sarsa_value_logit`  | SARSA 表格 (概率)    |
+| `vope_greedy`        | 离线 V_ope (贪婪)    |
+| `vope_logit`         | 离线 V_ope (概率)    |
+| `online_vope_greedy` | 在线 V_ope (贪婪)    |
+| `online_vope_logit`  | 在线 V_ope (概率)    |
+| `v1d3_greedy`        | 在线V+离线V_ope (贪婪) |
+| `v1d3_logit`  | 在线V+离线V_ope (概率) |
+| `demand_greedy`      | 需求贪婪基线           |
+| `random_repo`        | 随机调度基线           |
 
 详见 [METHOD_DESIGN.md](./METHOD_DESIGN.md)。
 
@@ -122,9 +122,9 @@ from value_estimatior import SarsaAgent
 本项目实现了四种价值函数估计方法：
 
 1. **SARSA**: 表格方法，2D 状态 (grid_id, time_slice)
-2. **离线 V_ope**: 监督学习，6D/10D 状态
-3. **在线 V_ope**: 在线 TD 学习，6D/10D 状态
-4. **V1D3**: 离线初始化 + 在线 TD，2D 状态
+2. **离线 V_ope**: 监督学习，6D/2D 状态
+3. **在线 V_ope**: 在线 TD 学习，10D/2D 状态
+4. **V1D3**: 离线初始化 + 在线 TD，10D/2D 状态
 
 详见 [METHOD_DESIGN.md](./METHOD_DESIGN.md)。
 

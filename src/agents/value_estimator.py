@@ -470,24 +470,33 @@ def train_value_network(decision_freq, hidden_dim=128, epochs=100, batch_size=64
 
     print(f"\n=== Training Offline V_ope for decision_freq={decision_freq} ===")
 
-    # 加载数据
-    orders_df = load_order_data(TRAIN_DATES)
-    if orders_df.empty:
-        print(f"No data for decision_freq={decision_freq}")
-        return None, None, None
-
-    states, targets = build_dataset(orders_df, decision_freq)
-    if len(states) == 0:
-        print(f"No samples for decision_freq={decision_freq}")
-        return None, None, None
-
-    # 保存数据集
     dataset_path = f'my_data/vope_dataset_freq{decision_freq}.pkl'
     import pickle
-    with open(dataset_path, 'wb') as f:
-        pickle.dump({'states': states, 'targets': targets, 'train_dates': TRAIN_DATES}, f)
-    print(f"Dataset saved to {dataset_path}")
-    print(f"Dataset: {len(states)} samples, state_dim={states.shape[1]}")
+    try:
+        with open(dataset_path, 'rb') as f:
+            data = pickle.load(f)
+            states = data['states']
+            targets = data['targets']
+    except FileNotFoundError:
+
+        # 加载数据
+        orders_df = load_order_data(TRAIN_DATES)
+        if orders_df.empty:
+            print(f"No data for decision_freq={decision_freq}")
+            return None, None, None
+
+        states, targets = build_dataset(orders_df, decision_freq)
+        if len(states) == 0:
+            print(f"No samples for decision_freq={decision_freq}")
+            return None, None, None
+
+        # 保存数据集
+        dataset_path = f'my_data/vope_dataset_freq{decision_freq}.pkl'
+        import pickle
+        with open(dataset_path, 'wb') as f:
+            pickle.dump({'states': states, 'targets': targets, 'train_dates': TRAIN_DATES}, f)
+        print(f"Dataset saved to {dataset_path}")
+        print(f"Dataset: {len(states)} samples, state_dim={states.shape[1]}")
 
     # 归一化
     scaler = StandardScaler()
@@ -643,24 +652,31 @@ def train_value_network_2d(decision_freq, hidden_dim=128, epochs=100, batch_size
 
     print(f"\n=== Training Offline V_ope 2D for decision_freq={decision_freq} ===")
 
-    # 加载数据
-    orders_df = load_order_data(TRAIN_DATES)
-    if orders_df.empty:
-        print(f"No data for decision_freq={decision_freq}")
-        return None, None
-
-    states, targets = build_dataset_2d(orders_df, decision_freq)
-    if len(states) == 0:
-        print(f"No samples for decision_freq={decision_freq}")
-        return None, None
-
-    # 保存数据集
     dataset_path = f'my_data/vope_dataset_2d_freq{decision_freq}.pkl'
     import pickle
-    with open(dataset_path, 'wb') as f:
-        pickle.dump({'states': states, 'targets': targets, 'train_dates': TRAIN_DATES}, f)
-    print(f"Dataset saved to {dataset_path}")
-    print(f"Dataset: {len(states)} samples, state_dim=2")
+    try:
+        with open(dataset_path, 'rb') as f:
+            data = pickle.load(f)
+            states = data['states']
+            targets = data['targets']
+    except FileNotFoundError:
+        # 加载数据
+        orders_df = load_order_data(TRAIN_DATES)
+        if orders_df.empty:
+            print(f"No data for decision_freq={decision_freq}")
+            return None, None
+
+        states, targets = build_dataset_2d(orders_df, decision_freq)
+        if len(states) == 0:
+            print(f"No samples for decision_freq={decision_freq}")
+            return None, None
+
+        # 保存数据集
+        import pickle
+        with open(dataset_path, 'wb') as f:
+            pickle.dump({'states': states, 'targets': targets, 'train_dates': TRAIN_DATES}, f)
+        print(f"Dataset saved to {dataset_path}")
+        print(f"Dataset: {len(states)} samples, state_dim=2")
 
     max_time_slice = int(300 / decision_freq)
 
@@ -753,6 +769,7 @@ def test_inference(model, scaler):
 
 def main():
     """主函数"""
+    # offline V_ope 6维
     for freq in DECISION_FREQS:
         print(f"\n{'='*50}")
         print(f"Training V_ope for decision_freq={freq}")
@@ -785,6 +802,36 @@ def main():
         print("\nTesting inference:")
         test_inference(model, scaler)
 
+def main2d():
+    # offline V_ope 2维
+    for freq in DECISION_FREQS:
+        print(f"\n{'=' * 50}")
+        print(f"Training V_ope (2D) for decision_freq={freq}")
+        print(f"{'=' * 50}")
+
+        model, history = train_value_network_2d(
+            decision_freq=freq,
+            hidden_dim=128,
+            epochs=500,
+            batch_size=64
+        )
+
+        if model is None:
+            continue
+
+        save_path = os.path.join(OUTPUT_DIR, f'vope_2d_freq{freq}.pth')
+        torch.save({
+            'model': model.state_dict(),
+            'config': {
+                'decision_freq': freq,
+                'grid_num': GRID_NUM,
+                'max_time_slice': int(300 / freq),
+                'hidden_dim': 128,
+                'reward_type': 'raw'
+            }
+        }, save_path)
+        print(f"Model saved to {save_path}")
 
 if __name__ == '__main__':
-    main()
+    # main()
+    main2d()
