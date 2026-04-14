@@ -13,12 +13,8 @@
 Author: 项目团队
 """
 
-from collections import defaultdict
-from copy import deepcopy
 import numpy as np
-import pandas as pd
 import os
-import torch
 from dynamic_matching.dynamic_matching_agent.maddpd_discreate import *
 from src.repos.repo_util import get_centroid_coordinates, get_three_hop_neighbors
 from src.env.simulator_pattern import SimulatorPattern
@@ -34,8 +30,8 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # 核心仿真环境类，提供统一的 RL 环境接口
 #
 # 使用方式:
-#   1. Repo 训练: 创建 Simulator(rl_mode='reposition', matching_agent=SarsaAgent)
-#   2. Matching 训练: 创建 Simulator(rl_mode='matching', matching_agent=agent)
+#   1. Repo 训练: 创建 Simulator(rl_mode='reposition', score_agent=agent)
+#   2. Matching 训练: 创建 Simulator(rl_mode='matching', score_agent=agent)
 #   3. Dynamic Matching: 创建 Simulator(rl_mode='dynamic_matching', dynamic_matching_agent=MADDPG)
 #
 # 关键方法:
@@ -49,13 +45,13 @@ class Simulator:
     # =========================================================================
     # 初始化 (Initialization)
     # =========================================================================
-    def __init__(self, matching_agent, reposition_agent=None, dynamic_matching_agent=None,
+    def __init__(self, score_agent, dynamic_matching_agent=None,
                  dynamic_reposition_agent=None, mapping_dict=None, road_network=None, **kwargs):
         """
         初始化仿真环境
 
         Args:
-            matching_agent: 匹配 Agent (用于价值估计，通常是 SarsaAgent)
+            score_agent: 用于价值估计，通常是 SarsaAgent (在线学习agent都可)
             reposition_agent: 重定位 Agent (预留)
             dynamic_matching_agent: 动态匹配 Agent (MADDPG/IDQN)
             dynamic_reposition_agent: 动态重定位 Agent (预留)
@@ -86,8 +82,8 @@ class Simulator:
         self.rl_mode = kwargs.get('rl_mode', 'dynamic_matching')
 
         # RL agents(RL module)
-        self.matching_agent = matching_agent
-        self.reposition_agent = reposition_agent
+        self.score_agent = score_agent
+        # self.reposition_agent = reposition_agent
         # self.pricing_agent = pricing_agent
 
         # register dynamic matching agent
@@ -143,67 +139,180 @@ class Simulator:
         self.max_idle_time = 600  # 10 min
 
         if self.rl_mode == 'reposition':
-            self.reposition_flag = True
-            self.repo_mode = kwargs.get('repo_mode',
-                                        'random_repo')  # random_repo / demand_greedy / ratio_greedy / rl_value
+            self.repo_mode = kwargs.get('repo_mode','random_repo')
             self.eligible_time_for_reposition = 300
-            self.reposition_method = ''
-            # self.repo2any = self.reposition_agent.repo2any
             self.df_neighbor_centroid = get_centroid_coordinates()
-            # _, self.df_neighbor_centroid = get_available_directions(grid_num=self.grid_num, repo2any=True)
-            # self.df_neighbor_centroid =self.reposition_agent.df_neighbor_centroid
-            # self.transitions = [[] for i in range(5)]
+            self.vope_model = None
+            self.online_vope_model = None
+            self.v1d3_model = None
 
-        self.score_discount_rate = kwargs.get('score_discount_rate', self.matching_agent.discount_rate)
+        self.score_discount_rate = kwargs.get('score_discount_rate', self.score_agent.discount_rate)
 
         # V_ope 模型加载 (用于 reposition)
-        self.vope_model = None
-        self.vope_scaler = None
-        self.vope_hidden_dim = 64  # 默认值，会从checkpoint覆盖
-        vope_path = kwargs.get('vope_model_path', None)
-        if vope_path and os.path.exists(vope_path):
-            try:
-                checkpoint = torch.load(vope_path, map_location='cpu', weights_only=False)
-                hidden_dim = checkpoint.get('config', {}).get('hidden_dim', 64)
-                self.vope_hidden_dim = hidden_dim
-                self.vope_model = ValueNetwork(state_dim=6, hidden_dim=hidden_dim)
-                self.vope_model.load_state_dict(checkpoint['model'])
-                self.vope_model.eval()
-                self.vope_scaler = checkpoint['scaler']
-                print(f"V_ope model loaded from {vope_path} (hidden_dim={hidden_dim})")
-            except Exception as e:
-                print(f"Failed to load V_ope model: {e}")
+        # 离线模型 一定要加载
+        # V_ope有6D和2D的，这里兼容两种情况
+        if self.repo_mode in ['vope_greedy', 'vope_logit']:
+            self.vope_model = None
+            self.vope_scaler = None
+            self.vope_hidden_dim = 64  # 默认值，会从checkpoint覆盖
+            self.vope_state_dim = 6    # 默认6D，会从checkpoint覆盖
+            vope_path = kwargs.get('vope_model_path', None)
+            if vope_path and os.path.exists(vope_path):
+                try:
+                    checkpoint = torch.load(vope_path, map_location='cpu', weights_only=False)
+                    config = checkpoint.get('config', {})
+                    hidden_dim = config.get('hidden_dim', 64)
+                    # 从模型权重推断state_dim (fc1.weight: [hidden_dim, state_dim])
+                    state_dim = checkpoint['model']['fc1.weight'].shape[1]
+                    self.vope_hidden_dim = hidden_dim
+                    self.vope_state_dim = state_dim
+                    self.vope_model = ValueNetwork(state_dim=state_dim, hidden_dim=hidden_dim)
+                    self.vope_model.load_state_dict(checkpoint['model'])
+                    self.vope_model.eval()
+                    if 'scaler' in checkpoint:
+                        self.vope_scaler = checkpoint['scaler']
+                    print(f"V_ope model loaded from {vope_path} (state_dim={state_dim}, hidden_dim={hidden_dim})")
+                except Exception as e:
+                    print(f"Failed to load V_ope model: {e}")
+            self.score_agent = self.vope_model
 
-        # 在线 V_ope 模型 (用于 TD 更新学习)
-        self.online_vope_model = None
-        self.online_vope_learning_rate = kwargs.get('online_vope_lr', 0.001)
-        self.online_vope_discount = kwargs.get('online_vope_discount', 0.95)
-        online_vope_path = kwargs.get('online_vope_model_path', None)
-        if online_vope_path and os.path.exists(online_vope_path):
-            try:
-                from src.agents.value_estimator import ValueNetworkOnline
-                checkpoint = torch.load(online_vope_path, map_location='cpu', weights_only=False)
-                config = checkpoint.get('config', {})
-                self.online_vope_model = ValueNetworkOnline(
-                    state_dim=config.get('state_dim', 10),
-                    hidden_dim=config.get('hidden_dim', 128),
-                    learning_rate=config.get('learning_rate', 0.001),
-                    discount_rate=config.get('discount_rate', 0.95)
+        elif self.repo_mode in ['online_vope_greedy', 'online_vope_logit']:
+            # 在线 V_ope 模型 (用于 TD 更新学习)
+            # 支持10D版本和2D版本
+            self.online_vope_model = None
+            self.online_vope_learning_rate = kwargs.get('online_vope_lr', 0.001)
+            self.online_vope_discount = kwargs.get('online_vope_discount', 0.95)
+            self.online_vope_state_dim = kwargs.get('online_vope_state_dim', 10)
+            online_vope_path = kwargs.get('online_vope_model_path', None)
+            if online_vope_path and os.path.exists(online_vope_path):
+                try:
+                    checkpoint = torch.load(online_vope_path, map_location='cpu', weights_only=False)
+                    config = checkpoint.get('config', {})
+                    # 从模型权重推断state_dim
+                    if 'fc1.weight' in checkpoint['model']:
+                        loaded_state_dim = checkpoint['model']['fc1.weight'].shape[1]
+                    else:
+                        loaded_state_dim = config.get('state_dim', self.online_vope_state_dim)
+                    self.online_vope_state_dim = loaded_state_dim
+
+                    if loaded_state_dim == 2:
+                        from src.agents.value_estimator import ValueNetwork2D
+                        self.online_vope_model = ValueNetwork2D(
+                            grid_num=config.get('grid_num', self.grid_num),
+                            max_time_slice=config.get('max_time_slice', 30),
+                            hidden_dim=config.get('hidden_dim', 128),
+                            learning_rate=config.get('learning_rate', 0.001),
+                            discount_rate=config.get('discount_rate', 0.95)
+                        )
+                    else:
+                        from src.agents.value_estimator import ValueNetworkOnline
+                        self.online_vope_model = ValueNetworkOnline(
+                            state_dim=loaded_state_dim,
+                            hidden_dim=config.get('hidden_dim', 128),
+                            learning_rate=config.get('learning_rate', 0.001),
+                            discount_rate=config.get('discount_rate', 0.95)
+                        )
+                    self.online_vope_model.load_state_dict(checkpoint['model'])
+                    self.online_vope_model.optimizer.load_state_dict(checkpoint['optimizer'])
+                    print(f"Online V_ope model loaded from {online_vope_path} (state_dim={loaded_state_dim})")
+                except Exception as e:
+                    print(f"Failed to load Online V_ope model: {e}")
+            else:
+                # 如果没有预训练模型，创建新模型
+                if self.online_vope_state_dim == 2:
+                    from src.agents.value_estimator import ValueNetwork2D
+                    self.online_vope_model = ValueNetwork2D(
+                        grid_num=self.grid_num,
+                        max_time_slice=int(300 / self.decision_freq),
+                        hidden_dim=128,
+                        learning_rate=self.online_vope_learning_rate,
+                        discount_rate=self.online_vope_discount
+                    )
+                else:
+                    from src.agents.value_estimator import ValueNetworkOnline
+                    self.online_vope_model = ValueNetworkOnline(
+                        state_dim=10,
+                        hidden_dim=128,
+                        learning_rate=self.online_vope_learning_rate,
+                        discount_rate=self.online_vope_discount
+                    )
+
+            self.score_agent = self.online_vope_model
+
+        elif self.repo_mode in ['v1d3_greedy', 'v1d3_logit']:
+            # v1d3有两个版本:
+            # online V(10D) + offline V_ope(6D): 离线6D仅作参考，在线10D从零训练
+            # online V(2D) + offline V_ope(2D): 离线2D权重迁移到在线2D，然后TD微调
+            # 依赖于离线V_ope的传入来决定版本
+
+            # --- 1. 加载离线 V_ope 模型 ---
+            self.vope_model = None
+            self.vope_scaler = None
+            self.vope_hidden_dim = 64
+            self.vope_state_dim = 6
+            offline_state_dim = 6  # 默认假设6D
+
+            vope_path = kwargs.get('vope_model_path', None)
+            if vope_path and os.path.exists(vope_path):
+                try:
+                    checkpoint = torch.load(vope_path, map_location='cpu', weights_only=False)
+                    config = checkpoint.get('config', {})
+                    hidden_dim = config.get('hidden_dim', 64)
+                    # 从模型权重推断state_dim
+                    state_dim = checkpoint['model']['fc1.weight'].shape[1]
+                    self.vope_hidden_dim = hidden_dim
+                    self.vope_state_dim = state_dim
+                    offline_state_dim = state_dim
+                    self.vope_model = ValueNetwork(state_dim=state_dim, hidden_dim=hidden_dim)
+                    self.vope_model.load_state_dict(checkpoint['model'])
+                    self.vope_model.eval()
+                    if 'scaler' in checkpoint:
+                        self.vope_scaler = checkpoint['scaler']
+                    print(f"[V1D3] Offline V_ope loaded from {vope_path} (state_dim={state_dim})")
+                except Exception as e:
+                    print(f"[V1D3] Failed to load offline V_ope: {e}")
+
+            # --- 2. 创建在线模型 (V1D3 = 离线初始化 + 在线TD) ---
+            online_vope_lr = kwargs.get('online_vope_lr', 0.001)
+            online_vope_discount = kwargs.get('online_vope_discount', 0.95)
+            max_time_slice = int(300 / self.decision_freq)
+
+            if offline_state_dim == 2:
+                # 2D版本: 从离线V_ope(2D)迁移权重到在线V(2D)
+                from src.agents.value_estimator import ValueNetwork2D
+                self.v1d3_model = ValueNetwork2D(
+                    grid_num=self.grid_num,
+                    max_time_slice=max_time_slice,
+                    hidden_dim=self.vope_hidden_dim,
+                    learning_rate=online_vope_lr,
+                    discount_rate=online_vope_discount
                 )
-                self.online_vope_model.load_state_dict(checkpoint['model'])
-                self.online_vope_model.optimizer.load_state_dict(checkpoint['optimizer'])
-                print(f"Online V_ope model loaded from {online_vope_path}")
-            except Exception as e:
-                print(f"Failed to load Online V_ope model: {e}")
-        else:
-            # 如果没有预训练模型，创建新模型
-            from src.agents.value_estimator import ValueNetworkOnline
-            self.online_vope_model = ValueNetworkOnline(
-                state_dim=10,
-                hidden_dim=128,
-                learning_rate=self.online_vope_learning_rate,
-                discount_rate=self.online_vope_discount
-            )
+                # 迁移离线权重到在线模型
+                if self.vope_model is not None:
+                    self.v1d3_model.load_state_dict(self.vope_model.state_dict())
+                    print(f"[V1D3] 2D online model initialized from offline V_ope weights")
+                else:
+                    print(f"[V1D3] 2D online model created from scratch (no offline model)")
+            else:
+                # 10D版本: 离线V_ope(6D)仅作参考，在线V(10D)从零开始训练
+                from src.agents.value_estimator import ValueNetworkOnline
+                self.v1d3_model = ValueNetworkOnline(
+                    state_dim=10,
+                    hidden_dim=128,
+                    learning_rate=online_vope_lr,
+                    discount_rate=online_vope_discount
+                )
+                print(f"[V1D3] 10D online model created (offline V_ope is 6D, weights not transferred)")
+
+            # --- 3. 设置引用 ---
+            # online_vope_model 用于 _online_vope_td_update 的入口检查
+            self.online_vope_model = self.v1d3_model
+            self.score_agent = self.v1d3_model
+
+        elif self.repo_mode in ['sarsa_value_greedy','sarsa_value_logit']:
+            # online sarsa 也在此实现
+            # 只有一个2D版本
+            pass
 
         # get steps
         self.finish_run_step = int((self.t_end - self.t_initial) // self.delta_t)
@@ -280,7 +389,6 @@ class Simulator:
         self.driver_table['target_grid_id'] = self.driver_table['target_grid_id'].values.astype(int)
 
         if self.rl_mode == 'matching':
-            self.end_of_episode = 0  # rl for matching
             self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]),
                                                 np.array([]).reshape([0, 2]),
                                                 np.array([]).astype(float)]  # rl for matching
@@ -495,56 +603,40 @@ class Simulator:
                 matched_itinerary_df[con_remain]['itinerary_segment_dis_list'].map(
                     lambda x: x[0]).values / self.vehicle_speed * 3600
 
-            if self.repo_mode in ['rl_value_greedy','rl_value_logit']:
-                if self.rl_mode in ['matching', 'reposition'] and self.experiment_mode == 'train':
+            if self.rl_mode in ['matching', 'reposition'] and self.experiment_mode == 'train_value':
 
-                    state_array = np.vstack([self.time + np.zeros(new_matched_requests.shape[0]),
-                                             self.driver_table.loc[cor_driver[con_remain], 'grid_id'].values]).T
-                    action_array = np.ones(new_matched_requests.shape[0])
-                    next_state_array = np.vstack([new_matched_requests['t_end'].values,
-                                                  new_matched_requests['dest_grid_id'].values]).T
-                    if self.method in ['sarsa_travel_time', 'sarsa_travel_time_no_subway']:
-                        reward_array = 5000. - new_matched_requests['trip_time'].values
-                    elif self.method in ['sarsa_total_travel_time', 'sarsa_total_travel_time_no_subway']:
-                        reward_array = 5151. - new_matched_requests['pickup_time'].values - new_matched_requests[
-                            'trip_time'].values
-                    else:
-                        # reward_array = new_matched_requests['designed_reward'].values / 20
-                        original_rewards = new_matched_requests['designed_reward'].values
+                # 注意 这里仍然是二维的state设计
+                state_array = np.vstack([self.time + np.zeros(new_matched_requests.shape[0]),
+                                         self.driver_table.loc[cor_driver[con_remain], 'grid_id'].values]).T
+                action_array = np.ones(new_matched_requests.shape[0])
+                next_state_array = np.vstack([new_matched_requests['t_end'].values,
+                                              new_matched_requests['dest_grid_id'].values]).T
 
-                        # 空车的惩罚 (2025-04-12: 恢复用于在线 V_ope 学习)
-                        idle_drivers = self.driver_table[
-                            (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)].copy()
-                        grid_total_wait = idle_drivers.groupby('grid_id')['total_idle_time'].sum()
-                        grid_match_counts = new_matched_requests['origin_grid_id'].value_counts()
-                        grid_unit_penalty = grid_total_wait / (grid_match_counts + 1)  # +1 防止除零
-                        matched_grids = new_matched_requests['origin_grid_id'].values
-                        penalties = pd.Series(matched_grids).map(grid_unit_penalty).fillna(0).values
+                # reward_array = new_matched_requests['designed_reward'].values / 20
+                original_rewards = new_matched_requests['designed_reward'].values
 
-                        # penalty_alpha 控制惩罚权重
-                        penalty_alpha = self.penalty_alpha
-                        reward_array = original_rewards - (penalty_alpha * penalties)
+                # 空车的惩罚 (2025-04-12: 恢复用于在线 V_ope 学习)
+                idle_drivers = self.driver_table[
+                    (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)].copy()
+                grid_total_wait = idle_drivers.groupby('grid_id')['total_idle_time'].sum()
+                grid_match_counts = new_matched_requests['origin_grid_id'].value_counts()
+                grid_unit_penalty = grid_total_wait / (grid_match_counts + 1)  # +1 防止除零
+                matched_grids = new_matched_requests['origin_grid_id'].values
+                penalties = pd.Series(matched_grids).map(grid_unit_penalty).fillna(0).values
 
-                    self.dispatch_transitions_buffer[0] = np.concatenate(
-                        [self.dispatch_transitions_buffer[0], state_array])
-                    self.dispatch_transitions_buffer[1] = np.concatenate(
-                        [self.dispatch_transitions_buffer[1], action_array])
-                    self.dispatch_transitions_buffer[2] = np.concatenate(
-                        [self.dispatch_transitions_buffer[2], next_state_array])
-                    # 将已匹配订单的reward_array与buffer连接
-                    self.dispatch_transitions_buffer[3] = np.concatenate(
-                        [self.dispatch_transitions_buffer[3], reward_array])
-                    # 更新 Buffer
-                    # self.dispatch_transitions_buffer[3] = np.concatenate(
-                    #     [self.dispatch_transitions_buffer[3], final_rewards]
-                    # )
+                # penalty_alpha 控制惩罚权重
+                penalty_alpha = self.penalty_alpha
+                reward_array = original_rewards - (penalty_alpha * penalties)
 
-            # for j, index in enumerate(cor_driver[con_remain]):
-            #     driver_grid = self.driver_table.loc[index, 'grid_id']
-            #     order_id = self.driver_table.loc[index, 'matched_order_id']
-            #     origin_id = new_matched_requests.loc[new_matched_requests['order_id'] == order_id, 'origin_grid_id'].values[0]
-            #     if driver_grid != origin_id:
-            #         self.cross_grid_count += 1
+                self.dispatch_transitions_buffer[0] = np.concatenate(
+                    [self.dispatch_transitions_buffer[0], state_array])
+                self.dispatch_transitions_buffer[1] = np.concatenate(
+                    [self.dispatch_transitions_buffer[1], action_array])
+                self.dispatch_transitions_buffer[2] = np.concatenate(
+                    [self.dispatch_transitions_buffer[2], next_state_array])
+                # 将已匹配订单的reward_array与buffer连接
+                self.dispatch_transitions_buffer[3] = np.concatenate(
+                    [self.dispatch_transitions_buffer[3], reward_array])
 
             if self.track_recording_flag:
                 for j, index in enumerate(cor_driver[con_remain]):
@@ -658,15 +750,13 @@ class Simulator:
                                 wait_info['designed_reward'].values.tolist(),
                                 wait_info['dest_grid_id'].values.tolist())):
 
-                            end_time_slice = int((
-                                                             self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (
-                                                             self.decision_freq * 60))
+                            end_time_slice = int((self.decision_freq * 60))
 
                             if end_time_slice >= num_slices:
                                 original_trip_score = reward
                             else:
                                 next_state = State(end_time_slice, int(dest_grid_id))
-                                original_trip_score = reward + scale_coeff * (
+                                original_trip_score = reward + (
                                         self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
                                                       score_agent.q_value_table[next_state]
                             weight_array[i] = original_trip_score
@@ -733,7 +823,7 @@ class Simulator:
                                 #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
                                 #                       score_agent.strategy.q_value_table[next_state]
                                 # train dynamic matching的时候打开这个
-                                original_trip_score = reward + scale_coeff * (
+                                original_trip_score = reward + (
                                         self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
                                                       score_agent.q_value_table[next_state]
                             weight_array[i] = original_trip_score
@@ -1152,14 +1242,11 @@ class Simulator:
     # =========================================================================
     # 执行重定位 (Execute Reposition) - [Repo]
     # =========================================================================
-    def repo_driver(self, score_agent):
+    def repo_driver(self,):
         """
         执行车辆重定位决策
 
         根据 repo_mode (random_repo, demand_greedy, rl_value 等) 为空闲司机选择目标网格
-
-        Args:
-            score_agent: 计分/价值估计 Agent (用于 rl_value 模式)
 
         Returns:
             None
@@ -1338,20 +1425,20 @@ class Simulator:
             end_time_slice = np.clip(end_time_slice, 0, num_slices - 1)
 
             # === 6. Q-value 查询（必须是 numpy array: [T, G]）===
-            q_values = score_agent.q_value_table[end_time_slice, np.arange(self.grid_num)[None, :]]  # (N,M)
+            q_values = self.score_agent.q_value_table[end_time_slice, np.arange(self.grid_num)[None, :]]  # (N,M)
 
             # === 7. discount ===
             delta_t = end_time_slice - current_time_slice
             discount = self.score_discount_rate ** delta_t
 
             # --- waiting orders ---
-            waiting_orders_by_grid = (
-                self.wait_requests
-                .groupby('origin_grid_id')
-                .size()
-                .reindex(self.zone_id_array, fill_value=0)
-                .values
-            )
+            # waiting_orders_by_grid = (
+            #     self.wait_requests
+            #     .groupby('origin_grid_id')
+            #     .size()
+            #     .reindex(self.zone_id_array, fill_value=0)
+            #     .values
+            # )
             # --- 空闲司机分布 ---
             # con_ready_to_dispatch = (self.driver_table['status'] == 0) | (self.driver_table['status'] == 4)
             # idle_driver_table = self.driver_table[con_ready_to_dispatch]
@@ -1427,9 +1514,13 @@ class Simulator:
                 chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
                 best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
 
+            # --- 计算距离与时间 ---
+            best_dist = dist_matrix[np.arange(N), best_grid]
+            remaining_time = best_dist / self.vehicle_speed * 3600
+
         elif self.repo_mode in ['vope_greedy', 'vope_logit']:
             # === V_ope 模式: 使用神经网络估计价值 ===
-            # 参考 SARSA 模式的实现: 使用实际旅行时间计算 end_time_slice 和 discount
+            # 支持6D和2D状态
             if self.vope_model is None:
                 raise ValueError("V_ope model not loaded! Set vope_model_path in config.")
 
@@ -1441,9 +1532,8 @@ class Simulator:
 
             # --- 2. 计算每个候选网格的 V 值 ---
             N = len(grid_id_array)
-            num_grids = self.grid_num
 
-            # 获取当前需求特征
+            # 获取当前需求特征 (6D需要)
             waiting_orders_by_grid = (
                 self.wait_requests
                 .groupby('origin_grid_id')
@@ -1453,33 +1543,21 @@ class Simulator:
             )
 
             # --- 3. 计算折扣因子（基于实际旅行时间，与 SARSA 模式一致）---
-            # repo_time: (N, M) 每个司机到每个网格的旅行时间（秒）
-            # end_time_slice: 根据实际旅行时间计算到达的时间片
             end_time_slice_per_driver = ((self.time + repo_time - self.t_initial - 1) //
                                          (self.decision_freq * 60)).astype(int)
             end_time_slice_per_driver = np.clip(end_time_slice_per_driver, 0, num_slices - 1)
 
-            # delta_t: 到达时间片 - 当前时间片
-            delta_t = end_time_slice_per_driver - current_time_slice  # (N, M)
-            delta_t = np.maximum(delta_t, 1)  # 至少1个时间片
+            delta_t = end_time_slice_per_driver - current_time_slice
+            delta_t = np.maximum(delta_t, 1)
 
-            # 折扣因子: gamma ** delta_t，形状为 (N, M)
             discount_per_driver = self.score_discount_rate ** delta_t
 
             # --- 4. 为所有网格计算 V 值 ---
-            # V_ope 模型输出 V(s)，其中 s = (grid_id, time_slice)
-            # 对于每个司机，需要根据其选择的候选网格对应的到达时间片来查询 V 值
-            # 由于不同司机到同一网格的旅行时间不同，到达时间片也不同
-            # 所以需要对每个 (司机, 候选网格) 组合分别查询 V 值
-
-            # 方法: 对于每个司机，计算其所有候选网格的 discounted V 值
-            # cands_per_driver: (N, max_cand) 候选网格ID，不足位用 -1 填充
             cands_per_driver = cand_matrix[grid_id_array.astype(int)]
             mask = cands_per_driver != -1
 
-            # 计算每个司机-候选组合的 discounted V 值
-            # 需要对每个组合查询 V(grid_id=cand, time_slice=end_time_slice)
             cvals = np.zeros((N, max_cand))
+            max_time_slice = int(300 / self.decision_freq)
 
             with torch.no_grad():
                 for i in range(N):
@@ -1488,16 +1566,24 @@ class Simulator:
                             continue
                         g = cands_per_driver[i, j]
                         ts = end_time_slice_per_driver[i, j]
-                        state = self._encode_state_for_vope(g, ts, waiting_orders_by_grid)
-                        if state is not None:
-                            state_scaled = self.vope_scaler.transform([state])
-                            v = self.vope_model(torch.FloatTensor(state_scaled)).item()
-                            # 应用折扣因子
-                            cvals[i, j] = discount_per_driver[i, j] * v
+                        if self.vope_state_dim == 2:
+                            # 2D: 简单编码 (grid_id_norm, time_slice_norm)
+                            state = np.array([
+                                float(g) / self.grid_num,
+                                float(ts) / max(1, max_time_slice)
+                            ], dtype=np.float32)
+                            v = self.score_agent(torch.FloatTensor(state.reshape(1, -1))).item()
+                        else:
+                            # 6D: 使用 _encode_state_for_vope + scaler
+                            state = self._encode_state_for_vope(g, ts, waiting_orders_by_grid)
+                            if state is not None and self.vope_scaler is not None:
+                                state_scaled = self.vope_scaler.transform([state])
+                                v = self.score_agent(torch.FloatTensor(state_scaled)).item()
+                            else:
+                                v = 0.0
+                        cvals[i, j] = discount_per_driver[i, j] * v
 
-            cvals[~mask] = -np.inf  # 屏蔽无效候选
-
-            # safe_cands 已在上面定义，直接使用
+            cvals[~mask] = -np.inf
             safe_cands = np.where(mask, cands_per_driver, 0)
 
             if self.repo_mode == 'vope_greedy':
@@ -1526,21 +1612,21 @@ class Simulator:
             next_time = self.time + remaining_time
 
             # 构建结果数组  === 10. transitions ===
-            current_state_array = np.column_stack([np.full(N, self.time), grid_id_array])
-            next_state_array = np.column_stack([next_time, best_grid])
-            action_array = np.zeros(N)
-            reward_array = np.zeros(N)
+            # current_state_array = np.column_stack([np.full(N, self.time), grid_id_array])
+            # next_state_array = np.column_stack([next_time, best_grid])
+            # action_array = np.zeros(N)
+            # reward_array = np.zeros(N)
 
-            self.dispatch_transitions_buffer[0] = np.concatenate(
-                [self.dispatch_transitions_buffer[0], current_state_array])
-            self.dispatch_transitions_buffer[1] = np.concatenate([self.dispatch_transitions_buffer[1], action_array])
-            self.dispatch_transitions_buffer[2] = np.concatenate(
-                [self.dispatch_transitions_buffer[2], next_state_array])
-            self.dispatch_transitions_buffer[3] = np.concatenate([self.dispatch_transitions_buffer[3], reward_array])
+            # self.dispatch_transitions_buffer[0] = np.concatenate(
+            #     [self.dispatch_transitions_buffer[0], current_state_array])
+            # self.dispatch_transitions_buffer[1] = np.concatenate([self.dispatch_transitions_buffer[1], action_array])
+            # self.dispatch_transitions_buffer[2] = np.concatenate(
+            #     [self.dispatch_transitions_buffer[2], next_state_array])
+            # self.dispatch_transitions_buffer[3] = np.concatenate([self.dispatch_transitions_buffer[3], reward_array])
 
         elif self.repo_mode in ['online_vope_greedy', 'online_vope_logit']:
             # === Online V_ope 模式: 使用神经网络 TD 更新学习 ===
-            # 参考 SARSA 模式的实现: 使用实际旅行时间计算 end_time_slice 和 discount
+            # 支持10D和2D状态
             if self.online_vope_model is None:
                 raise ValueError("Online V_ope model not initialized!")
 
@@ -1557,21 +1643,22 @@ class Simulator:
 
             # --- 2. 为每个候选网格计算 V 值 (使用在线 V_ope) ---
             N = len(grid_id_array)
-            num_grids = self.grid_num
 
             # --- 3. 计算折扣因子（基于实际旅行时间，与 SARSA 模式一致）---
             end_time_slice_per_driver = ((self.time + repo_time - self.t_initial - 1) //
                                          (self.decision_freq * 60)).astype(int)
             end_time_slice_per_driver = np.clip(end_time_slice_per_driver, 0, num_slices - 1)
 
-            delta_t = end_time_slice_per_driver - current_time_slice  # (N, M)
-            delta_t = np.maximum(delta_t, 1)  # 至少1个时间片
+            delta_t = end_time_slice_per_driver - current_time_slice
+            delta_t = np.maximum(delta_t, 1)
 
             discount_per_driver = self.score_discount_rate ** delta_t
 
             # --- 4. 计算每个司机-候选组合的 discounted V 值 ---
             cands_per_driver = cand_matrix[grid_id_array.astype(int)]
             mask = cands_per_driver != -1
+
+            model_state_dim = getattr(self.online_vope_model, 'state_dim', 10)
 
             cvals = np.zeros((N, max_cand))
             with torch.no_grad():
@@ -1581,9 +1668,12 @@ class Simulator:
                             continue
                         g = cands_per_driver[i, j]
                         ts = end_time_slice_per_driver[i, j]
-                        state = self._encode_state_for_online_vope(g, ts)
+                        if model_state_dim == 2:
+                            state = self.online_vope_model.encode_state(g, ts)
+                        else:
+                            state = self._encode_state_for_online_vope(g, ts)
                         state_reshaped = state.reshape(1, -1)
-                        v = self.online_vope_model(torch.FloatTensor(state_reshaped)).item()
+                        v = self.score_agent(torch.FloatTensor(state_reshaped)).item()
                         cvals[i, j] = discount_per_driver[i, j] * v
 
             cvals[~mask] = -np.inf
@@ -1606,24 +1696,90 @@ class Simulator:
                 chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
                 best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
 
-            # --- 3. 统一计算距离与状态转换 ---
+            # --- 统一计算距离与状态转换 ---
             best_grid = np.where(best_grid >= 0, best_grid, grid_id_array.astype(int))
             best_dist = dist_matrix[np.arange(N), best_grid]
             remaining_time = (best_dist / self.vehicle_speed) * 3600
-            next_time = self.time + remaining_time
 
-            # --- 4. TD 更新 (收集 transitions 用于在线学习) ---
-            current_state_array = np.column_stack([np.full(N, self.time), grid_id_array])
-            next_state_array = np.column_stack([next_time, best_grid])
-            action_array = np.zeros(N)
-            reward_array = np.zeros(N)  # repo 决策暂无即时奖励
+        elif self.repo_mode in ['v1d3_greedy', 'v1d3_logit']:
+            # === V1D3 模式: 离线V_ope初始化 + 在线TD微调 ===
+            # 2D版本: 使用2D编码 (grid_id_norm, time_slice_norm)
+            # 10D版本: 使用10D编码 (需求+供给特征)
+            if self.v1d3_model is None:
+                raise ValueError("V1D3 model not initialized!")
 
-            self.dispatch_transitions_buffer[0] = np.concatenate(
-                [self.dispatch_transitions_buffer[0], current_state_array])
-            self.dispatch_transitions_buffer[1] = np.concatenate([self.dispatch_transitions_buffer[1], action_array])
-            self.dispatch_transitions_buffer[2] = np.concatenate(
-                [self.dispatch_transitions_buffer[2], next_state_array])
-            self.dispatch_transitions_buffer[3] = np.concatenate([self.dispatch_transitions_buffer[3], reward_array])
+            # 计算当前时间片
+            current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq * 60))
+            max_time_slice = int(300 / self.decision_freq)
+            num_slices = max_time_slice
+
+            # --- 1. 预处理候选集 ---
+            max_cand = max(len(v) for v in repo_candidate_by_grid.values())
+            cand_matrix = np.full((self.grid_num, max_cand), -1, dtype=int)
+            for g, cands in repo_candidate_by_grid.items():
+                cand_matrix[g, :len(cands)] = list(cands)
+
+            N = len(grid_id_array)
+
+            # --- 2. 计算折扣因子（基于实际旅行时间）---
+            end_time_slice_per_driver = ((self.time + repo_time - self.t_initial - 1) //
+                                         (self.decision_freq * 60)).astype(int)
+            end_time_slice_per_driver = np.clip(end_time_slice_per_driver, 0, num_slices - 1)
+
+            delta_t = end_time_slice_per_driver - current_time_slice
+            delta_t = np.maximum(delta_t, 1)
+
+            discount_per_driver = self.score_discount_rate ** delta_t
+
+            # --- 3. 计算每个司机-候选组合的 discounted V 值 ---
+            cands_per_driver = cand_matrix[grid_id_array.astype(int)]
+            mask = cands_per_driver != -1
+
+            # 检测模型状态维度
+            model_state_dim = getattr(self.v1d3_model, 'state_dim', 10)
+
+            cvals = np.zeros((N, max_cand))
+            with torch.no_grad():
+                for i in range(N):
+                    for j in range(max_cand):
+                        if not mask[i, j]:
+                            continue
+                        g = cands_per_driver[i, j]
+                        ts = end_time_slice_per_driver[i, j]
+                        if model_state_dim == 2:
+                            # 2D版本: 使用模型的encode_state
+                            state = self.v1d3_model.encode_state(g, ts)
+                        else:
+                            # 10D版本: 使用10D编码 (含供给信息)
+                            state = self._encode_state_for_online_vope(g, ts)
+                        state_reshaped = state.reshape(1, -1)
+                        v = self.score_agent(torch.FloatTensor(state_reshaped)).item()
+                        cvals[i, j] = discount_per_driver[i, j] * v
+
+            cvals[~mask] = -np.inf
+            safe_cands = np.where(mask, cands_per_driver, 0)
+
+            if self.repo_mode == 'v1d3_greedy':
+                chosen_col_idx = np.argmax(cvals, axis=1)
+                best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
+            elif self.repo_mode == 'v1d3_logit':
+                max_u = np.max(cvals, axis=1, keepdims=True)
+                with np.errstate(over='ignore', invalid='ignore'):
+                    exp_u = np.exp(beta * (cvals - max_u))
+                    exp_u[~mask] = 0
+                sum_exp = np.sum(exp_u, axis=1, keepdims=True)
+                probs = np.divide(exp_u, sum_exp, out=np.zeros_like(exp_u), where=sum_exp > 0)
+                cum_probs = np.cumsum(probs, axis=1)
+                unique_g, inverse_idx = np.unique(grid_id_array.astype(int), return_inverse=True)
+                u_unique = np.random.default_rng().random((len(unique_g), 1))
+                u = u_unique[inverse_idx]
+                chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
+                best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
+
+            # --- 统一计算距离与状态转换 ---
+            best_grid = np.where(best_grid >= 0, best_grid, grid_id_array.astype(int))
+            best_dist = dist_matrix[np.arange(N), best_grid]
+            remaining_time = (best_dist / self.vehicle_speed) * 3600
 
         # === 9. 更新 driver_table（批量）===
         self.driver_table.loc[repo_idx, 'status'] = 4
@@ -1723,11 +1879,11 @@ class Simulator:
 
         # reposition
         if self.rl_mode == 'reposition':
-            # V1D3: 每 decision_freq 分钟触发一次 repo 决策
+            # 每 decision_freq 分钟触发一次 repo 决策
             if self.current_step % (self.decision_freq * 60 // self.delta_t) == 0:
-                self.repo_driver(self.matching_agent)
+                self.repo_driver()
 
-            # V1D3: 所有 idle 司机的 transitions (r=0)
+            # 所有 idle 司机的 transitions (r=0)
             # 这部分之前被注释掉了，现在启用
             con_idle = self.driver_table['status'] == 0
             idle_driver = self.driver_table[con_idle]
@@ -1757,11 +1913,12 @@ class Simulator:
         self.update_time()
 
         if self.dispatch_transitions_buffer[0].shape[0] > 0:
-            self.matching_agent.perceive(self.dispatch_transitions_buffer)  # Andrew
-
-            # Online V_ope TD 更新
-            if self.online_vope_model is not None and self.repo_mode in ['online_vope_greedy', 'online_vope_logit']:
-                self._online_vope_td_update()
+            if self.rl_mode == 'matching':
+                self.score_agent.perceive(self.dispatch_transitions_buffer)
+            else:
+                # 在线模型 TD 更新
+                if self.online_vope_model or self.v1d3_model:
+                    self._online_vope_td_update()
 
     # hong-yang step train for dynamic matching method selection
     # =========================================================================
@@ -1963,15 +2120,9 @@ class Simulator:
         grid_num = self.grid_num
         max_time_slice = int(300 / self.decision_freq)
 
-        # 归一化
-        grid_id_norm = grid_id / grid_num
-        time_slice_norm = time_slice / max_time_slice if max_time_slice > 0 else 0
-
         # 小时 (从18:00开始)
         hour = (time_slice * self.decision_freq * 60 + 18000) / 3600
         hour = hour % 24
-        hour_sin = np.sin(2 * np.pi * hour / 24)
-        hour_cos = np.cos(2 * np.pi * hour / 24)
 
         # 需求特征
         demand_now = demand_by_grid[grid_id] if grid_id < len(demand_by_grid) else 0

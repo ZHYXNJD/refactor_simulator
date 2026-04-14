@@ -261,6 +261,60 @@ cvals[i, j] = discount_per_driver[i, j] * v
 
 ---
 
+## 2026-04-14 四种 Repo 方法多状态维度支持 + V1D3 实现
+
+### 概述
+
+为所有四种 repositioning 方法添加多状态维度支持（2D/6D/10D），并完整实现 V1D3 调度逻辑。
+
+### 修改文件
+
+`src/env/simulator_env.py`
+
+### 1. `__init__` — 四种方法的状态维度支持 ✅
+
+| 方法 | 变更 |
+|------|------|
+| `vope_greedy/vope_logit` | 从 checkpoint 权重 `fc1.weight.shape[1]` 自动检测 state_dim (2D 或 6D)，存储 `self.vope_state_dim` |
+| `online_vope_greedy/online_vope_logit` | 支持 2D (`ValueNetwork2D`) 和 10D (`ValueNetworkOnline`)，通过 `online_vope_state_dim` kwargs 或 checkpoint 自动选择 |
+| `v1d3_greedy/v1d3_logit` | **完整实现**：加载离线 V_ope，根据维度创建在线模型 (2D: 权重迁移; 10D: 随机初始化)，设置 `self.v1d3_model` + `self.online_vope_model` + `self.score_agent` |
+| `sarsa_value_greedy/sarsa_value_logit` | 无变更 (仅 2D 表格方法) |
+
+**V1D3 两个版本**:
+- 2D: 离线 V_ope(2D) → `ValueNetwork2D` 权重直接迁移 → 在线 TD 微调
+- 10D: 离线 V_ope(6D) 仅作参考 → `ValueNetworkOnline(10D)` 从零训练
+
+**state_dim 检测**: 从 `checkpoint['model']['fc1.weight'].shape[1]` 推断，兼容无 `state_dim` 配置的旧 checkpoint。
+
+### 2. `repo_driver` — 四种方法的调度逻辑 ✅
+
+| 方法 | 变更 |
+|------|------|
+| `vope_greedy/vope_logit` | 2D: 简单编码 `[grid_id/grid_num, ts/max_ts]`；6D: 原有 `_encode_state_for_vope` + scaler |
+| `online_vope_greedy/online_vope_logit` | 通过 `model.state_dim` 检测: 2D 用 `model.encode_state()`；10D 用 `_encode_state_for_online_vope()` |
+| `v1d3_greedy/v1d3_logit` | **完整实现**：与 online_vope 相同模式，检测 `v1d3_model.state_dim` 选择编码方式 |
+| `sarsa_value_greedy/sarsa_value_logit` | 修复: 补充缺失的 `remaining_time` / `best_dist` 计算 (原有 bug) |
+
+### 3. Bug 修复
+
+**SARSA repo_driver 缺失 remaining_time**: 原 SARSA 调度块未计算 `remaining_time` 和 `best_dist`，导致共享的 driver_table 更新代码报 `UnboundLocalError`。已补充计算逻辑。
+
+### 4. 测试结果
+
+| 测试 | 结果 |
+|------|------|
+| SARSA (2D) | ✅ PASSED |
+| vope_greedy (6D) | ✅ PASSED |
+| vope_greedy (2D) | ✅ PASSED |
+| online_vope_greedy (10D, fresh) | ✅ PASSED |
+| online_vope_greedy (2D, fresh) | ✅ PASSED |
+| v1d3_greedy (10D, offline 6D) | ✅ PASSED |
+| v1d3_greedy (2D, offline 2D + weight transfer) | ✅ PASSED |
+
+验证内容: `__init__` 模型加载、forward pass 输出、TD update 损失计算、V1D3 2D 权重迁移 (torch.allclose)。
+
+---
+
 ## 代码结构
 
 ```
