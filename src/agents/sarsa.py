@@ -92,11 +92,8 @@ class SarsaAgent(object):
                                      self.learning_rate * (reward + (self.discount_rate ** (t1-t0)) * self.q_value_table[t1,l1])
 
     def load_parameters(self, file_name):
-        q_table = pickle.load(open(file_name, 'rb'))
-        for time_slice in self.time_slices:
-            for grid_id in self.grid_ids:
-                s = State(time_slice, grid_id)
-                self.q_value_table[s] = q_table[time_slice][grid_id]
+
+        self.q_value_table = pickle.load(open(file_name, 'rb'))
 
     def save_parameters(self, save_path):
 

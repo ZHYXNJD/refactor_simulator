@@ -45,7 +45,7 @@ class Simulator:
     # =========================================================================
     # 初始化 (Initialization)
     # =========================================================================
-    def __init__(self, score_agent, dynamic_matching_agent=None,
+    def __init__(self, score_agent=None, dynamic_matching_agent=None,
                  dynamic_reposition_agent=None, mapping_dict=None, road_network=None, **kwargs):
         """
         初始化仿真环境
@@ -310,9 +310,11 @@ class Simulator:
             self.score_agent = self.v1d3_model
 
         elif self.repo_mode in ['sarsa_value_greedy','sarsa_value_logit']:
-            # online sarsa 也在此实现
             # 只有一个2D版本
-            pass
+            self.score_agent = score_agent
+            sarsa_path = kwargs.get('sarsa_model_path', None)
+            if sarsa_path and os.path.exists(sarsa_path):
+                self.score_agent.load_parameters(sarsa_path)
 
         # get steps
         self.finish_run_step = int((self.t_end - self.t_initial) // self.delta_t)

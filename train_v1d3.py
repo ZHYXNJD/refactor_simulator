@@ -112,14 +112,12 @@ def train_v1d3(repo_mode='online_vope_greedy', num_epochs=50, save_path=MODEL_SA
     )
 
     # 创建 Agent 和 Simulator
-    matching_agent = SarsaAgent(**config)
     simulator = Simulator(
         **config,
-        matching_agent=matching_agent,
         mapping_dict=MAPPING_DICT,
         road_network=ROAD_NETWORK
     )
-    trainer = SimulatorTrainer(simulator=simulator, matching_agent=matching_agent)
+    trainer = SimulatorTrainer(simulator=simulator)
 
     # 训练
     print(f"\nStarting training for {num_epochs} epochs...")
@@ -197,14 +195,12 @@ def test_v1d3(model, test_dates=TEST_DATES, repo_mode='online_vope_greedy'):
         )
 
         # 创建 Simulator
-        matching_agent = SarsaAgent(**config)
         simulator = Simulator(
             **config,
-            matching_agent=matching_agent,
             mapping_dict={test_date: MAPPING_DICT[test_date]},
             road_network={GRID_NUM: pd.read_csv(f'my_data/new_grids_{GRID_NUM}.csv', index_col='node_id')}
         )
-        trainer = SimulatorTrainer(simulator=simulator, matching_agent=matching_agent)
+        trainer = SimulatorTrainer(simulator=simulator)
 
         # 测试
         output_path = f"{OUTPUT_DIR}/test_{test_date}"

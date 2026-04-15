@@ -57,7 +57,7 @@ def load_data(dates):
 
     return ROAD_NETWORK, driver_info_base, REQUEST_DICT, MAPPING_DICT
 
-def train_online_vope(repo_mode='online_sarsa_greedy', num_epochs=50, save_path=MODEL_SAVE_PATH):
+def train_online_sarsa(repo_mode='online_sarsa_greedy', num_epochs=50, save_path=MODEL_SAVE_PATH):
     """
     训练在线 Sarsa 模型
 
@@ -93,9 +93,7 @@ def train_online_vope(repo_mode='online_sarsa_greedy', num_epochs=50, save_path=
         repo_mode=repo_mode,
         load_path=None,
         date=TRAIN_DATES,
-        discount_rate=0.95,
-        online_vope_lr=0.001,
-        online_vope_discount=0.95
+        discount_rate=0.95
     )
 
     # 创建 Agent 和 Simulator
@@ -124,94 +122,123 @@ def train_online_vope(repo_mode='online_sarsa_greedy', num_epochs=50, save_path=
     })
 
     # 保存模型
-    if simulator.online_vope_model is not None:
-        simulator.online_vope_model.save(save_path)
+    if simulator.score_agent is not None:
+        simulator.score_agent.save_parameters(save_path)
         print(f"\nModel saved to {save_path}")
 
-    return simulator.online_vope_model
+    return simulator.score_agent
 
-def repo_value_estimate(grid_num,decision_freq,experiment_mode,rl_mode,method,repo_mode,config_path=None,repo2any=False):
+def test_sarsa(model, test_dates=TEST_DATES, repo_mode='online_sarsa_greedy'):
+    """
+    测试 SARSA 模型
 
-    '''
-    experiment_mode: train_single_agent_repo, train_dgw_repo, test_dgw_repo,test_single_agent_repo,test_heuristic_repo
-    rl_mode: single_agent_repo, dgw_repo,reposition
-    method (repo method): random, greedy1,greedy2, greedy3, single_rl, single_rl_global,dgw
-    # random_repo / demand_greedy / ratio_greedy / sarsa_value
-    date: ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08','2015-05-11'] # train date
-    date: ['2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15','2015-05-18'] # test date
-    '''
+    Args:
+        model: 训练好的模型
+        test_dates: 测试日期列表
+        repo_mode: 测试时使用的模式
+    """
+    print(f"\n{'='*60}")
+    print(f"Testing SARSA (mode={repo_mode})")
+    print(f"{'='*60}")
 
+    # 加载测试数据
+    _, driver_info_base, REQUEST_DICT, MAPPING_DICT = load_data(test_dates)
 
-    config = dict(grid_num=grid_num, decision_freq=decision_freq,
-                    order_sample_ratio=1,driver_num=1000,
-                    experiment_mode=experiment_mode,
-                    rl_mode=rl_mode,
-                    method=method,
-                    repo_mode=repo_mode,
-                    load_path=None, # Q-table load path
-                    date = ['2015-05-05'],
-                    load_dynamic_path = None
-                    )
+    results = []
+    for test_date in test_dates:
+        print(f"\n--- Test Date: {test_date} ---")
 
-    config.update({"order_sample_ratio":1,"driver_sample_ratio":1})
+        # 预处理司机位置
+        driver_info = deepcopy(driver_info_base)
+        driver_info['grid_id'] = pd.merge(
+            driver_info[['lng', 'lat']],
+            pd.read_csv(f'my_data/new_grids_{GRID_NUM}.csv', index_col='node_id')[['lng', 'lat', 'grid_id']],
+            on=['lng', 'lat']
+        )['grid_id']
 
-    config.update({"discount_rate":0.95})
+        # 配置
+        config = dict(
+            grid_num=GRID_NUM,
+            decision_freq=DECISION_FREQ,
+            order_sample_ratio=1,
+            driver_sample_ratio=1,
+            experiment_mode='test_single_agent_repo',
+            rl_mode='reposition',
+            method='d',
+            repo_mode=repo_mode,
+            load_path=None,
+            date=[test_date],
+            discount_rate=0.95,
+            sarsa_model_path=MODEL_SAVE_PATH  # 使用训练好的模型
+        )
 
-    ROAD_NETWORK = {}
-    DRIVER_INFO_DICT = {}
-    MAPPING_DICT = {}
+        # 创建 Simulator
+        simulator = Simulator(
+            **config,
+            score_agent=SarsaAgent(**config),
+            mapping_dict={test_date: MAPPING_DICT[test_date]},
+            road_network={GRID_NUM: pd.read_csv(f'my_data/new_grids_{GRID_NUM}.csv', index_col='node_id')}
+        )
+        trainer = SimulatorTrainer(simulator=simulator, score_agent=SarsaAgent(**config))
 
+        # 测试
+        output_path = f"{OUTPUT_DIR}/test_{test_date}"
+        os.makedirs(output_path, exist_ok=True)
 
-    result = pd.read_csv(f'my_data/new_grids_{grid_num}.csv', index_col='node_id', dtype={'node_id': float})
-    ROAD_NETWORK[grid_num] = result
-    driver_origin_loc = DRIVER_INFO[['lng', 'lat']]
-    driver_origin_loc_grid = pd.merge(driver_origin_loc, result[['lng', 'lat', 'grid_id']], on=['lng', 'lat'],
-                                          how='left')
-    driver_info = deepcopy(DRIVER_INFO)
-    driver_info['grid_id'] = driver_origin_loc_grid['grid_id']
-
-    DRIVER_INFO_DICT[grid_num] = driver_info
-
-    for date in config['date']:
-        MAPPING_DICT[date] = pd.read_csv(f"my_data/cleaned_orders_pickle/orders_grid35_{date}-map263.csv")
-
-    matching_agent = SarsaAgent(**config)
-
-    simulator = Simulator(**config,matching_agent=matching_agent,mapping_dict=MAPPING_DICT,road_network=ROAD_NETWORK)
-
-    trainer = SimulatorTrainer(
-        simulator=simulator,
-        matching_agent=matching_agent
-    )
-
-    trainer.train(
-        train_config={
-            'num_epochs': 500,
-            'train_dates': TRAIN_DATE,
-            'driver_num': 1000,
-            'output_path': "dynamic_repo/sarsa_value_estimation_result",
+        trainer.train(train_config={
+            'num_epochs': 1,
+            'train_dates': [test_date],
+            'driver_num': DRIVER_NUM,
+            'output_path': output_path,
             'flag_load': False,
-            'parallel': True,
+            'parallel': False,
             'hyper_parameters': config,
-            'DRIVER_INFO': DRIVER_INFO_DICT[config['grid_num']],  # 使用全局变量
-            'REQUEST_DICT': REQUEST_DICT,  # 使用全局变量
-            'ROAD_NETWORK': ROAD_NETWORK  # 使用全局变量
-        }
+            'DRIVER_INFO': driver_info,
+            'REQUEST_DICT': {test_date: REQUEST_DICT[test_date]},
+            'ROAD_NETWORK': {GRID_NUM: pd.read_csv(f'my_data/new_grids_{GRID_NUM}.csv', index_col='node_id')}
+        })
+
+        results.append({
+            'date': test_date,
+            'total_reward': simulator.total_reward,
+            'matched_orders': simulator.matched_requests_num
+        })
+        print(f"  Reward: {simulator.total_reward:.2f}, Matched: {simulator.matched_requests_num}")
+
+    # 汇总
+    print(f"\n{'='*60}")
+    print("Test Summary")
+    print(f"{'='*60}")
+    mean_reward = np.mean([r['total_reward'] for r in results])
+    mean_matched = np.mean([r['matched_orders'] for r in results])
+    print(f"Mean Reward: {mean_reward:.2f}")
+    print(f"Mean Matched: {mean_matched:.2f}")
+
+    return results
+
+def main():
+    """主函数"""
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Train SARSA')
+    parser.add_argument('--mode', type=str, default='online_sarsa_greedy',
+                        choices=['online_sarsa_greedy', 'online_sarsa_logit'],
+                        help='Repo mode')
+    parser.add_argument('--epochs', type=int, default=50,
+                        help='Number of training epochs')
+    parser.add_argument('--test', action='store_true',
+                        help='Run test after training')
+    args = parser.parse_args()
+
+    # 训练
+    model = train_online_sarsa(
+        repo_mode=args.mode,
+        num_epochs=args.epochs,
+        save_path=MODEL_SAVE_PATH
     )
 
+    # 测试
+    if args.test and model is not None:
+        test_sarsa(model, repo_mode=args.mode)
 
-if __name__ == '__main__':
-    # TRAIN_DATE = ['2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15', '2015-05-18']
-    TRAIN_DATE = ['2015-05-05']
-    REQUEST_DICT = {}
-    for date in TRAIN_DATE:
-        request_path = f"my_data/cleaned_orders_pickle/orders_grid35_{date}.pkl"
-        with open(request_path, 'rb') as f:
-            print(f"load request file: {request_path}")
-            REQUEST_DICT[date] = pickle.load(f)
-
-    driver_path = f"my_data/drivers_grid35_1000.pickle"
-    with open(driver_path, 'rb') as f:
-        DRIVER_INFO = pickle.load(f)
-
-    repo_value_estimate(grid_num=263, decision_freq=10, rl_mode='reposition', method='d',experiment_mode='train',repo_mode='sarsa_value_greedy')
+    print(f"\nDone! Model saved to {MODEL_SAVE_PATH}")
