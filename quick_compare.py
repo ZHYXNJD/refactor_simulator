@@ -64,10 +64,10 @@ def run_single_method(repo_mode, use_offline_vope=False):
             config['vope_model_path'] = OFFLINE_VOPE_PATH
 
         matching_agent = SarsaAgent(**config)
-        simulator = Simulator(**config, matching_agent=matching_agent,
+        simulator = Simulator(**config, score_agent=matching_agent,
                            mapping_dict={test_date: MAPPING_DICT_TEST[test_date]},
                            road_network=ROAD_NETWORK)
-        trainer = SimulatorTrainer(simulator=simulator, matching_agent=matching_agent)
+        trainer = SimulatorTrainer(simulator=simulator, score_agent=matching_agent)
 
         output_path = f"{OUTPUT_BASE}/{repo_mode}_{test_date}"
         os.makedirs(output_path, exist_ok=True)

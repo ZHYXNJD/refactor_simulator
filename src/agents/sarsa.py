@@ -10,6 +10,8 @@ import pickle
 
 import numpy as np
 
+from src.utils.utilities import State
+
 
 # rl for matching
 # Andrew: Only one rl method is used in the simulator, which is sarsa_no_subway
@@ -63,6 +65,14 @@ class SarsaAgent(object):
             for grid_id in self.grid_ids:
                 self.q_value_table[time_slice,grid_id] = 0
 
+        # old version
+        # initialization of Q value table
+        # self.q_value_table = dict()  # each state a two dimension vector
+        # for time_slice in self.time_slices:
+        #     for grid_id in self.grid_ids:
+        #         s = State(time_slice, grid_id)
+        #         self.q_value_table[s] = 0
+
         # 加载权重
         if self.load_path:
             self.load_parameters(params['load_path'])
@@ -92,8 +102,15 @@ class SarsaAgent(object):
                                      self.learning_rate * (reward + (self.discount_rate ** (t1-t0)) * self.q_value_table[t1,l1])
 
     def load_parameters(self, file_name):
-
+        # new version
         self.q_value_table = pickle.load(open(file_name, 'rb'))
+
+        # old version
+        # q_table = pickle.load(open(file_name, 'rb'))
+        # for time_slice in self.time_slices:
+        #     for grid_id in self.grid_ids:
+        #         s = State(time_slice, grid_id)
+        #         self.q_value_table[s] = q_table[time_slice][grid_id]
 
     def save_parameters(self, save_path):
 

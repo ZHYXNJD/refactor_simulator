@@ -1,4 +1,5 @@
 import pickle
+import types
 from copy import deepcopy
 from typing import List
 
@@ -6,10 +7,47 @@ import joblib
 import pandas as pd
 from simulator_env import Simulator
 from dynamic_matching.dynamic_matching_agent.maddpd_discreate import *
-from simulator_trainer import SimulatorTrainer
-from value_estimatior.sarsa import SarsaAgent
+from dynamic_matching.dynamic_matching_agent.idqn import *
+from src.env.simulator_trainer import SimulatorTrainer
+from src.agents.sarsa import SarsaAgent
 import warnings
-warnings.filterwarnings("ignore")
+from pathlib import Path
+import sys
+
+# 添加项目根目录到 sys.path
+project_root = Path(r"D:\project\Transportation_Simulator")
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
+# 确保能导入新的 dynamic_matching
+try:
+    import dynamic_matching
+    print("✓ dynamic_matching 导入成功")
+except Exception as e:
+    print("✗ dynamic_matching 导入失败:", e)
+
+
+# ====================== 最终版 CustomUnpickler ======================
+class CustomUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        original = module
+        print(f"🔍 Pickle 请求: {module}.{name}")  # 调试信息，可后续删除
+
+        # 模块映射规则
+        if module.startswith('simulator_matching'):
+            module = module.replace('simulator_matching', 'dynamic_matching', 1)
+
+        # 特殊映射：dynamic_matching_algorithm → dynamic_matching_agent
+        if 'dynamic_matching_algorithm' in module:
+            module = module.replace('dynamic_matching_algorithm', 'dynamic_matching_agent')
+
+        if original != module:
+            print(f"   → 重映射为: {module}.{name}")
+
+        return super().find_class(module, name)
+
+
+# =================================================================
 
 def test_result(grid_num,decision_freq,rl_mode,method,config_path:List):
 
@@ -29,7 +67,8 @@ def test_result(grid_num,decision_freq,rl_mode,method,config_path:List):
                     method=method,
                     load_path=config_path[0], # Q-table load path
                     date = ['2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15','2015-05-18'],
-                    load_dynamic_path =config_path[1]
+                    load_dynamic_path =config_path[1],
+                    agent_type='IDQN'
                     )
 
     ROAD_NETWORK = {}
@@ -37,7 +76,7 @@ def test_result(grid_num,decision_freq,rl_mode,method,config_path:List):
 
 
 
-    result = pd.read_csv(f'my_data/new_grids_{grid_num}.csv', index_col='node_id', dtype={'node_id': float})
+    result = pd.read_csv(f'../my_data/new_grids_{grid_num}.csv', index_col='node_id', dtype={'node_id': float})
 
     ROAD_NETWORK[grid_num] = result
     driver_origin_loc = DRIVER_INFO[['lng', 'lat']]
@@ -48,15 +87,13 @@ def test_result(grid_num,decision_freq,rl_mode,method,config_path:List):
 
     DRIVER_INFO_DICT[grid_num] = driver_info
 
-
-
-    with open("my_data/node_to_grid.pkl", "rb") as f:
+    with open("../my_data/node_to_grid.pkl", "rb") as f:
         MAPPING_DICT = pickle.load(f)
 
     if method in ["rl","dynamic_matching","static_multi_choice"]:
-        matching_agent = SarsaAgent(**config)
+        score_agent = SarsaAgent(**config)
     else:
-        matching_agent = None
+        score_agent = None
 
     # 注册dynamic matching agent
     if method == 'dynamic_matching':
@@ -64,36 +101,41 @@ def test_result(grid_num,decision_freq,rl_mode,method,config_path:List):
         grid_num = config['grid_num']
         decision_freq = config['decision_freq']
         total_state_dim = grid_num * 3 + 2
-        local_feature_len = int((total_state_dim - 2) // grid_num)
-        per_agent_local_input = local_feature_len + 2
+        # local_feature_len = int((total_state_dim - 2) // grid_num)
+        # per_agent_local_input = local_feature_len + 2
         per_agent_actor_input = total_state_dim + grid_num
         agent_type = config.get('agent_type', 'MADDPG')
-        if agent_type in ['IDQN']:
-            obs_dims = [per_agent_local_input for _ in range(grid_num)]
-        else:
-            obs_dims = [per_agent_actor_input for _ in range(grid_num)]
-        n_actions = [3 for _ in range(grid_num)]
-
-        warmup_data_file = f"dynamic_matching/warmup_transitions/sensitivity_analysis/grid_{grid_num}_freq_{decision_freq}_state.pkl"
-        scaler_file = f"dynamic_matching/warmup_transitions/sensitivity_analysis/grid_{grid_num}_freq_{decision_freq}_state_scaler.pkl"
+        warmup_data_file = f"warmup_transitions/sensitivity_analysis/grid_{grid_num}_freq_{decision_freq}_state.pkl"
+        scaler_file = f"warmup_transitions/sensitivity_analysis/grid_{grid_num}_freq_{decision_freq}_state_scaler.pkl"
 
         with open(warmup_data_file, 'rb') as f:
-            TRANSITIONS = pickle.load(f)
+
+            # 现在正常加载
+            # TRANSITIONS = pickle.load(f)
+            TRANSITIONS = CustomUnpickler(f).load()
+            print("✅ Pickle 加载成功！")
 
         STATE_SCALER = joblib.load(scaler_file)
+        n_actions = [3 for _ in range(grid_num)]
+        if agent_type in ['IDQN']:
+            obs_dims = [per_agent_actor_input for _ in range(grid_num)]
+            dynamic_matching_agent = IDQN(**config, obs_dims=obs_dims, n_actions=n_actions, transitions=TRANSITIONS,
+                                            state_scaler=STATE_SCALER)
+        else:
+            obs_dims = [per_agent_actor_input for _ in range(grid_num)]
+            dynamic_matching_agent = MADDPG(**config, obs_dims=obs_dims, n_actions=n_actions, transitions=TRANSITIONS,
+                                            state_scaler=STATE_SCALER)
 
-        dynamic_matching_agent = MADDPG(**config, obs_dims=obs_dims, n_actions=n_actions, transitions=TRANSITIONS,
-                                        state_scaler=STATE_SCALER)
-        simulator = Simulator(**config, matching_agent=matching_agent,mapping_dict=MAPPING_DICT,road_network=ROAD_NETWORK, dynamic_matching_agent=dynamic_matching_agent)
+        simulator = Simulator(**config, score_agent=score_agent,mapping_dict=MAPPING_DICT,road_network=ROAD_NETWORK, dynamic_matching_agent=dynamic_matching_agent)
 
     else:
-        simulator = Simulator(**config, matching_agent=matching_agent,mapping_dict=MAPPING_DICT,road_network=ROAD_NETWORK)
+        simulator = Simulator(**config, score_agent=score_agent,mapping_dict=MAPPING_DICT,road_network=ROAD_NETWORK)
         dynamic_matching_agent = None
 
     if simulator.experiment_mode == 'test':
         trainer = SimulatorTrainer(
             simulator=simulator,
-            matching_agent=matching_agent,
+            score_agent=score_agent,
             dynamic_matching_agent=dynamic_matching_agent
         )
 
@@ -117,21 +159,21 @@ if __name__ == '__main__':
     TRAIN_DATE = ['2015-05-12', '2015-05-13', '2015-05-14', '2015-05-15', '2015-05-18']
     REQUEST_DICT = {}
     for date in TRAIN_DATE:
-        data_path = f"my_data/cleaned_orders_pickle/orders_grid35_{date}.pkl"
+        data_path = f"../my_data/cleaned_orders_pickle/orders_grid35_{date}.pkl"
         with open(data_path, 'rb') as f:
             print(f"load request file: {data_path}")
             REQUEST_DICT[date] = pickle.load(f)
 
 
 
-    driver_path = f"my_data/drivers_grid35_1000.pickle"
+    driver_path = f"../my_data/drivers_grid35_1000.pickle"
     with open(driver_path, 'rb') as f:
         DRIVER_INFO = pickle.load(f)
 
     DRIVER_INFO = DRIVER_INFO.sample(n=1000, replace=False, random_state=42)
 
 
-    test_result(grid_num=8, decision_freq=30, rl_mode='dynamic_matching', method='dynamic_matching',
+    test_result(grid_num=63, decision_freq=10, rl_mode='dynamic_matching', method='dynamic_matching',
                 config_path=[
-                    'dynamic_matching/value_estimation_result/grid_8_freq_30_230731_0/qtable_grid_8_freq_30_epoch_21_score202734.pickle',
-                    'dynamic_matching/output/sensitivity_result/grid_8_freq_30_112005_0/model_epoch162_score211638.pt'])
+                    'value_estimation_result/grid_63_freq_10_112355_5/qtable_grid_63_freq_10_epoch_216_score202722.pickle',
+                    'idqn_result/63_10_idqn_181301_1/model_epoch479_score201839.pt'])

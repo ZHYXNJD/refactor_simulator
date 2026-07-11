@@ -10,11 +10,11 @@ right_b = []
 
 
 def get_centroid_coordinates():
-    df_centroid = pd.read_csv('my_data/hex_updated_r300_info.csv',usecols=['center_lat','center_lon'])
+    df_centroid = pd.read_csv('../my_data/hex_updated_r300_info.csv',usecols=['center_lat','center_lon'])
     return df_centroid
 
 def get_three_hop_neighbors(nodes, driver_grid_id_dict):
-    adj_matrix = pd.read_csv("my_data/hexo_updated_r300_adj.csv").to_numpy()
+    adj_matrix = pd.read_csv("../my_data/hexo_updated_r300_adj.csv").to_numpy()
     # 确保输入列表唯一
     nodes = list(set(nodes))
     data = {}
@@ -51,7 +51,7 @@ def get_three_hop_neighbors(nodes, driver_grid_id_dict):
 
 def get_available_directions(grid_num,repo2any=False):
 
-    df_neighbor_centroid = pd.read_csv(f'my_data/new_grids_{grid_num}_centroid_coordinates.csv')
+    df_neighbor_centroid = pd.read_csv(f'../my_data/new_grids_{grid_num}_centroid_coordinates.csv')
 
     if repo2any == True:
         for id in range(grid_num):
@@ -106,17 +106,89 @@ def get_exponential_epsilons(initial_epsilon, final_epsilon, steps, decay=0.99, 
     """
     Exponential decay epsilons with optional pre-steps.
     """
-    # 前期保持初始值
     pre = np.full(pre_steps, initial_epsilon)
-
-    # 后续指数衰减
     decay_steps = steps - pre_steps
     epsilons = initial_epsilon * (decay ** np.arange(decay_steps))
-
-    # 保证不低于 final_epsilon
     epsilons = np.maximum(epsilons, final_epsilon)
-
     return np.concatenate([pre, epsilons])
+
+
+# ---------------------------------------------------------------------------
+# Refactored per-grid reposition strategy functions (logit-based)
+# ---------------------------------------------------------------------------
+
+def repo_demand_for_grid(candidates, waiting_orders_by_grid, beta=1.0):
+    """
+    Select target grid using demand-based logit selection.
+
+    Args:
+        candidates: array of candidate grid_ids
+        waiting_orders_by_grid: array of shape (grid_num,) with order counts
+        beta: logit sensitivity parameter
+
+    Returns:
+        chosen grid_id (int)
+    """
+    if len(candidates) == 0:
+        return None
+    cand_array = np.array(list(candidates))
+    demands = waiting_orders_by_grid[cand_array]
+    max_d = np.max(demands)
+    exp_u = np.exp(beta * (demands - max_d))
+    probs = exp_u / np.sum(exp_u)
+    return np.random.choice(cand_array, p=probs)
+
+
+def repo_ratio_for_grid(candidates, waiting_orders_by_grid, idle_by_grid,
+                         occupied_by_grid, beta=1.0):
+    """
+    Select target grid using demand-supply ratio logit selection.
+
+    Args:
+        candidates: array of candidate grid_ids
+        waiting_orders_by_grid: array of shape (grid_num,)
+        idle_by_grid: array of shape (grid_num,)
+        occupied_by_grid: array of shape (grid_num,)
+        beta: logit sensitivity parameter
+
+    Returns:
+        chosen grid_id (int)
+    """
+    if len(candidates) == 0:
+        return None
+    cand_array = np.array(list(candidates))
+    total_supply = idle_by_grid + occupied_by_grid
+    ratios = waiting_orders_by_grid[cand_array] / (total_supply[cand_array] + 0.001)
+    max_r = np.max(ratios)
+    exp_u = np.exp(beta * (ratios - max_r))
+    probs = exp_u / np.sum(exp_u)
+    return np.random.choice(cand_array, p=probs)
+
+
+def repo_vope_for_grid(candidates, cvals_row, beta=1.0):
+    """
+    Select target grid using value-network logit selection.
+
+    Args:
+        candidates: array of candidate grid_ids
+        cvals_row: array of discounted V values for each candidate
+        beta: logit sensitivity parameter
+
+    Returns:
+        chosen grid_id (int)
+    """
+    if len(candidates) == 0:
+        return None
+    cand_array = np.array(list(candidates))
+    max_v = np.max(cvals_row)
+    with np.errstate(over='ignore', invalid='ignore'):
+        exp_u = np.exp(beta * (cvals_row - max_v))
+    sum_exp = np.sum(exp_u)
+    if sum_exp > 0:
+        probs = exp_u / sum_exp
+    else:
+        probs = np.ones(len(cand_array)) / len(cand_array)
+    return np.random.choice(cand_array, p=probs)
 
 
 

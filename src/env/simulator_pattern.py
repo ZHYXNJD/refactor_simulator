@@ -16,8 +16,8 @@ import os
 
 class SimulatorPattern:
     def __init__(self,date):
-        self.request_file_name = f"my_data/cleaned_orders_pickle/orders_grid35_{date}.pkl"
-        self.driver_file_name = f"my_data/drivers_grid35_1000.pickle"
+        self.request_file_name = f"../my_data/cleaned_orders_pickle/orders_grid35_{date}.pkl"
+        self.driver_file_name = f"../my_data/drivers_grid35_1000.pickle"
         with open(self.request_file_name, 'rb') as f:
             print(f"load request file: {self.request_file_name}")
             self.request_all = pickle.load(f)

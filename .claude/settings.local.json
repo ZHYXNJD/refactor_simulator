@@ -42,7 +42,12 @@
       "Bash(git commit:*)",
       "Bash(git push:*)",
       "Bash(rm -f _test_repo_methods.py)",
-      "Bash(rm -rf test_result/_test_tmp)"
+      "Bash(rm -rf test_result/_test_tmp)",
+      "Bash(conda run *)",
+      "Bash(conda env *)",
+      "Bash(F:\\\\Anaconda\\\\envs\\\\pinn_baterry\\\\python.exe dynamic_reposition/test_imports.py)",
+      "Bash(\"F:/Anaconda/envs/pinn_baterry/python.exe\" dynamic_reposition/test_imports.py)",
+      "Bash(\"F:/Anaconda/envs/pinn_baterry/python.exe\" dynamic_reposition/run_warmup.py)"
     ]
   }
 }

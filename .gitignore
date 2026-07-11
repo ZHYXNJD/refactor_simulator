@@ -45,3 +45,10 @@ Thumbs.db
 # Environment
 .env
 venv/
+
+dynamic_reposition/
+dynamic_reposition/warmup_data/
+dynamic_reposition/train_output/
+dynamic_matching/idqn_result/
+
+result_server/

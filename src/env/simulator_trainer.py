@@ -34,6 +34,8 @@ from datetime import datetime
 
 from dynamic_matching.dynamic_matching_agent.idqn import IDQN
 from dynamic_matching.dynamic_matching_agent.maddpd_discreate import MADDPG
+from dynamic_reposition.td3_repo import TD3Discrete
+from dynamic_reposition.idqn_repo import IDQNRepo
 from src.utils.utilities import *
 
 
@@ -136,7 +138,8 @@ class SimulatorTrainer:
     # =========================================================================
     # 初始化 (Initialization)
     # =========================================================================
-    def __init__(self, simulator: Simulator, score_agent=None, dynamic_matching_agent=None):
+    def __init__(self, simulator: Simulator, score_agent=None, dynamic_matching_agent=None,
+                 dynamic_reposition_agent=None):
         """
         初始化训练器
 
@@ -144,11 +147,13 @@ class SimulatorTrainer:
             simulator: Simulator 环境实例
             score_agent:  用于价值估计
             dynamic_matching_agent: 动态匹配 Agent (MADDPG/IDQN)
+            dynamic_reposition_agent: 动态重定位 Agent (TD3Discrete/IDQNRepo)
         """
         self.action_table = None
         self.simulator = simulator
         self.score_agent = score_agent
         self.dynamic_matching_agent = dynamic_matching_agent
+        self.dynamic_reposition_agent = dynamic_reposition_agent
 
         self.total_step = 0
         self.evaluate_table = None
@@ -436,6 +441,266 @@ class SimulatorTrainer:
                     # 保存新模型
                     self.simulator.dynamic_matching_agent.save(model_path)
                     heapq.heappush(best_models, (score, epoch, model_path))
+
+    # =========================================================================
+    # Single Epoch Training - Dynamic Reposition
+    # =========================================================================
+    def run_training_epoch_reposition_method(self, epoch, train_config, logger):
+        """
+        执行单轮训练 (for Dynamic Reposition mode)
+
+        Args:
+            epoch: 当前 epoch 编号
+            train_config: 训练配置字典
+            logger: MetricsLogger 实例
+        """
+        # seed_list = [0, 42, 3407, 1024, 215]
+        seed_list = [0]
+        seed = seed_list[epoch % len(seed_list)]
+        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        if not train_config['parallel']:
+            self.simulator.reset(seed)
+        else:
+            self.simulator.reset(seed, given_data=True,
+                                 request_databases=train_config['REQUEST_DICT'][self.simulator.experiment_date],
+                                 driver_info=train_config['DRIVER_INFO'])
+        grid_num = self.simulator.grid_num
+
+        agent = self.simulator.dynamic_reposition_agent
+        if hasattr(agent, 'actor_losses_history'):
+            agent.actor_losses_history = [[] for _ in range(grid_num)]
+            agent.q_pi_history = []
+            agent.entropy_history = [[] for _ in range(grid_num)]
+            agent.critic1_losses_history = []
+            agent.critic2_losses_history = []
+        elif hasattr(agent, 'loss_history'):
+            agent.loss_history = [[] for _ in range(grid_num)]
+
+        agent.actor_counts = [[0] * agent.n_actions[0] for _ in range(grid_num)]
+
+        for step in range(self.simulator.finish_run_step + 1):
+            self.simulator.rl_step_train_reposition_method()
+
+        agent.current_episode += 1
+
+        if train_config['parallel']:
+            print(
+                f"Worker: {train_config['worker_id']} | Date: {self.simulator.experiment_date} | "
+                f"Epoch: {epoch}/{train_config['num_epochs']} | Total Reward: {self.simulator.total_reward}")
+        else:
+            print(f"Epoch: {epoch}/{train_config['num_epochs']} | Total Reward: {self.simulator.total_reward}")
+
+        # Log metrics
+        if isinstance(agent, TD3Discrete):
+            step_actor_losses = agent.actor_losses_history
+            step_critic1_loss = agent.critic1_losses_history
+            step_critic2_loss = agent.critic2_losses_history
+            step_entropy = agent.entropy_history
+            step_q_pi = agent.q_pi_history
+            step_action_counts = agent.actor_counts
+            agent.last_action_freq = [
+                [cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in range(grid_num)]
+            switch_counts = agent.strategy_tracker.get_switch_counts()
+            logger.log_rl_metrics(epoch, step_actor_losses, step_critic1_loss, step_critic2_loss,
+                                  step_action_counts, step_q_pi, step_entropy)
+            logger.log_env_metrics(epoch, self.simulator.total_reward)
+        elif isinstance(agent, IDQNRepo):
+            step_loss = agent.loss_history
+            step_action_counts = agent.actor_counts
+            switch_counts = agent.strategy_tracker.get_switch_counts()
+            action_counts = [
+                [cnt / max(1, sum(step_action_counts[i])) for cnt in step_action_counts[i]] for i in range(grid_num)]
+            loss_episode = np.mean(step_loss) if step_loss else 0.0
+            logger.writer.add_scalar('loss', loss_episode, epoch)
+            for i in range(grid_num):
+                for a in range(agent.n_actions[0]):
+                    logger.writer.add_scalar(f'Actor_{i}/Action_{a}_Freq', action_counts[i][a], epoch)
+            logger.writer.add_scalar('Total_Reward', self.simulator.total_reward, epoch)
+
+        for i in range(self.simulator.grid_num):
+            logger.writer.add_scalar(f'Strategy/Agent_{i}_Switches', switch_counts[i], epoch)
+
+    # =========================================================================
+    # Full Training - Dynamic Reposition
+    # =========================================================================
+    def dynamic_reposition_train(self, train_config):
+        """
+        完整训练流程 (for Dynamic Reposition mode)
+
+        Args:
+            train_config: 训练配置字典
+        """
+        grid_num = train_config['hyper_parameters']['grid_num']
+        decision_freq = train_config['hyper_parameters']['decision_freq']
+        write_path = train_config['output_path']
+        agent_type = train_config['hyper_parameters']['agent_type']
+        worker_id = train_config.get('worker_id',0)
+        if not os.path.exists(write_path):
+            os.makedirs(write_path)
+        if not train_config['parallel']:
+            writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
+        else:
+            writer_filename = os.path.join(
+                write_path,
+                f'{grid_num}_{decision_freq}_{agent_type}_' + datetime.now().strftime('%H%M%S') + '_' + str(
+                    worker_id))
+            os.makedirs(writer_filename, exist_ok=True)
+            with open(f'{writer_filename}/hyper_parameters.json', "w", encoding="utf-8") as f:
+                json.dump(train_config['hyper_parameters'], f, ensure_ascii=False, indent=4)
+
+        agent = self.simulator.dynamic_reposition_agent
+        num_actions = int(agent.n_actions[0])
+        logger = MetricsLogger(log_dir=writer_filename, num_agents=self.simulator.grid_num, num_actions=num_actions)
+
+        best_models = []
+        for epoch in range(train_config['num_epochs']):
+            self.run_training_epoch_reposition_method(epoch, train_config, logger)
+
+            score = self.simulator.total_reward
+            model_path = f"{writer_filename}/model_epoch{epoch}_score{int(score)}.pt"
+
+            if epoch % 50 in [0, 1, 2, 3, 4]:
+                agent.save(model_path)
+            if len(best_models) < 5:
+                agent.save(model_path)
+                heapq.heappush(best_models, (score, epoch, model_path))
+            else:
+                if score > best_models[0][0]:
+                    worst_score, worst_epoch, worst_path = heapq.heappop(best_models)
+                    os.remove(worst_path)
+                    agent.save(model_path)
+                    heapq.heappush(best_models, (score, epoch, model_path))
+
+    # =========================================================================
+    # Warmup Data Generation - Dynamic Reposition
+    # =========================================================================
+    def generate_warmup_data_reposition(self, train_config):
+        """
+        生成预热数据用于 Dynamic Reposition 训练
+
+        Args:
+            train_config: 训练配置字典
+        """
+        grid_num = train_config['hyper_parameters']['grid_num']
+        decision_freq = train_config['hyper_parameters']['decision_freq']
+        agent_type = train_config['hyper_parameters']['agent_type']
+        worker_id = train_config.get('worker_id', 0)
+
+        N_WARMUP_EPOCHS = (3 + 3 + 4) * 5
+        warmup_states = []
+        write_path = train_config['output_path']
+        if not os.path.exists(write_path):
+            os.makedirs(write_path)
+
+        print(f"Warmup: grid_num={grid_num}, decision_freq={decision_freq}, worker_id={worker_id}, agent_type={agent_type}")
+
+        seed_list = [0, 42, 3407, 1024, 215]
+        for epoch in range(N_WARMUP_EPOCHS):
+            seed = seed_list[epoch % len(seed_list)]
+            self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+            if not train_config['parallel']:
+                self.simulator.reset(seed)
+            else:
+                self.simulator.reset(seed, given_data=True,
+                                     request_databases=train_config['REQUEST_DICT'][self.simulator.experiment_date],
+                                     driver_info=train_config['DRIVER_INFO'])
+            simulator = self.simulator
+            agent = simulator.dynamic_reposition_agent
+            agent.load_offline_warmup = False
+            buffer = agent.buffer
+
+            policy_rng = np.random.RandomState(seed=epoch + 10000)
+            last_actions = policy_rng.choice([0, 1, 2], size=grid_num)
+            fixed_actions_for_epoch = None
+            if 15 <= epoch <= 29:
+                fixed_actions_for_epoch = policy_rng.choice([0, 1, 2], size=grid_num, replace=True)
+
+            for step in range(simulator.finish_run_step + 1):
+                if simulator.time % (simulator.decision_freq * 60) == 0 and simulator.time > simulator.t_initial:
+                    if simulator.repo_state_at_decision_time is not None:
+                        s0 = simulator.repo_state_at_decision_time
+                        s1 = simulator.get_reposition_global_state()
+                        reward = (simulator.repo_reward_by_grid_df / 100).values.tolist()
+                        buffer.push(s0, simulator.held_action_tuple[0], simulator.held_action_tuple[1],
+                                    reward, s1,
+                                    [1 if simulator.time == simulator.t_end else 0] * grid_num)
+                        warmup_states.append(s0)
+                        if simulator.time == simulator.t_end:
+                            break
+
+                    repo_state_current = simulator.get_reposition_global_state()
+                    simulator.repo_state_at_decision_time = repo_state_current
+
+                    # Phase 1: pure strategies
+                    if epoch <= 4:
+                        actions = [0] * grid_num
+                    elif epoch <= 9:
+                        actions = [1] * grid_num
+                    elif epoch <= 14:
+                        actions = [2] * grid_num
+                    # Phase 2: spatial mix, time-invariant
+                    elif epoch <= 29:
+                        actions = fixed_actions_for_epoch
+                    # Phase 3: spatio-temporal mix
+                    else:
+                        change_mask = policy_rng.rand(grid_num) > 0.5
+                        new_random_actions = policy_rng.choice([0, 1, 2], size=grid_num)
+                        last_actions = np.where(change_mask, new_random_actions, last_actions)
+                        actions = last_actions
+
+                    log_probs = [0 for _ in range(grid_num)]
+                    simulator.held_action_tuple = (actions, log_probs)
+                    simulator.repo_reward_by_grid_df = pd.Series(data=np.zeros(grid_num))
+
+                # Standard simulation steps
+                wait_requests = deepcopy(simulator.wait_requests)
+                driver_table = deepcopy(simulator.driver_table)
+                matched_pair_actual_indexes, matched_itinerary = order_dispatch(
+                    wait_requests, driver_table, simulator.maximal_pickup_distance,
+                    simulator.dispatch_method, simulator.method)
+                df_new_matched_requests, df_update_wait_requests = simulator.update_info_after_matching_multi_process(
+                    matched_pair_actual_indexes, matched_itinerary)
+
+                if len(df_new_matched_requests) != 0:
+                    simulator.total_reward += np.sum(df_new_matched_requests['designed_reward'].values)
+
+                if len(df_new_matched_requests) > 0:
+                    matched_requests_by_grid = df_new_matched_requests.groupby('origin_grid_id')[
+                        'designed_reward'].sum()
+                    matched_requests_li = matched_requests_by_grid.reindex(
+                        [i for i in range(grid_num)], fill_value=0)
+                    simulator.total_reward_by_grid += matched_requests_li
+                    simulator.repo_reward_by_grid_df += matched_requests_li
+
+                simulator.matched_requests_num += len(df_new_matched_requests)
+
+                if simulator.end_of_episode == 0:
+                    simulator.matched_requests = pd.concat([simulator.matched_requests, df_new_matched_requests],
+                                                           axis=0)
+                    simulator.matched_requests = simulator.matched_requests.reset_index(drop=True)
+                    simulator.wait_requests = df_update_wait_requests.reset_index(drop=True)
+                    simulator.step_bootstrap_new_orders(self.score_agent)
+
+                # Reposition at decision points
+                if simulator.time % (simulator.decision_freq * 60) == 0 and simulator.time > simulator.t_initial:
+                    simulator.repo_driver_dynamic()
+
+                simulator.update_state()
+                simulator.driver_online_offline_update()
+                simulator.update_time()
+
+            print(f"Warmup Epoch: {epoch}/{N_WARMUP_EPOCHS} | Total Reward: {simulator.total_reward}")
+            print(f"--- Collected states: {len(buffer)} ---")
+
+        # Fit scaler
+        print("--- Fitting StandardScaler ---")
+        scaler = StandardScaler()
+        scaler.fit(np.array(warmup_states))
+        print("--- Scaler fitted ---")
+
+        with open(write_path + f'/grid_{grid_num}_freq_{decision_freq}_repo_state.pkl', 'wb') as f:
+            pickle.dump(list(buffer.buffer), f)
+        joblib.dump(scaler, write_path + f'/grid_{grid_num}_freq_{decision_freq}_repo_state_scaler.pkl')
 
     # =========================================================================
     # Accumulate Metrics - [Common]

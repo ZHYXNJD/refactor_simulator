@@ -1,18 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <project version="4">
-  <component name="PublishConfigData" serverName="hy" remoteFilesAllowedToDisappearOnAutoupload="false">
+  <component name="PublishConfigData" remoteFilesAllowedToDisappearOnAutoupload="false">
     <serverData>
-      <paths name="hy">
+      <paths name="zhy@10.21.17.36:10022 password">
         <serverdata>
           <mappings>
             <mapping local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
-      <paths name="root@root@connect.nmb1.seetacloud.com:39122 password">
+      <paths name="zhy@10.21.17.36:10022 password (2)">
         <serverdata>
           <mappings>
-            <mapping deploy="/Transportation_Simulator" local="$PROJECT_DIR$" />
+            <mapping deploy="/home/zhy/hy_project/refactor_simulator" local="$PROJECT_DIR$" />
           </mappings>
         </serverdata>
       </paths>
