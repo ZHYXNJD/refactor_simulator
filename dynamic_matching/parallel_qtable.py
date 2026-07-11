@@ -2,12 +2,12 @@ import os
 import time
 from copy import deepcopy
 import pandas as pd
-from ..value_estimatior.sarsa import SarsaAgent
+from src.agents.sarsa import SarsaAgent
 import multiprocessing as mp
 import pickle
 import torch
-from ..simulator_env import Simulator
-from ..simulator_trainer import SimulatorTrainer
+from src.env.simulator_env import Simulator
+from src.env.simulator_trainer import SimulatorTrainer
 
 
 # --- 1. 全局变量区域 ---
@@ -36,7 +36,7 @@ ROAD_NETWORK = {}
 DRIVER_INFO_DICT = {}
 
 # for grid_num in [8,35,63]:
-for grid_num in [35,63]:
+for grid_num in [8,35,63]:
 
     result = pd.read_csv(f'../my_data/new_grids_{grid_num}.csv', index_col='node_id', dtype={'node_id': float})
     ROAD_NETWORK[grid_num] = result
@@ -58,20 +58,20 @@ def run_simulation_and_train(config,worker_id):
     matching_agent = SarsaAgent(**config)
 
     # ... 定义网络，开始训练 ...
-    simulator = Simulator(**config, matching_agent=matching_agent,mapping_dict=MAPPING_DICT,road_network=ROAD_NETWORK)
+    simulator = Simulator(**config, score_agent=matching_agent,mapping_dict=MAPPING_DICT,road_network=ROAD_NETWORK)
 
     # Initialize SimulatorTrainer
     trainer = SimulatorTrainer(
         simulator=simulator,
-        matching_agent=matching_agent,
+        score_agent=matching_agent,
     dynamic_matching_agent=None)
 
     trainer.train(
         train_config={
-            'num_epochs': 501,
+            'num_epochs': 30,
             'train_dates': TRAIN_DATE,
             'driver_num': 1000,
-            'output_path': "check_penalty_alpha",
+            'output_path': "qtable_0711",
             'flag_load': False,
             'parallel': True,
             'worker_id': worker_id,
