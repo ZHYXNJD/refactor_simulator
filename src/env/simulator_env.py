@@ -704,7 +704,10 @@ class Simulator:
             self.driver_table.loc[cor_driver[con_remain], 'target_grid_id'] = new_matched_requests[
                 'dest_grid_id'].to_numpy(dtype=int)
             self.driver_table.loc[cor_driver[con_remain], 'remaining_time'] = pickup_time
-            self.driver_table.loc[cor_driver[con_remain], 'matched_order_id'] = new_matched_requests['order_id'].values
+            # Driver tables use Pandas' strict string dtype on newer versions;
+            # order IDs are numeric in the sampled request data.
+            self.driver_table.loc[cor_driver[con_remain], 'matched_order_id'] = \
+                new_matched_requests['order_id'].astype(str).to_numpy(dtype=object)
             self.driver_table.loc[cor_driver[con_remain], 'total_idle_time'] = 0
             self.driver_table.loc[cor_driver[con_remain], 'time_to_last_cruising'] = 0
             self.driver_table.loc[cor_driver[con_remain], 'current_road_node_index'] = 0
