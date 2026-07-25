@@ -96,6 +96,12 @@ class Simulator:
         # register dynamic matching agent
         self.dynamic_matching_agent = dynamic_matching_agent
         self.dynamic_reposition_agent = dynamic_reposition_agent
+        # A framework wrapper can drive dynamic-matching actions directly.
+        # In that mode Simulator remains a transition/reward model and must
+        # never query or update a learning agent itself.
+        self.external_dynamic_matching_actions = bool(
+            kwargs.get('external_dynamic_matching_actions', False)
+        )
 
         self.mapping_dict = mapping_dict
 
@@ -2517,7 +2523,9 @@ class Simulator:
         """
 
         # --- 1. Agent 决策与数据存储 ---
-        if self.time % (self.decision_freq * 60) == 0 and self.time > self.t_initial:
+        if (self.time % (self.decision_freq * 60) == 0 and
+                self.time > self.t_initial and
+                not self.external_dynamic_matching_actions):
 
             # --- A. 存储上一个 15 分钟的 (S_k, A_k, R_sum, S_k+1) ---
             # (跳过第一次, 因为那时还没有 S_k)
@@ -2626,6 +2634,56 @@ class Simulator:
         self.driver_online_offline_update()
         # Step 7: update time
         self.update_time()
+
+    def set_external_dynamic_matching_actions(self, actions):
+        """Set the matching rule selected by an external RL environment.
+
+        ``actions[i]`` selects the matching-score rule for origin grid ``i``:
+        0 is instant reward, 1 is pickup distance and 2 is the fixed Q-table
+        score.  This method deliberately contains no policy or learning code.
+        """
+        if len(actions) != self.grid_num:
+            raise ValueError(
+                f'Expected {self.grid_num} matching actions, got {len(actions)}.')
+        normalized_actions = []
+        for action in actions:
+            action_value = int(action)
+            if action_value not in (0, 1, 2):
+                raise ValueError(
+                    f'Dynamic-matching actions must be 0, 1, or 2; got {action!r}.')
+            normalized_actions.append(action_value)
+        self.held_action_tuple = (normalized_actions, [0.0] * self.grid_num)
+        if self.current_decision_index < self.max_decision_index:
+            self.choose_action[:, self.current_decision_index] = normalized_actions
+            self.current_decision_index += 1
+
+    def step_dynamic_matching_interval(self, actions):
+        """Advance one externally controlled matching decision interval.
+
+        This is the algorithm-independent boundary used by Gymnasium and
+        PettingZoo adapters.  The supplied grid actions remain fixed while the
+        minute-level simulator advances.  The returned per-grid rewards are
+        raw platform rewards accumulated over exactly this decision interval.
+        """
+        if self.rl_mode != 'dynamic_matching':
+            raise RuntimeError(
+                'step_dynamic_matching_interval is only available in '
+                "rl_mode='dynamic_matching'."
+            )
+        if self.time is None or self.driver_table is None:
+            raise RuntimeError('Call reset() before stepping the simulator.')
+        if self.time >= self.t_end or self.end_of_episode:
+            raise RuntimeError('Cannot step a completed simulation episode.')
+
+        self.external_dynamic_matching_actions = True
+        self.set_external_dynamic_matching_actions(actions)
+        self.reward_by_grid_df = pd.Series(np.zeros(self.grid_num, dtype=float))
+        interval_end = min(self.time + self.decision_freq * 60, self.t_end)
+
+        while self.time < interval_end:
+            self.rl_step_train_matching_method()
+
+        return self.get_global_state(), self.reward_by_grid_df.to_numpy(dtype=float)
 
     # =========================================================================
     # RL 训练步骤 - 动态重定位方法选择 (RL Training Step - Dynamic Reposition)
