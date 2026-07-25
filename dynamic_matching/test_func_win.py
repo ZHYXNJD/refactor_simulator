@@ -83,7 +83,8 @@ def test_result(grid_num,decision_freq,rl_mode,method,config_path:List):
     driver_origin_loc_grid = pd.merge(driver_origin_loc, result[['lng', 'lat', 'grid_id']], on=['lng', 'lat'],
                                           how='left')
     driver_info = deepcopy(DRIVER_INFO)
-    driver_info['grid_id'] = driver_origin_loc_grid['grid_id']
+    # Assign positionally: the merge index differs from the sampled driver index.
+    driver_info['grid_id'] = driver_origin_loc_grid['grid_id'].to_numpy()
 
     DRIVER_INFO_DICT[grid_num] = driver_info
 

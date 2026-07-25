@@ -532,8 +532,35 @@ def sample_all_drivers(driver_info, t_initial, t_end, driver_sample_ratio=1, dri
 #     return skewnorm.rvs(a, loc=u, scale=thegma, size=input_size)
 
 
+def discounted_reward_uniform(reward, elapsed_seconds, gamma, time_unit_seconds):
+    """Discount uniformly accrued transition revenue in fixed time units."""
+    rewards = np.asarray(reward, dtype=float)
+    elapsed = np.maximum(np.asarray(elapsed_seconds, dtype=float), 0.0)
+    if time_unit_seconds <= 0:
+        raise ValueError('time_unit_seconds must be positive')
+    if not 0 < gamma <= 1:
+        raise ValueError('gamma must be in (0, 1]')
+
+    result = rewards.copy()
+    positive = elapsed > 0
+    if not np.any(positive) or gamma == 1:
+        return result
+
+    duration = elapsed[positive]
+    full_units = np.floor(duration / time_unit_seconds).astype(int)
+    remainder = duration - full_units * time_unit_seconds
+    geometric_sum = (1.0 - np.power(gamma, full_units)) / (1.0 - gamma)
+    discounted_duration = (
+        time_unit_seconds * geometric_sum +
+        remainder * np.power(gamma, full_units)
+    )
+    result[positive] = rewards[positive] * discounted_duration / duration
+    return result
+
+
 def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, dispatch_method='LD',
-                   method='pickup_distance'):
+                   method='pickup_distance', reject_nonpositive=False,
+                   advantage_context=None):
     """
     :param wait_requests: the requests of orders
     :type wait_requests: pandas.DataFrame
@@ -639,6 +666,92 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
             final_order_weights = order_data[final_m_indices, 3]  # 这是原始 reward
             final_driver_ids = driver_data[final_n_indices, 2]
 
+            if advantage_context is not None:
+                score_agent = advantage_context['score_agent']
+                q_table = score_agent.q_value_table
+                current_time = float(advantage_context['current_time'])
+                t_initial = float(advantage_context['t_initial'])
+                decision_freq = float(advantage_context['decision_freq'])
+                vehicle_speed = float(advantage_context['vehicle_speed'])
+                gamma = float(advantage_context['discount_rate'])
+                time_unit_seconds = float(advantage_context['discount_time_unit_seconds'])
+                score_mode = advantage_context.get('score_mode', 'state_value')
+                reward_mode = advantage_context.get('reward_mode', 'undiscounted')
+
+                order_rows = wait_requests.iloc[final_m_indices]
+                driver_rows = idle_driver_table.iloc[final_n_indices]
+                trip_seconds = order_rows['trip_time'].to_numpy(dtype=float)
+                pickup_seconds = final_dis_array / vehicle_speed * 3600.0
+                elapsed_seconds = np.maximum(pickup_seconds + trip_seconds, 0.0)
+                rewards = order_rows['designed_reward'].to_numpy(dtype=float)
+                if reward_mode == 'uniform_discounted':
+                    edge_rewards = discounted_reward_uniform(
+                        rewards, elapsed_seconds, gamma, time_unit_seconds
+                    )
+                elif reward_mode == 'undiscounted':
+                    edge_rewards = rewards
+                else:
+                    raise ValueError(f'Unknown reward_mode={reward_mode!r}')
+
+                current_slice = int((current_time - t_initial - 1) /
+                                    (decision_freq * 60.0))
+                current_slice = int(np.clip(current_slice, 0, q_table.shape[0] - 1))
+                end_slices = ((current_time + elapsed_seconds - t_initial - 1) //
+                              (decision_freq * 60.0)).astype(int)
+                destination_grids = order_rows['dest_grid_id'].to_numpy(dtype=int)
+                driver_grids = driver_rows['grid_id'].to_numpy(dtype=int)
+                discounts = np.power(gamma, elapsed_seconds / time_unit_seconds)
+                future_values = np.zeros(len(end_slices), dtype=float)
+                non_terminal = end_slices < q_table.shape[0]
+                future_values[non_terminal] = (
+                    discounts[non_terminal] *
+                    q_table[end_slices[non_terminal], destination_grids[non_terminal]]
+                )
+
+                order_action_values = edge_rewards + future_values
+                comparison_baseline_values = None
+                if score_mode == 'advantage':
+                    origin_values = q_table[current_slice, driver_grids]
+                    comparison_baseline_values = origin_values
+                    final_order_weights = order_action_values - origin_values
+                    reject_nonpositive = True
+                elif score_mode == 'idle_relative_advantage':
+                    # Rejecting the current order does not commit a driver to
+                    # five idle minutes: matching is executed again one minute
+                    # later.  The dummy/unmatched edge must therefore use the
+                    # value at the next matching scan, discounted by 1/5 of a
+                    # five-minute discount unit.
+                    idle_elapsed_seconds = float(
+                        advantage_context.get('idle_comparison_interval_seconds', 60.0)
+                    )
+                    idle_next_slice = int((
+                        current_time + idle_elapsed_seconds - t_initial - 1
+                    ) // (decision_freq * 60.0))
+                    idle_discount = gamma ** (idle_elapsed_seconds / time_unit_seconds)
+                    comparison_baseline_values = np.zeros(len(driver_grids), dtype=float)
+                    if 0 <= idle_next_slice < q_table.shape[0]:
+                        comparison_baseline_values = (
+                            idle_discount * q_table[idle_next_slice, driver_grids]
+                        )
+                    final_order_weights = (
+                        order_action_values - comparison_baseline_values
+                    )
+                    reject_nonpositive = True
+                elif score_mode == 'state_value':
+                    final_order_weights = order_action_values
+                else:
+                    raise ValueError(f'Unknown score_mode={score_mode!r}')
+
+                advantage_context['diagnostics'] = {
+                    'candidate_weights': np.asarray(final_order_weights, dtype=float),
+                    'nonpositive_ratio': float(np.mean(final_order_weights <= 0)),
+                    'order_action_values': np.asarray(order_action_values, dtype=float),
+                    'comparison_baseline_values': (
+                        np.asarray(comparison_baseline_values, dtype=float)
+                        if comparison_baseline_values is not None else np.asarray([], dtype=float)
+                    ),
+                }
+
             # 4. 构建 LD 函数的输入
             #    注意：我们不再创建 NumPy 数组再 .tolist()
             #    我们直接构建 LD 期望的 list[list]
@@ -688,7 +801,19 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
                 return [], []
 
             # 5. [核心优化] 直接传入 list，而不是 np.array().tolist()
-            matched_pair_actual_indexs = LD(order_driver_pair_list, method)
+            matched_pair_actual_indexs = LD(
+                order_driver_pair_list,
+                method,
+                reject_nonpositive=reject_nonpositive,
+            )
+
+            if not matched_pair_actual_indexs:
+                return [], []
+            if advantage_context is not None:
+                advantage_context['diagnostics']['accepted_weights'] = np.asarray(
+                    [pair[2] for pair in matched_pair_actual_indexs],
+                    dtype=float,
+                )
 
             # [新代码] 1. 提取 ID
             # (确保 LD 返回的 ID 是 int 或 float，如果不是，请转换)

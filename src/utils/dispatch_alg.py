@@ -1,9 +1,13 @@
 import numpy as np
 
-def LD(dispatch_observ,method):
+def LD(dispatch_observ, method, reject_nonpositive=False):
 
 
     dispatch_action = []
+    if reject_nonpositive:
+        dispatch_observ = [pair for pair in dispatch_observ if pair[2] > 0]
+        if not dispatch_observ:
+            return dispatch_action
 
     # 我们使用 set() 来自动去重，这比 np.unique() 更快
     order_ids_set = set()
@@ -101,6 +105,8 @@ def LD(dispatch_observ,method):
 
         # 检查订单或司机是否已被分配
         if assigned_order_bool[m] or assigned_driver_bool[n]:
+            continue
+        if reject_nonpositive and pair['reward'] <= 0:
             continue
 
         # 标记为已分配

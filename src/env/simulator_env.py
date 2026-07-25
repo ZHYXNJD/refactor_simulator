@@ -22,7 +22,11 @@ from src.env.simulator_pattern import SimulatorPattern
 from src.agents.value_estimator import ValueNetwork
 from src.utils.utilities import *
 import warnings
+import pandas as pd
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+# Keep online transition rewards on the same scale as the offline warmup data.
+GRID_REWARD_NORMALIZER = 100.0
 
 
 # =============================================================================
@@ -73,8 +77,10 @@ class Simulator:
         self.price_per_km = 5
         self.seed = None
         self.seed_list = [0, 42, 3407, 1024, 215]
-        self.t_initial = 18000
-        self.t_end = 36000
+        self.t_initial = int(kwargs.get('t_initial', 5 * 3600))
+        self.t_end = int(kwargs.get('t_end', 10 * 3600))
+        if self.t_end <= self.t_initial:
+            raise ValueError('t_end must be later than t_initial')
         self.delta_t = 60
         self.vehicle_speed = 22.788
         self.repo_speed = 22.788
@@ -321,6 +327,30 @@ class Simulator:
             self.score_discount_rate = kwargs.get('score_discount_rate', self.score_agent.discount_rate)
         else:
             self.score_discount_rate = kwargs.get('score_discount_rate', 0.95)
+        self.discount_mode = kwargs.get(
+            'discount_mode',
+            getattr(self.score_agent, 'discount_mode', 'time_bin'),
+        )
+        self.discount_time_unit_seconds = float(kwargs.get(
+            'discount_time_unit_seconds',
+            getattr(self.score_agent, 'discount_time_unit_seconds', 300.0),
+        ))
+        self.matching_score_mode = kwargs.get('matching_score_mode', 'state_value')
+        valid_matching_score_modes = {
+            'state_value',
+            'advantage',
+            'idle_relative_advantage',
+        }
+        if self.matching_score_mode not in valid_matching_score_modes:
+            raise ValueError(f'Unknown matching_score_mode={self.matching_score_mode!r}')
+        self.idle_comparison_interval_seconds = float(
+            kwargs.get('idle_comparison_interval_seconds', self.delta_t)
+        )
+        if self.idle_comparison_interval_seconds <= 0:
+            raise ValueError('idle_comparison_interval_seconds must be positive')
+        self.reward_discount_mode = kwargs.get('reward_discount_mode', 'undiscounted')
+        if self.reward_discount_mode not in {'undiscounted', 'uniform_discounted'}:
+            raise ValueError(f'Unknown reward_discount_mode={self.reward_discount_mode!r}')
 
 
 
@@ -353,8 +383,37 @@ class Simulator:
 
         # 创建一个私有的随机生成器实例，初始为 None
         self.rng = None
+        self.np_rng = None
 
         self.penalty_alpha = kwargs.get('penalty_alpha', 0.001)
+        self.reward_scheme = kwargs.get('reward_scheme', 'fixed_penalty')
+        valid_reward_schemes = {
+            'penalty_zero',
+            'fixed_penalty',
+            'spatiotemporal_penalty',
+            'idle_transitions',
+        }
+        if self.reward_scheme not in valid_reward_schemes:
+            raise ValueError(
+                f'Unknown reward_scheme={self.reward_scheme!r}; '
+                f'expected one of {sorted(valid_reward_schemes)}'
+            )
+        self.penalty_alpha_min = kwargs.get('penalty_alpha_min', 0.001)
+        self.penalty_alpha_max = kwargs.get('penalty_alpha_max', 0.01)
+        self.penalty_ema_beta = kwargs.get('penalty_ema_beta', 0.05)
+        self.penalty_reward_cap_ratio = kwargs.get('penalty_reward_cap_ratio', None)
+        self.idle_cost_per_minute = kwargs.get('idle_cost_per_minute', 0.0)
+        self.idle_transition_interval_seconds = int(
+            kwargs.get('idle_transition_interval_seconds', 300)
+        )
+        if self.idle_transition_interval_seconds <= 0:
+            raise ValueError('idle_transition_interval_seconds must be positive')
+
+        # Persistent space-time statistics for the normalized-penalty scheme.
+        # They deliberately survive episode resets and accumulate over train days.
+        max_time_slice = int(300 / self.decision_freq)
+        self.penalty_ema_by_state = np.full((max_time_slice, self.grid_num), np.nan, dtype=float)
+        self.global_penalty_ema = np.nan
 
         # pattern = SimulatorPattern(self.experiment_date)
         # self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
@@ -411,8 +470,35 @@ class Simulator:
 
         self.wait_requests = pd.DataFrame(columns=self.request_columns)
         self.matched_requests = pd.DataFrame(columns=self.request_columns)
+        # A record belongs to one simulation episode/date.  Keeping the old
+        # DataFrame across reset() makes test-day counts and averages cumulative.
+        self.record = ""
 
         self.total_reward = 0
+        # driver_id -> (anchor_time, anchor_grid). An idle transition is emitted
+        # only after a driver remains continuously idle for a full interval.
+        self.idle_transition_anchors = {}
+        self.qtable_episode_metrics = {
+            'original_rewards': [],
+            'discounted_rewards': [],
+            'shaped_rewards': [],
+            'raw_penalties': [],
+            'weighted_penalties': [],
+            'penalty_reward_ratios': [],
+            'dynamic_alphas': [],
+            'matched_elapsed_minutes': [],
+            'matched_discounts': [],
+            'idle_elapsed_minutes': [],
+            'idle_discounts': [],
+            'candidate_advantages': [],
+            'accepted_advantages': [],
+            'nonpositive_advantage_ratios': [],
+            'candidate_order_action_values': [],
+            'comparison_baseline_values': [],
+            'matched_transitions': 0,
+            'idle_transitions': 0,
+            'same_bin_transitions': 0,
+        }
         self.cumulative_on_trip_driver_num = 0
         self.cumulative_on_reposition_driver_num = 0
         self.occupancy_rate = 0
@@ -488,6 +574,11 @@ class Simulator:
         """
         if seed is not None:
             self.rng = np.random.RandomState(seed)
+            self.np_rng = np.random.default_rng(seed)
+            # Some legacy code below still uses NumPy's module-level RNG.
+            # Reset it as well so episode-level environment randomness is
+            # reproducible and remains separate from Torch policy sampling.
+            np.random.seed(seed)
             self.seed = seed
         self.initial_base_tables(given_data, request_databases, driver_info)
 
@@ -623,6 +714,19 @@ class Simulator:
 
                 # reward_array = new_matched_requests['designed_reward'].values / 20
                 original_rewards = new_matched_requests['designed_reward'].values
+                elapsed_seconds = np.maximum(
+                    next_state_array[:, 0] - state_array[:, 0],
+                    0.0,
+                )
+                if self.reward_discount_mode == 'uniform_discounted':
+                    discounted_rewards = discounted_reward_uniform(
+                        original_rewards,
+                        elapsed_seconds,
+                        self.score_discount_rate,
+                        self.discount_time_unit_seconds,
+                    )
+                else:
+                    discounted_rewards = np.asarray(original_rewards, dtype=float)
 
                 # 空车的惩罚 (2025-04-12: 恢复用于在线 V_ope 学习)
                 idle_drivers = self.driver_table[
@@ -631,11 +735,84 @@ class Simulator:
                 grid_match_counts = new_matched_requests['origin_grid_id'].value_counts()
                 grid_unit_penalty = grid_total_wait / (grid_match_counts + 1)  # +1 防止除零
                 matched_grids = new_matched_requests['origin_grid_id'].values
-                penalties = pd.Series(matched_grids).map(grid_unit_penalty).fillna(0).values
+                raw_penalties = pd.Series(matched_grids).map(grid_unit_penalty).fillna(0).values.astype(float)
 
                 # penalty_alpha 控制惩罚权重
-                penalty_alpha = self.penalty_alpha
-                reward_array = original_rewards - (penalty_alpha * penalties)
+                if self.reward_scheme in ['penalty_zero', 'idle_transitions']:
+                    dynamic_alphas = np.zeros_like(raw_penalties)
+                    weighted_penalties = np.zeros_like(raw_penalties)
+                elif self.reward_scheme == 'fixed_penalty':
+                    dynamic_alphas = np.full_like(raw_penalties, self.penalty_alpha)
+                    weighted_penalties = dynamic_alphas * raw_penalties
+                elif self.reward_scheme == 'spatiotemporal_penalty':
+                    time_slice = int((self.time - self.t_initial) // (self.decision_freq * 60))
+                    time_slice = int(np.clip(time_slice, 0, self.penalty_ema_by_state.shape[0] - 1))
+                    beta = self.penalty_ema_beta
+
+                    observed = grid_unit_penalty.dropna().astype(float)
+                    if len(observed) > 0:
+                        observed_mean = float(observed.mean())
+                        if np.isnan(self.global_penalty_ema):
+                            self.global_penalty_ema = observed_mean
+                        else:
+                            self.global_penalty_ema = (1 - beta) * self.global_penalty_ema + beta * observed_mean
+
+                        for grid_id, raw_penalty in observed.items():
+                            grid_id = int(grid_id)
+                            previous = self.penalty_ema_by_state[time_slice, grid_id]
+                            if np.isnan(previous):
+                                self.penalty_ema_by_state[time_slice, grid_id] = raw_penalty
+                            else:
+                                self.penalty_ema_by_state[time_slice, grid_id] = \
+                                    (1 - beta) * previous + beta * raw_penalty
+
+                    local_ema = self.penalty_ema_by_state[time_slice, matched_grids.astype(int)]
+                    fallback = self.global_penalty_ema if not np.isnan(self.global_penalty_ema) else 0.0
+                    local_ema = np.where(np.isnan(local_ema), fallback, local_ema)
+                    scale = fallback / np.maximum(local_ema, 1e-6) if fallback > 0 else np.ones_like(local_ema)
+                    dynamic_alphas = np.clip(
+                        self.penalty_alpha * scale,
+                        self.penalty_alpha_min,
+                        self.penalty_alpha_max,
+                    )
+                    weighted_penalties = dynamic_alphas * raw_penalties
+                else:
+                    raise ValueError(f'Unknown reward_scheme: {self.reward_scheme}')
+
+                if self.penalty_reward_cap_ratio is not None:
+                    weighted_penalties = np.minimum(
+                        weighted_penalties,
+                        self.penalty_reward_cap_ratio * original_rewards,
+                    )
+
+                reward_array = discounted_rewards - weighted_penalties
+
+                metrics = self.qtable_episode_metrics
+                metrics['original_rewards'].extend(original_rewards.tolist())
+                metrics['discounted_rewards'].extend(discounted_rewards.tolist())
+                metrics['shaped_rewards'].extend(reward_array.tolist())
+                metrics['raw_penalties'].extend(raw_penalties.tolist())
+                metrics['weighted_penalties'].extend(weighted_penalties.tolist())
+                metrics['penalty_reward_ratios'].extend(
+                    (weighted_penalties / np.maximum(original_rewards, 1e-6)).tolist()
+                )
+                metrics['dynamic_alphas'].extend(dynamic_alphas.tolist())
+                metrics['matched_transitions'] += len(reward_array)
+
+                current_slices = ((state_array[:, 0] - self.t_initial - 1) //
+                                  (self.decision_freq * 60)).astype(int)
+                next_slices = ((next_state_array[:, 0] - self.t_initial - 1) //
+                               (self.decision_freq * 60)).astype(int)
+                matched_discounts = self._score_discount_factor(
+                    elapsed_seconds,
+                    next_slices - current_slices,
+                    self.score_agent,
+                )
+                metrics['matched_elapsed_minutes'].extend((elapsed_seconds / 60.0).tolist())
+                metrics['matched_discounts'].extend(
+                    np.asarray(matched_discounts, dtype=float).reshape(-1).tolist()
+                )
+                metrics['same_bin_transitions'] += int(np.sum(next_slices == current_slices))
 
                 self.dispatch_transitions_buffer[0] = np.concatenate(
                     [self.dispatch_transitions_buffer[0], state_array])
@@ -744,7 +921,7 @@ class Simulator:
                 # assign weight array
                 if self.rl_mode == 'matching':
                     current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq * 60))
-                    num_slices = int(18000 / (self.decision_freq * 60))
+                    num_slices = int((self.t_end - self.t_initial) / (self.decision_freq * 60))
 
                     if self.method in ['instant_reward', 'ir']:
                         weight_array = wait_info['designed_reward'].values
@@ -759,15 +936,23 @@ class Simulator:
                                 wait_info['designed_reward'].values.tolist(),
                                 wait_info['dest_grid_id'].values.tolist())):
 
-                            end_time_slice = int((self.decision_freq * 60))
+                            estimated_elapsed_seconds = (
+                                    0.5 * self.maximal_pickup_distance /
+                                    self.vehicle_speed * 3600 + travel_time)
+                            end_time_slice = int((
+                                    self.time + estimated_elapsed_seconds - self.t_initial - 1) / (
+                                    self.decision_freq * 60))
 
                             if end_time_slice >= num_slices:
                                 original_trip_score = reward
                             else:
-                                next_state = State(end_time_slice, int(dest_grid_id))
-                                original_trip_score = reward + (
-                                        self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
-                                                      score_agent.q_value_table[next_state]
+                                discount = self._score_discount_factor(
+                                    estimated_elapsed_seconds,
+                                    end_time_slice - current_time_slice,
+                                    score_agent,
+                                )
+                                original_trip_score = reward + discount * \
+                                                      score_agent.q_value_table[end_time_slice, int(dest_grid_id)]
                             weight_array[i] = original_trip_score
                             self.transfer_request_num += 1
 
@@ -780,16 +965,22 @@ class Simulator:
                             if origin_grid_id in [0, 1, 2]:
                                 weight_array[i] = reward
                             elif origin_grid_id in [3, 4, 5, 6, 7, 20, 21, 22]:
+                                estimated_elapsed_seconds = (
+                                        0.5 * self.maximal_pickup_distance /
+                                        self.vehicle_speed * 3600 + travel_time)
                                 end_time_slice = int((
-                                                                 self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (
+                                                                 self.time + estimated_elapsed_seconds - self.t_initial - 1) / (
                                                              self.decision_freq * 60))
                                 if end_time_slice >= num_slices:
                                     original_trip_score = reward
                                 else:
-                                    next_state = State(end_time_slice, int(dest_grid_id))
-                                    original_trip_score = reward + (
-                                            self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
-                                                          score_agent.q_value_table[next_state]
+                                    discount = self._score_discount_factor(
+                                        estimated_elapsed_seconds,
+                                        end_time_slice - current_time_slice,
+                                        score_agent,
+                                    )
+                                    original_trip_score = reward + discount * \
+                                                          score_agent.q_value_table[end_time_slice, int(dest_grid_id)]
                                 weight_array[i] = original_trip_score
                             else:
                                 pass
@@ -818,23 +1009,29 @@ class Simulator:
                             pass
                         else:  # RL
                             current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq * 60))
-                            num_slices = int(18000 / (self.decision_freq * 60))
+                            num_slices = int((self.t_end - self.t_initial) / (self.decision_freq * 60))
+                            estimated_elapsed_seconds = (
+                                    0.5 * self.maximal_pickup_distance /
+                                    self.vehicle_speed * 3600 + travel_time)
                             end_time_slice = int((
-                                                             self.time + 0.5 * self.maximal_pickup_distance / self.vehicle_speed * 3600 + travel_time - self.t_initial - 1) / (
+                                                             self.time + estimated_elapsed_seconds - self.t_initial - 1) / (
                                                              self.decision_freq * 60))
                             if end_time_slice >= num_slices:
                                 original_trip_score = reward
                             else:
-                                next_state = State(end_time_slice, int(dest_grid_id))
                                 # 只用一个qtable small size乘以的缩放系数为0.3
                                 # middle size 系数0.5
                                 # original_trip_score = reward + scale_coeff * (
                                 #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
                                 #                       score_agent.strategy.q_value_table[next_state]
                                 # train dynamic matching的时候打开这个
-                                original_trip_score = reward + (
-                                        self.score_discount_rate ** (end_time_slice - current_time_slice)) * \
-                                                      score_agent.q_value_table[next_state]
+                                discount = self._score_discount_factor(
+                                    estimated_elapsed_seconds,
+                                    end_time_slice - current_time_slice,
+                                    score_agent,
+                                )
+                                original_trip_score = reward + discount * \
+                                                      score_agent.q_value_table[end_time_slice, int(dest_grid_id)]
                             weight_array[i] = original_trip_score
                             dynamic_matching_array[i] = 2
 
@@ -1094,7 +1291,8 @@ class Simulator:
 
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
-                                                                        self.dispatch_method, self.method)
+                                                                        self.dispatch_method, self.method,
+                                                                        advantage_context=self._matching_value_context())
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -1135,7 +1333,9 @@ class Simulator:
             self.wait_requests = df_update_wait_requests.reset_index(drop=True)
 
             # Step 3: bootstrap new orders
-            self.step_bootstrap_new_orders(self.matching_agent)
+            # score_agent is the frozen value table during evaluation.  The
+            # old matching_agent attribute no longer exists on Simulator.
+            self.step_bootstrap_new_orders(self.score_agent)
 
         # Step 4: both-rg-cruising and/or repositioning decision
         # self.cruise_and_reposition()
@@ -1230,6 +1430,122 @@ class Simulator:
     # =========================================================================
     # 获取匹配奖励 (Get Matching Reward) - [Matching/Dynamic Matching]
     # =========================================================================
+    def _score_discount_factor(self, elapsed_seconds, time_slice_delta, score_agent=None):
+        """Compute the future-value discount used by both TD learning and dispatch."""
+        agent = score_agent if score_agent is not None else self.score_agent
+        discount_mode = getattr(agent, 'discount_mode', self.discount_mode)
+        discount_time_unit_seconds = getattr(
+            agent,
+            'discount_time_unit_seconds',
+            self.discount_time_unit_seconds,
+        )
+        if discount_mode == 'elapsed_time':
+            exponent = np.maximum(np.asarray(elapsed_seconds, dtype=float), 0.0) / \
+                       discount_time_unit_seconds
+        else:
+            exponent = np.maximum(np.asarray(time_slice_delta, dtype=float), 0.0)
+        return np.power(self.score_discount_rate, exponent)
+
+    def _matching_value_context(self):
+        """Return edge-level value settings for Q-table matching."""
+        if (self.score_agent is None or self.method not in {'rl', 'sarsa'} or
+                self.rl_mode != 'matching'):
+            return None
+        return {
+            'score_agent': self.score_agent,
+            'current_time': self.time,
+            't_initial': self.t_initial,
+            'decision_freq': self.decision_freq,
+            'vehicle_speed': self.vehicle_speed,
+            'discount_rate': self.score_discount_rate,
+            'discount_time_unit_seconds': self.discount_time_unit_seconds,
+            'score_mode': self.matching_score_mode,
+            'reward_mode': self.reward_discount_mode,
+            'idle_comparison_interval_seconds': self.idle_comparison_interval_seconds,
+        }
+
+    def _record_matching_value_diagnostics(self, context):
+        if (context is None or self.matching_score_mode not in {
+                'advantage', 'idle_relative_advantage'}):
+            return
+        diagnostics = context.get('diagnostics', {})
+        self.qtable_episode_metrics['candidate_advantages'].extend(
+            np.asarray(diagnostics.get('candidate_weights', []), dtype=float).tolist()
+        )
+        self.qtable_episode_metrics['accepted_advantages'].extend(
+            np.asarray(diagnostics.get('accepted_weights', []), dtype=float).tolist()
+        )
+        if 'nonpositive_ratio' in diagnostics:
+            self.qtable_episode_metrics['nonpositive_advantage_ratios'].append(
+                diagnostics['nonpositive_ratio']
+            )
+        self.qtable_episode_metrics['candidate_order_action_values'].extend(
+            np.asarray(
+                diagnostics.get('order_action_values', []), dtype=float
+            ).tolist()
+        )
+        self.qtable_episode_metrics['comparison_baseline_values'].extend(
+            np.asarray(
+                diagnostics.get('comparison_baseline_values', []), dtype=float
+            ).tolist()
+        )
+
+    def get_qtable_episode_metrics(self):
+        """Return scalar diagnostics for one Q-table training episode."""
+        metrics = self.qtable_episode_metrics
+
+        def summarize(values, prefix):
+            array = np.asarray(values, dtype=float)
+            if array.size == 0:
+                return {
+                    f'{prefix}/Mean': 0.0,
+                    f'{prefix}/P50': 0.0,
+                    f'{prefix}/P90': 0.0,
+                    f'{prefix}/P99': 0.0,
+                    f'{prefix}/Max': 0.0,
+                }
+            return {
+                f'{prefix}/Mean': float(np.mean(array)),
+                f'{prefix}/P50': float(np.percentile(array, 50)),
+                f'{prefix}/P90': float(np.percentile(array, 90)),
+                f'{prefix}/P99': float(np.percentile(array, 99)),
+                f'{prefix}/Max': float(np.max(array)),
+            }
+
+        matched = metrics['matched_transitions']
+        idle = metrics['idle_transitions']
+        total = matched + idle
+        result = {
+            'Transitions/Matched': float(matched),
+            'Transitions/Idle': float(idle),
+            'Transitions/Idle_Ratio': float(idle / total) if total else 0.0,
+            'Transitions/Same_Bin_Ratio': float(metrics['same_bin_transitions'] / matched) if matched else 0.0,
+        }
+        result.update(summarize(metrics['original_rewards'], 'TDReward/Original'))
+        result.update(summarize(metrics['discounted_rewards'], 'TDReward/Discounted'))
+        result.update(summarize(metrics['shaped_rewards'], 'TDReward/Shaped'))
+        result.update(summarize(metrics['raw_penalties'], 'Penalty/Raw'))
+        result.update(summarize(metrics['weighted_penalties'], 'Penalty/Weighted'))
+        result.update(summarize(metrics['penalty_reward_ratios'], 'Penalty/Reward_Ratio'))
+        result.update(summarize(metrics['dynamic_alphas'], 'Penalty/Alpha'))
+        result.update(summarize(metrics['matched_elapsed_minutes'], 'ElapsedMinutes/Matched'))
+        result.update(summarize(metrics['matched_discounts'], 'Discount/Matched'))
+        result.update(summarize(metrics['idle_elapsed_minutes'], 'ElapsedMinutes/Idle'))
+        result.update(summarize(metrics['idle_discounts'], 'Discount/Idle'))
+        result.update(summarize(metrics['candidate_advantages'], 'Advantage/Candidate'))
+        result.update(summarize(metrics['accepted_advantages'], 'Advantage/Accepted'))
+        result.update(summarize(
+            metrics['candidate_order_action_values'],
+            'MatchingValue/OrderAction',
+        ))
+        result.update(summarize(
+            metrics['comparison_baseline_values'],
+            'MatchingValue/ComparisonBaseline',
+        ))
+        ratios = metrics['nonpositive_advantage_ratios']
+        result['Advantage/Nonpositive_Ratio'] = float(np.mean(ratios)) if ratios else 0.0
+        return result
+
     def get_matching_reward(self, df_new_matched_requests):
         """
         计算匹配订单的总奖励
@@ -1516,7 +1832,7 @@ class Simulator:
                 # 1. 找出当前所有司机所在的 unique grids 以及它们在原数组中的映射索引
                 unique_g, inverse_idx = np.unique(grid_id_array.astype(int), return_inverse=True)
                 # 2. 仅为每个 unique grid 生成一次随机数
-                u_unique = np.random.default_rng().random((len(unique_g), 1))
+                u_unique = self.np_rng.random((len(unique_g), 1))
                 # 3. 将随机数映射回 N 个司机。同网格的司机将获得完全相同的随机数 u
                 u = u_unique[inverse_idx]
                 # 由于同网格司机的 cum_probs 相同，且 u 也相同，argmax 必然选出同一个候选列
@@ -1607,7 +1923,7 @@ class Simulator:
                 probs = np.divide(exp_u, sum_exp, out=np.zeros_like(exp_u), where=sum_exp > 0)
                 cum_probs = np.cumsum(probs, axis=1)
                 unique_g, inverse_idx = np.unique(grid_id_array.astype(int), return_inverse=True)
-                u_unique = np.random.default_rng().random((len(unique_g), 1))
+                u_unique = self.np_rng.random((len(unique_g), 1))
                 u = u_unique[inverse_idx]
                 chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
                 best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
@@ -1700,7 +2016,7 @@ class Simulator:
                 probs = np.divide(exp_u, sum_exp, out=np.zeros_like(exp_u), where=sum_exp > 0)
                 cum_probs = np.cumsum(probs, axis=1)
                 unique_g, inverse_idx = np.unique(grid_id_array.astype(int), return_inverse=True)
-                u_unique = np.random.default_rng().random((len(unique_g), 1))
+                u_unique = self.np_rng.random((len(unique_g), 1))
                 u = u_unique[inverse_idx]
                 chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
                 best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
@@ -1780,7 +2096,7 @@ class Simulator:
                 probs = np.divide(exp_u, sum_exp, out=np.zeros_like(exp_u), where=sum_exp > 0)
                 cum_probs = np.cumsum(probs, axis=1)
                 unique_g, inverse_idx = np.unique(grid_id_array.astype(int), return_inverse=True)
-                u_unique = np.random.default_rng().random((len(unique_g), 1))
+                u_unique = self.np_rng.random((len(unique_g), 1))
                 u = u_unique[inverse_idx]
                 chosen_col_idx = np.argmax(cum_probs >= u, axis=1)
                 best_grid = np.take_along_axis(safe_cands, chosen_col_idx[:, None], axis=1).flatten()
@@ -1985,6 +2301,76 @@ class Simulator:
     # =========================================================================
     # RL 训练步骤 (RL Training Step) - [Repo/Matching]
     # =========================================================================
+    def _append_completed_idle_transitions(self):
+        """Append one transition per completed continuous-idle interval."""
+        if not (self.rl_mode == 'matching' and
+                self.experiment_mode == 'train_value' and
+                self.reward_scheme == 'idle_transitions'):
+            return
+
+        idle_drivers = self.driver_table[self.driver_table['status'] == 0]
+        current_idle_ids = set(idle_drivers['driver_id'].astype(int).tolist())
+
+        # A driver who was matched, repositioned, or went offline no longer has
+        # a continuous-idle interval.
+        for driver_id in list(self.idle_transition_anchors):
+            if driver_id not in current_idle_ids:
+                del self.idle_transition_anchors[driver_id]
+
+        interval = self.idle_transition_interval_seconds
+        completed = []
+        for row in idle_drivers[['driver_id', 'grid_id']].itertuples(index=False):
+            driver_id = int(row.driver_id)
+            current_grid = int(row.grid_id)
+            anchor = self.idle_transition_anchors.get(driver_id)
+            if anchor is None:
+                self.idle_transition_anchors[driver_id] = (self.time, current_grid)
+                continue
+
+            anchor_time, anchor_grid = anchor
+            if self.time - anchor_time >= interval:
+                completed.append((driver_id, anchor_time, anchor_grid, current_grid))
+                self.idle_transition_anchors[driver_id] = (self.time, current_grid)
+
+        if not completed:
+            return
+
+        start_times = np.asarray([item[1] for item in completed], dtype=float)
+        start_grids = np.asarray([item[2] for item in completed], dtype=int)
+        end_times = np.full(len(completed), self.time, dtype=float)
+        end_grids = np.asarray([item[3] for item in completed], dtype=int)
+        elapsed_seconds = end_times - start_times
+
+        idle_state_array = np.column_stack([start_times, start_grids])
+        idle_next_state_array = np.column_stack([end_times, end_grids])
+        idle_action_array = np.zeros(len(completed))
+        idle_rewards = -self.idle_cost_per_minute * (elapsed_seconds / 60.0)
+        current_slices = ((start_times - self.t_initial - 1) //
+                          (self.decision_freq * 60)).astype(int)
+        next_slices = ((end_times - self.t_initial - 1) //
+                       (self.decision_freq * 60)).astype(int)
+        idle_discounts = self._score_discount_factor(
+            elapsed_seconds,
+            next_slices - current_slices,
+            self.score_agent,
+        )
+
+        self.qtable_episode_metrics['idle_elapsed_minutes'].extend(
+            (elapsed_seconds / 60.0).tolist()
+        )
+        self.qtable_episode_metrics['idle_discounts'].extend(
+            np.asarray(idle_discounts, dtype=float).reshape(-1).tolist()
+        )
+        self.qtable_episode_metrics['idle_transitions'] += len(completed)
+        self.dispatch_transitions_buffer[0] = np.concatenate(
+            [self.dispatch_transitions_buffer[0], idle_state_array])
+        self.dispatch_transitions_buffer[1] = np.concatenate(
+            [self.dispatch_transitions_buffer[1], idle_action_array])
+        self.dispatch_transitions_buffer[2] = np.concatenate(
+            [self.dispatch_transitions_buffer[2], idle_next_state_array])
+        self.dispatch_transitions_buffer[3] = np.concatenate(
+            [self.dispatch_transitions_buffer[3], idle_rewards])
+
     def rl_step_train(self):  # rl for matching
         """
         执行一步 RL 训练
@@ -2001,13 +2387,23 @@ class Simulator:
 
         self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]), np.array([]).reshape([0, 2]),
                                             np.array([]).astype(float)]  # rl for matching
+        # Record completed idle intervals before dispatch so a driver who is
+        # matched at this minute still contributes the preceding 5-minute wait.
+        self._append_completed_idle_transitions()
 
         wait_requests = deepcopy(self.wait_requests)
         driver_table = deepcopy(self.driver_table)
 
-        matched_pair_actual_indexs, matched_itinerary = order_dispatch(wait_requests, driver_table,
-                                                                       self.maximal_pickup_distance,
-                                                                       self.dispatch_method, self.method)
+        value_context = self._matching_value_context()
+        matched_pair_actual_indexs, matched_itinerary = order_dispatch(
+            wait_requests,
+            driver_table,
+            self.maximal_pickup_distance,
+            self.dispatch_method,
+            self.method,
+            advantage_context=value_context,
+        )
+        self._record_matching_value_diagnostics(value_context)
 
         # Update matched and waiting requests
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
@@ -2053,7 +2449,7 @@ class Simulator:
                 drop=True)
             self.wait_requests = df_update_wait_requests.reset_index(drop=True)
             # Bootstrap new orders
-            self.step_bootstrap_new_orders(self.matching_agent)
+            self.step_bootstrap_new_orders(self.score_agent)
 
         # reposition
         if self.rl_mode == 'reposition':
@@ -2130,20 +2526,34 @@ class Simulator:
                 # 获取 S_k+1 (当前状态)
                 s1 = self.get_global_state()
 
-                reward = (self.reward_by_grid_df / 100).values.tolist()
+                reward = (self.reward_by_grid_df / GRID_REWARD_NORMALIZER).values.tolist()
 
                 # 存储15分钟的聚合数据
-                self.dynamic_matching_agent.buffer.push(s0,
-                                                        self.held_action_tuple[0],  # a
-                                                        self.held_action_tuple[1],  # log_a
-                                                        reward,
-                                                        s1,
-                                                        [1 if self.time == self.t_end else 0] * self.grid_num)
-                if not self.dynamic_matching_agent.is_scaler_fitted:
+                if self.dynamic_matching_agent.use_replay_buffer:
+                    self.dynamic_matching_agent.buffer.push(
+                        s0,
+                        self.held_action_tuple[0],
+                        self.held_action_tuple[1],
+                        reward,
+                        s1,
+                        [1 if self.time == self.t_end else 0] * self.grid_num,
+                    )
+                self.dynamic_matching_agent.record_on_policy_transition(
+                    s0,
+                    self.held_action_tuple[0],
+                    self.held_action_tuple[1],
+                    reward,
+                    s1,
+                    [1 if self.time == self.t_end else 0] * self.grid_num,
+                )
+                if (self.dynamic_matching_agent.normalize_states and
+                        not self.dynamic_matching_agent.is_scaler_fitted):
                     self.dynamic_matching_agent.warmup_states.append(s0)
 
                 # 检查agent是否更新
-                if len(self.dynamic_matching_agent.buffer) >= self.dynamic_matching_agent.batch_size:
+                if (self.dynamic_matching_agent.use_replay_buffer and
+                        not self.dynamic_matching_agent.defer_critic_updates and
+                        len(self.dynamic_matching_agent.buffer) >= self.dynamic_matching_agent.batch_size):
                     self.dynamic_matching_agent.update()
 
                 if self.time == self.t_end:

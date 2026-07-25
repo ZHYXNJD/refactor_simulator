@@ -13,6 +13,15 @@ import numpy as np
 from src.utils.utilities import State
 
 
+class _NumpyCompatibleUnpickler(pickle.Unpickler):
+    """Load NumPy 2.x array pickles on environments using NumPy 1.x."""
+
+    def find_class(self, module, name):
+        if module == 'numpy._core' or module.startswith('numpy._core.'):
+            module = module.replace('numpy._core', 'numpy.core', 1)
+        return super().find_class(module, name)
+
+
 # rl for matching
 # Andrew: Only one rl method is used in the simulator, which is sarsa_no_subway
 class SarsaAgent(object):
@@ -33,11 +42,22 @@ class SarsaAgent(object):
         self.grid_ids = [i for i in range(self.grid_num)]
 
         self.decision_freq = params.get('decision_freq', 10)
+        self.t_initial = int(params.get('t_initial', 5 * 3600))
+        self.t_end = int(params.get('t_end', 10 * 3600))
+        if self.t_end <= self.t_initial:
+            raise ValueError('t_end must be later than t_initial')
+        episode_seconds = self.t_end - self.t_initial
+        decision_seconds = self.decision_freq * 60
+        if episode_seconds % decision_seconds:
+            raise ValueError(
+                'The simulation window must be divisible by decision_freq minutes: '
+                f'{episode_seconds=} {self.decision_freq=}'
+            )
 
         self.load_path = params.get('load_path', False)
 
         # the set of time slices
-        self.max_time_slice = int( 300 / self.decision_freq)
+        self.max_time_slice = episode_seconds // decision_seconds
         self.time_slices = [i for i in range(self.max_time_slice)]
 
         # --- 修改开始 ---
@@ -58,6 +78,17 @@ class SarsaAgent(object):
 
         # discount rate
         self.discount_rate = params.get('discount_rate', 0.99)
+        self.discount_mode = params.get('discount_mode', 'time_bin')
+        if self.discount_mode not in {'time_bin', 'elapsed_time'}:
+            raise ValueError(
+                f'Unknown discount_mode={self.discount_mode!r}; '
+                "expected 'time_bin' or 'elapsed_time'"
+            )
+        self.discount_time_unit_seconds = float(
+            params.get('discount_time_unit_seconds', 300.0)
+        )
+        if self.discount_time_unit_seconds <= 0:
+            raise ValueError('discount_time_unit_seconds must be positive')
 
         # initialization of Q value table
         self.q_value_table = np.zeros((self.max_time_slice,self.grid_num))  # each state a two dimension vector
@@ -94,16 +125,34 @@ class SarsaAgent(object):
         return self.learning_rate
 
 
-    def update_q_value_table(self, t0,l0,t1,l1, reward: float):
+    def update_q_value_table(self, t0, l0, t1, l1, reward: float, elapsed_seconds=None):
         if t1 >= self.max_time_slice:
             self.q_value_table[t0,l0] = (1 - self.learning_rate) * self.q_value_table[t0,l0] + self.learning_rate * reward
         else:
+            discount = self.discount_factor(
+                elapsed_seconds=elapsed_seconds,
+                time_slice_delta=t1 - t0,
+            )
             self.q_value_table[t0,l0] = (1 - self.learning_rate) * self.q_value_table[t0,l0] + \
-                                     self.learning_rate * (reward + (self.discount_rate ** (t1-t0)) * self.q_value_table[t1,l1])
+                                     self.learning_rate * (reward + discount * self.q_value_table[t1,l1])
+
+    def discount_factor(self, elapsed_seconds=None, time_slice_delta=None):
+        """Return a discount consistent with the configured time semantics."""
+        if self.discount_mode == 'elapsed_time':
+            if elapsed_seconds is None:
+                raise ValueError('elapsed_seconds is required for elapsed_time discounting')
+            exponent = np.maximum(np.asarray(elapsed_seconds, dtype=float), 0.0) / \
+                       self.discount_time_unit_seconds
+        else:
+            if time_slice_delta is None:
+                raise ValueError('time_slice_delta is required for time_bin discounting')
+            exponent = np.maximum(np.asarray(time_slice_delta, dtype=float), 0.0)
+        return np.power(self.discount_rate, exponent)
 
     def load_parameters(self, file_name):
         # new version
-        self.q_value_table = pickle.load(open(file_name, 'rb'))
+        with open(file_name, 'rb') as file:
+            self.q_value_table = _NumpyCompatibleUnpickler(file).load()
 
         # old version
         # q_table = pickle.load(open(file_name, 'rb'))
@@ -141,10 +190,10 @@ class SarsaAgent(object):
         rewards = sarsa_per_time_slice[3]  # (N,)
 
         # === 1. 解析状态（向量化）===
-        t0 = ((current_states[:, 0] - 18000 - 1) // (self.decision_freq * 60)).astype(int)
+        t0 = ((current_states[:, 0] - self.t_initial - 1) // (self.decision_freq * 60)).astype(int)
         l0 = current_states[:, 1].astype(int)
 
-        t1 = ((next_states[:, 0] - 18000 - 1) // (self.decision_freq * 60)).astype(int)
+        t1 = ((next_states[:, 0] - self.t_initial - 1) // (self.decision_freq * 60)).astype(int)
         l1 = next_states[:, 1].astype(int)
 
         # === 2. mask terminal ===
@@ -159,9 +208,16 @@ class SarsaAgent(object):
         # non-terminal
         non_terminal = ~terminal_mask
         delta_t = t1[non_terminal] - t0[non_terminal]
+        elapsed_seconds = (
+            next_states[non_terminal, 0] - current_states[non_terminal, 0]
+        )
+        discounts = self.discount_factor(
+            elapsed_seconds=elapsed_seconds,
+            time_slice_delta=delta_t,
+        )
 
         target[non_terminal] = rewards[non_terminal] + \
-                               (self.discount_rate ** delta_t) * self.q_value_table[
+                               discounts * self.q_value_table[
                                    t1[non_terminal], l1[non_terminal]]
 
         # === 4. 批量更新 Q ===

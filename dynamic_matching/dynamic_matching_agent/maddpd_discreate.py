@@ -99,6 +99,38 @@ class Critic(nn.Module):
         return q.squeeze(-1)  # [batch]
 
 
+class COMACritic(nn.Module):
+    """The action-vector central critic used by standard COMA.
+
+    For an evaluated agent ``a`` the input contains the global state, that
+    agent's local observation, the actions of all *other* agents, and its
+    identity.  The output has one Q value for every possible action of ``a``.
+    This is the critic representation in Foerster et al. (2018): it makes the
+    counterfactual baseline an interpolation over one forward pass instead of
+    querying scalar Q values for out-of-distribution joint actions.
+    """
+    def __init__(self, global_state_dim, local_obs_dim, num_agents, num_actions, hidden_sizes):
+        super().__init__()
+        self.num_agents = num_agents
+        self.num_actions = num_actions
+        input_dim = (
+            global_state_dim
+            + local_obs_dim
+            + num_agents * num_actions  # evaluated agent's action is masked to zero
+            + num_agents                # evaluated-agent identity
+        )
+        layers = []
+        last = input_dim
+        for h in hidden_sizes:
+            layers.extend([nn.Linear(last, h), nn.ReLU()])
+            last = h
+        layers.append(nn.Linear(last, num_actions))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, critic_input):
+        return self.net(critic_input)  # [batch, num_actions]
+
+
 # -----------------------
 # MADDPG agent manager
 # -----------------------
@@ -122,11 +154,58 @@ class MADDPG:
         self.batch_size = HYPERPARAMS.get('batch_size',32) # 原来为32
         self.action_var = HYPERPARAMS.get('action_var',0.3)
         self.update_num = HYPERPARAMS.get('update',3)
+        self.actor_loss_mode = HYPERPARAMS.get('actor_loss_mode','reinforce')  # 'reinforce' or 'coma'
+        # Preserve the historic replay-actor implementation while providing a
+        # correct on-policy COMA path for new experiments.
+        self.actor_update_mode = HYPERPARAMS.get('actor_update_mode', 'replay_legacy')
+        if self.actor_update_mode not in {'replay_legacy', 'on_policy'}:
+            raise ValueError(
+                f"Unknown actor_update_mode={self.actor_update_mode!r}; "
+                "expected 'replay_legacy' or 'on_policy'"
+            )
+        self.defer_critic_updates = bool(HYPERPARAMS.get('defer_critic_updates', False))
+        self.standard_coma = bool(HYPERPARAMS.get('standard_coma', False))
+        self.use_replay_buffer = bool(HYPERPARAMS.get('use_replay_buffer', True))
+        self.normalize_states = bool(HYPERPARAMS.get('normalize_states', True))
+        self.decentralized_actor = bool(HYPERPARAMS.get('decentralized_actor', False))
+        self.global_state_dim = int(HYPERPARAMS.get('global_state_dim', obs_dims[0] - HYPERPARAMS.get('grid_num', 35)))
+        self.td_lambda = float(HYPERPARAMS.get('td_lambda', 0.8))
+        self.coma_epsilon_start = float(HYPERPARAMS.get('coma_epsilon_start', 0.5))
+        self.coma_epsilon_end = float(HYPERPARAMS.get('coma_epsilon_end', 0.02))
+        self.coma_epsilon_anneal_episodes = int(
+            HYPERPARAMS.get('coma_epsilon_anneal_episodes', 750)
+        )
+        if not 0.0 <= self.td_lambda <= 1.0:
+            raise ValueError('td_lambda must lie in [0, 1].')
+        if not (0.0 <= self.coma_epsilon_end <= self.coma_epsilon_start < 1.0):
+            raise ValueError('COMA epsilon values must satisfy 0 <= end <= start < 1.')
+        if self.coma_epsilon_anneal_episodes <= 0:
+            raise ValueError('coma_epsilon_anneal_episodes must be positive.')
+        self.critic_updates_per_episode = int(
+            HYPERPARAMS.get(
+                'critic_updates_per_episode',
+                1 if self.standard_coma else self.update_num,
+            )
+        )
+        self.actor_updates_per_episode = int(HYPERPARAMS.get('actor_updates_per_episode', 1))
+        self.target_critic_update_interval = int(
+            HYPERPARAMS.get('target_critic_update_interval', 10)
+        )
+        if self.critic_updates_per_episode <= 0 or self.actor_updates_per_episode <= 0:
+            raise ValueError('Updates per episode must be positive.')
+        if self.target_critic_update_interval <= 0:
+            raise ValueError('target_critic_update_interval must be positive.')
         self.driver_num = HYPERPARAMS.get('driver_num',1000)
 
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        requested_device = HYPERPARAMS.get('device')
+        self.device = torch.device(
+            requested_device if requested_device is not None
+            else ('cuda' if torch.cuda.is_available() else 'cpu')
+        )
         # 必须热启动 以节约时间
-        self.load_offline_warmup = True  # <-- 新增一个控制开关
+        # Generation must start from an empty buffer; training supplies its
+        # scenario-specific transitions explicitly.
+        self.load_offline_warmup = HYPERPARAMS.get('load_offline_warmup', True)
 
         # self.n = len(obs_dims)
         self.n = HYPERPARAMS.get('grid_num',35)
@@ -134,6 +213,7 @@ class MADDPG:
 
         # Replay
         self.buffer = ReplayBuffer(self.buffer_size, self.device)
+        self.on_policy_rollout = []
 
         if transitions is not None:
             for t in transitions:
@@ -196,14 +276,16 @@ class MADDPG:
             actor_input_dim = obs_dims[i]  # global state + grid ID one-hot
             a = Actor(actor_input_dim, self.actor_hidden, self.n_actions[i]).to(self.device)
             ta = copy.deepcopy(a).to(self.device)
-            opt = optim.Adam(a.parameters(), lr=self.lr_actor)
+            # Strict COMA uses RMSProp; legacy replay experiments retain Adam.
+            optimizer_class = optim.RMSprop if self.standard_coma else optim.Adam
+            opt = optimizer_class(a.parameters(), lr=self.lr_actor)
             self.actors.append(a)
             self.target_actors.append(ta)
             self.actor_optims.append(opt)
 
         # Critics and target (one centralized critic)
-        total_obs = obs_dims[0]-self.n
-        total_act = len(n_actions)*self.n_actions[0]
+        total_obs = self.global_state_dim if self.decentralized_actor else obs_dims[0] - self.n
+        total_act = sum(n_actions)
 
         # double q network
         self.critic1 = Critic(total_obs, total_act, self.critic_hidden).to(self.device)
@@ -212,6 +294,26 @@ class MADDPG:
         self.critic2 = Critic(total_obs, total_act, self.critic_hidden).to(self.device)
         self.target_critic2 = copy.deepcopy(self.critic2).to(self.device)
         self.critic_optim2 = optim.Adam(self.critic2.parameters(), lr=self.lr_critic)
+        self._standard_coma_critic_steps = 0
+
+        # Keep the historic scalar critics above for legacy/replay checkpoints.
+        # Strict COMA trains only this shared action-vector critic.
+        self.coma_critic = None
+        self.target_coma_critic = None
+        self.coma_critic_optim = None
+        if self.standard_coma:
+            local_obs_dim = obs_dims[0]
+            self.coma_critic = COMACritic(
+                self.global_state_dim,
+                local_obs_dim,
+                self.n,
+                self.n_actions[0],
+                self.critic_hidden,
+            ).to(self.device)
+            self.target_coma_critic = copy.deepcopy(self.coma_critic).to(self.device)
+            self.coma_critic_optim = optim.RMSprop(
+                self.coma_critic.parameters(), lr=self.lr_critic
+            )
 
         # losses
         self.actor_losses_history = [[] for _ in range(self.n)]  # per-agent step-level list
@@ -224,7 +326,7 @@ class MADDPG:
         # per-episode accumulators
         self.episode_reward = 0.0
         self.episode_step = 0
-        self.actor_counts = [[0] * 3 for _ in range(self.n)]
+        self.actor_counts = [[0] * self.n_actions[0] for _ in range(self.n)]
         self.last_action_freq = [[None] * 3 for _ in range(self.n)]
         self.strategy_tracker = StrategyTracker(self.n)  # last_actions, switch_counts
         self.grid_rewards = np.zeros(self.n)
@@ -243,6 +345,89 @@ class MADDPG:
         entropy_coef = self.entropy_end + (self.entropy_start - self.entropy_end) * (1 - progress)
         return float(entropy_coef)
 
+    def _actor_input(self, global_state, agent_index):
+        """Build a decentralized actor observation from the global state."""
+        if not self.decentralized_actor:
+            onehot = F.one_hot(torch.tensor(agent_index, device=self.device), num_classes=self.n).float()
+            if global_state.dim() == 1:
+                return torch.cat([global_state, onehot], dim=-1)
+            return torch.cat([global_state, onehot.unsqueeze(0).repeat(global_state.shape[0], 1)], dim=-1)
+
+        feature_count = (self.global_state_dim - 2) // self.n
+        if feature_count * self.n + 2 != self.global_state_dim:
+            raise ValueError('global_state_dim must be grid_num * local_feature_count + 2')
+        begin = agent_index * feature_count
+        end = begin + feature_count
+        if global_state.dim() == 1:
+            return torch.cat([global_state[begin:end], global_state[-2:]], dim=-1)
+        return torch.cat([global_state[:, begin:end], global_state[:, -2:]], dim=-1)
+
+    def _coma_epsilon(self):
+        """Original COMA's linearly annealed epsilon-soft behaviour policy."""
+        progress = min(self.current_episode / self.coma_epsilon_anneal_episodes, 1.0)
+        return self.coma_epsilon_start + progress * (
+            self.coma_epsilon_end - self.coma_epsilon_start
+        )
+
+    def _policy_probs(self, logits):
+        """Return the policy used for both sampling and the COMA baseline."""
+        probs = F.softmax(logits, dim=-1)
+        if not self.standard_coma:
+            return probs
+        epsilon = self._coma_epsilon()
+        return (1.0 - epsilon) * probs + epsilon / probs.shape[-1]
+
+    def _coma_q_values(self, global_state, actions, critic=None):
+        """Evaluate Q_i(s, u_-i, .) for every batch item and evaluated agent.
+
+        Args:
+            global_state: ``[batch, global_state_dim]``.
+            actions: list of ``n`` integer tensors, each ``[batch]``.
+            critic: current or target action-vector COMA critic.
+
+        Returns:
+            Tensor of shape ``[batch, n_agents, n_actions]``.
+        """
+        if critic is None:
+            critic = self.coma_critic
+        if critic is None:
+            raise RuntimeError('Action-vector COMA critic is unavailable in legacy mode.')
+        if global_state.dim() == 1:
+            global_state = global_state.unsqueeze(0)
+        batch_size = global_state.shape[0]
+        if len(actions) != self.n:
+            raise ValueError('Expected one action tensor per COMA agent.')
+
+        joint_actions = torch.stack(actions, dim=1)  # [batch, agents]
+        action_onehot = F.one_hot(
+            joint_actions, num_classes=self.n_actions[0]
+        ).float()
+        # ``other_actions[b, i]`` contains u_-i; i's own action is masked.
+        other_actions = action_onehot.unsqueeze(1).expand(
+            batch_size, self.n, self.n, self.n_actions[0]
+        ).clone()
+        agent_indices = torch.arange(self.n, device=self.device)
+        other_actions[:, agent_indices, agent_indices, :] = 0.0
+
+        local_obs = torch.stack(
+            [self._actor_input(global_state, agent_index) for agent_index in range(self.n)],
+            dim=1,
+        )
+        agent_ids = F.one_hot(agent_indices, num_classes=self.n).float()
+        agent_ids = agent_ids.unsqueeze(0).expand(batch_size, -1, -1)
+        critic_input = torch.cat(
+            [
+                global_state.unsqueeze(1).expand(-1, self.n, -1),
+                local_obs,
+                other_actions.reshape(batch_size, self.n, -1),
+                agent_ids,
+            ],
+            dim=-1,
+        )
+        return critic(critic_input.reshape(batch_size * self.n, -1)).reshape(
+            batch_size, self.n, self.n_actions[0]
+        )
+
     def select_actions(self, global_state,deterministic=False):
         """
         global_state: np.array or tensor of shape [state_dim]
@@ -260,12 +445,20 @@ class MADDPG:
         else:
             global_state = global_state.to(device)
 
+        # Normalize state using the fitted scaler (BUG 3 fix)
+        if self.normalize_states and self.is_scaler_fitted:
+            global_state_np = global_state.cpu().numpy().reshape(1, -1)
+            global_state = torch.tensor(
+                self.state_scaler.transform(global_state_np),
+                dtype=torch.float32, device=device
+            ).squeeze(0)
+
         for i in range(self.n):
             # One-hot encode grid ID
             grid_onehot = F.one_hot(torch.tensor(i, device=device), num_classes=self.n).float()
 
             # 拼接 global_state + grid_onehot
-            agent_input = torch.cat([global_state, grid_onehot], dim=-1).unsqueeze(0)  # [1, state_dim + n]
+            agent_input = self._actor_input(global_state, i).unsqueeze(0)
 
             logits = self.actors[i](agent_input)  # [1, n_actions]
             logits = logits.squeeze(0)
@@ -281,7 +474,10 @@ class MADDPG:
                 act = int(torch.argmax(logits).item())
                 logp = 0
             else:
-                dist = torch.distributions.Categorical(logits=logits)
+                # Standard COMA samples from the epsilon-soft behaviour
+                # policy.  The same distribution is used in its
+                # counterfactual baseline during the actor update.
+                dist = torch.distributions.Categorical(probs=self._policy_probs(logits))
                 act = int(dist.sample().item())
                 act_tensor = torch.as_tensor(act, device=device)  # 保证 act 在 GPU
                 logp = float(dist.log_prob(act_tensor).item())
@@ -302,6 +498,22 @@ class MADDPG:
         # env-level: obs/actions/rewards/next_obs/dones are lists per agent
         self.buffer.push(obs, actions, actions_log,rewards, next_obs, dones)
 
+    def record_on_policy_transition(self, obs, actions, log_probs, rewards, next_obs, dones):
+        """Keep only freshly collected policy data for the COMA actor."""
+        if self.actor_update_mode != 'on_policy':
+            return
+        self.on_policy_rollout.append(Transition(
+            np.asarray(obs, dtype=np.float32).copy(),
+            tuple(int(action) for action in actions),
+            tuple(float(log_prob) for log_prob in log_probs),
+            tuple(float(reward) for reward in rewards),
+            np.asarray(next_obs, dtype=np.float32).copy(),
+            tuple(float(done) for done in dones),
+        ))
+
+    def clear_on_policy_rollout(self):
+        self.on_policy_rollout = []
+
     def _build_critic_input(self, global_state_batch, actions_batch):
         """
         global_state_batch: [batch, state_dim] — same for all agents
@@ -316,7 +528,235 @@ class MADDPG:
         critic_input = torch.cat([global_state_batch, acts_concat], dim=-1)  # [batch, state_dim + total_action_dim]
         return critic_input
 
-    def update(self):
+    def _normalize_states(self, states):
+        if not self.normalize_states:
+            return states.to(dtype=torch.float32, device=self.device)
+        return torch.tensor(
+            self.state_scaler.transform(states.cpu().numpy()),
+            dtype=torch.float32, device=self.device,
+        )
+
+    def _update_critic_only(self, num_updates):
+        """Off-policy TD updates are valid for the centralized critic only."""
+        if len(self.buffer) < max(self.batch_size, self.learning_starts):
+            return
+        if not self.is_scaler_fitted:
+            if not self.warmup_states:
+                return
+            self.state_scaler.fit(np.asarray(self.warmup_states))
+            self.is_scaler_fitted = True
+            self.warmup_states = []
+
+        global_state, acts_b, _, rews_b, next_global_state, dones_b = self.buffer.sample(self.batch_size)
+        global_state = self._normalize_states(global_state)
+        next_global_state = self._normalize_states(next_global_state)
+        batch_size = global_state.shape[0]
+
+        for _ in range(num_updates):
+            critic_input = self._build_critic_input(global_state, acts_b)
+            q1_values = self.critic1(critic_input)
+            q2_values = self.critic2(critic_input)
+            next_actions = []
+            with torch.no_grad():
+                for i in range(self.n):
+                    onehot = F.one_hot(torch.tensor(i), num_classes=self.n).float().to(self.device)
+                    actor_input = torch.cat(
+                        [next_global_state, onehot.unsqueeze(0).repeat(batch_size, 1)], dim=-1
+                    )
+                    next_actions.append(
+                        torch.distributions.Categorical(logits=self.target_actors[i](actor_input)).sample()
+                    )
+                target_input = self._build_critic_input(next_global_state, next_actions)
+                q_next = torch.min(self.target_critic1(target_input), self.target_critic2(target_input))
+                rewards_sum = sum(rews_b)
+                dones_any = torch.max(torch.stack(dones_b, dim=0), dim=0)[0]
+                target_q = rewards_sum + self.gamma * (1.0 - dones_any) * q_next
+
+            critic1_loss = F.mse_loss(q1_values, target_q)
+            critic2_loss = F.mse_loss(q2_values, target_q)
+            self.critic1_losses_history.append(critic1_loss.item())
+            self.critic2_losses_history.append(critic2_loss.item())
+            self.critic_optim1.zero_grad()
+            critic1_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic1.parameters(), 0.5)
+            self.critic_optim1.step()
+            self.critic_optim2.zero_grad()
+            critic2_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.critic2.parameters(), 0.5)
+            self.critic_optim2.step()
+            self._soft_update(self.critic1, self.target_critic1)
+            self._soft_update(self.critic2, self.target_critic2)
+
+    def update_on_policy_actor(self):
+        """One COMA actor update from the just-collected behaviour rollout."""
+        if self.actor_update_mode != 'on_policy' or not self.on_policy_rollout:
+            return
+        states = torch.tensor(
+            np.stack([transition.obs for transition in self.on_policy_rollout]),
+            dtype=torch.float32, device=self.device,
+        )
+        global_state = self._normalize_states(states)
+        batch_size = global_state.shape[0]
+        acts_b = [
+            torch.tensor(
+                [transition.actions[i] for transition in self.on_policy_rollout],
+                dtype=torch.long, device=self.device,
+            )
+            for i in range(self.n)
+        ]
+
+        for _ in range(self.actor_updates_per_episode):
+            standard_q_values = None
+            if self.standard_coma and self.actor_loss_mode == 'coma':
+                with torch.no_grad():
+                    standard_q_values = self._coma_q_values(global_state, acts_b)
+            q_monitors = []
+            for i in range(self.n):
+                actor_input = self._actor_input(global_state, i)
+                logits = self.actors[i](actor_input)
+                policy_probs = self._policy_probs(logits)
+                dist = torch.distributions.Categorical(probs=policy_probs)
+                logp = dist.log_prob(acts_b[i])
+                entropy = dist.entropy()
+
+                if self.standard_coma and self.actor_loss_mode == 'coma':
+                    q_by_action = standard_q_values[:, i, :]
+                    baseline = (policy_probs.detach() * q_by_action).sum(dim=-1)
+                    q_taken = q_by_action.gather(1, acts_b[i].unsqueeze(-1)).squeeze(-1)
+                    advantage = (q_taken - baseline).detach()
+                    q_monitors.append(q_taken)
+                elif self.actor_loss_mode == 'coma':
+                    q_by_action = []
+                    for action in range(logits.shape[-1]):
+                        counterfactual_action = torch.full(
+                            (batch_size,), action, dtype=torch.long, device=self.device
+                        )
+                        joint_actions = [acts_b[j] if j != i else counterfactual_action for j in range(self.n)]
+                        with torch.no_grad():
+                            q_by_action.append(self.critic1(self._build_critic_input(global_state, joint_actions)))
+                    q_by_action = torch.stack(q_by_action, dim=-1)
+                    baseline = (F.softmax(logits, dim=-1).detach() * q_by_action).sum(dim=-1)
+                    with torch.no_grad():
+                        q_taken = self.critic1(self._build_critic_input(global_state, acts_b))
+                    advantage = (q_taken - baseline).detach()
+                    q_monitors.append(q_taken)
+                else:
+                    with torch.no_grad():
+                        critic_input = self._build_critic_input(global_state, acts_b)
+                        q_taken = torch.min(self.critic1(critic_input), self.critic2(critic_input))
+                    advantage = q_taken.detach()
+                    q_monitors.append(q_taken)
+
+                actor_loss = self.compute_refined_actor_loss(
+                    i, logp, entropy, advantage, mode=self.actor_loss_mode, episode=self.current_episode
+                )
+                self.actor_optims[i].zero_grad()
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), 0.5)
+                self.actor_optims[i].step()
+
+            if q_monitors:
+                self.q_pi_history.append(torch.stack(q_monitors, dim=1).mean().item())
+            for actor, target_actor in zip(self.actors, self.target_actors):
+                self._soft_update(actor, target_actor)
+        self.clear_on_policy_rollout()
+
+    def update_standard_coma_critic(self):
+        """Fit the centralized critic from this rollout with TD(lambda).
+
+        No replay samples, target actors, or behaviour-policy corrections are
+        used here.  The next joint action is the action actually observed at
+        the next decision point of the same on-policy rollout.  Targets are
+        evaluated by a lagged critic to prevent fitted TD(lambda) regression
+        from chasing its own moving bootstrap values.
+        """
+        if self.coma_critic is None or self.target_coma_critic is None:
+            raise RuntimeError(
+                "Standard COMA requires the action-vector COMA critic. "
+                "Construct the agent with standard_coma=True."
+            )
+        if not self.on_policy_rollout:
+            return
+        states = torch.tensor(
+            np.stack([transition.obs for transition in self.on_policy_rollout]),
+            dtype=torch.float32, device=self.device,
+        )
+        next_states = torch.tensor(
+            np.stack([transition.next_obs for transition in self.on_policy_rollout]),
+            dtype=torch.float32, device=self.device,
+        )
+        global_state = self._normalize_states(states)
+        next_global_state = self._normalize_states(next_states)
+        batch_size = global_state.shape[0]
+        actions = [
+            torch.tensor(
+                [transition.actions[i] for transition in self.on_policy_rollout],
+                dtype=torch.long, device=self.device,
+            )
+            for i in range(self.n)
+        ]
+        rewards = torch.tensor(
+            [sum(transition.rewards) for transition in self.on_policy_rollout],
+            dtype=torch.float32, device=self.device,
+        )
+        dones = torch.tensor(
+            [max(transition.dones) for transition in self.on_policy_rollout],
+            dtype=torch.float32, device=self.device,
+        )
+
+        # For transition t, the observed joint action at t + 1 is the
+        # on-policy bootstrap action.  The final action is irrelevant because
+        # its terminal mask is one.
+        next_actions = [
+            torch.cat([action[1:], action[-1:]], dim=0) for action in actions
+        ]
+        with torch.no_grad():
+            # Every agent-specific critic head estimates the same cooperative
+            # return.  Averaging their selected-action values gives one team
+            # bootstrap target while supervising every head below.
+            next_q_values = self._coma_q_values(
+                next_global_state, next_actions, critic=self.target_coma_critic
+            )
+            next_joint_actions = torch.stack(next_actions, dim=1)
+            next_q_taken = next_q_values.gather(
+                2, next_joint_actions.unsqueeze(-1)
+            ).squeeze(-1)
+            next_q = next_q_taken.mean(dim=1)
+            td_lambda_targets = torch.empty(batch_size, dtype=torch.float32, device=self.device)
+            running_target = torch.zeros((), dtype=torch.float32, device=self.device)
+            for index in range(batch_size - 1, -1, -1):
+                if dones[index] > 0:
+                    running_target = rewards[index]
+                else:
+                    bootstrap = (1.0 - self.td_lambda) * next_q[index] + self.td_lambda * running_target
+                    running_target = rewards[index] + self.gamma * bootstrap
+                td_lambda_targets[index] = running_target
+
+        joint_actions = torch.stack(actions, dim=1)
+        for _ in range(self.critic_updates_per_episode):
+            q_values = self._coma_q_values(global_state, actions)
+            q_taken = q_values.gather(2, joint_actions.unsqueeze(-1)).squeeze(-1)
+            critic_loss = F.mse_loss(
+                q_taken,
+                td_lambda_targets.unsqueeze(1).expand_as(q_taken),
+            )
+            self.critic1_losses_history.append(critic_loss.item())
+            self.coma_critic_optim.zero_grad()
+            critic_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.coma_critic.parameters(), 0.5)
+            self.coma_critic_optim.step()
+            self._standard_coma_critic_steps += 1
+            if self._standard_coma_critic_steps % self.target_critic_update_interval == 0:
+                self.target_coma_critic.load_state_dict(self.coma_critic.state_dict())
+
+    def update(self, update_actor=None, num_updates=None):
+        # The legacy path below is kept byte-for-byte in spirit for old runs.
+        # New COMA jobs use this early branch to train only the critic.
+        if update_actor is None and self.actor_update_mode == 'on_policy':
+            update_actor = False
+        if update_actor is False:
+            updates = self.update_num if num_updates is None else int(num_updates)
+            return self._update_critic_only(updates)
 
         # 新代码: (等待 buffer 积攒足够的、多样化的经验)
         if len(self.buffer) < max(self.batch_size, self.learning_starts):
@@ -334,20 +774,19 @@ class MADDPG:
             self.warmup_states = []  # 释放内存
             print("--- Scaler fitted. Starting training. ---")
 
+        # --- Sample batch and normalize once (outside update_num loop) ---
+        global_state, acts_b, acts_b_log, rews_b, next_global_state, dones_b = self.buffer.sample(self.batch_size)
+        batch_size = global_state.shape[0]
+
+        global_state = torch.tensor(
+            self.state_scaler.transform(global_state.cpu().numpy()),
+            dtype=torch.float32, device=self.device)
+        next_global_state = torch.tensor(
+            self.state_scaler.transform(next_global_state.cpu().numpy()),
+            dtype=torch.float32, device=self.device)
+
         # --- 开始多次更新循环 ---
-        for _ in range(self.update_num):  # <--- 修改点 2: 循环开始
-
-            global_state, acts_b,acts_b_log, rews_b, next_global_state, dones_b = self.buffer.sample(self.batch_size)
-            batch_size = global_state.shape[0]
-
-            # 4. (新！) 对采样的 batch 数据进行标准化
-            #    使用 .transform()，而不是 .fit()！
-            global_state = self.state_scaler.transform(global_state.cpu().numpy())
-            next_global_state = self.state_scaler.transform(next_global_state.cpu().numpy())
-
-            # 5. (新！) 把它们转回 Tensor
-            global_state = torch.tensor(global_state, dtype=torch.float32, device=self.device)
-            next_global_state = torch.tensor(next_global_state, dtype=torch.float32, device=self.device)
+        for _ in range(self.update_num):
 
             # --- Critic forward (current) ---
             critic_input = self._build_critic_input(global_state, acts_b)  # shape: [batch, total_obs+total_act]
@@ -400,48 +839,76 @@ class MADDPG:
 
             # --- Actor updates ---
             for i in range(self.n):
-                # 构造 agent-specific 输入：global_state + grid_id one-hot
+                # 1. Construct agent-specific input
                 grid_onehot = F.one_hot(torch.tensor(i), num_classes=self.n).float().to(self.device)
                 grid_onehot_batch = grid_onehot.unsqueeze(0).repeat(batch_size, 1)
                 agent_input = torch.cat([global_state, grid_onehot_batch], dim=-1)  # [batch, state_dim + n]
 
+                # 2. Get current policy distribution
                 logits = self.actors[i](agent_input)  # [batch, n_actions]
                 dist = torch.distributions.Categorical(logits=logits)
-                sampled_actions = dist.sample()  # [batch]
-                logp = dist.log_prob(sampled_actions)  # [batch]
+
+                # Log-prob MUST be evaluated on buffer actions (off-policy)
+                logp_buffer = dist.log_prob(acts_b[i])  # [batch]
                 entropy = dist.entropy()
 
-                # 替换第 i 个动作为 sampled，其他用原来的
-                actions_for_q = []
-                for j in range(self.n):
-                    if j == i:
-                        actions_for_q.append(sampled_actions)
-                    else:
-                        actions_for_q.append(acts_b[j])
-                critic_input_pi = self._build_critic_input(global_state, actions_for_q)
-                q_pi = self.critic1(critic_input_pi)  # [batch]
+                # 3. Compute advantage based on mode
+                if self.actor_loss_mode == 'coma':
+                    # === True COMA: counterfactual marginalization baseline ===
+                    n_actions = logits.shape[-1]
+                    q_all_actions = []
 
-                with torch.no_grad():
-                    critic_input_base = self._build_critic_input(global_state, acts_b)
-                    q1_base = self.critic1(critic_input_base)
-                    q2_base = self.critic2(critic_input_base)
-                    q_base = torch.min(q1_base, q2_base)
+                    # Enumerate all possible actions for agent i, others fixed to buffer actions
+                    for act_idx in range(n_actions):
+                        test_act = torch.full((batch_size,), act_idx, dtype=torch.long, device=self.device)
+                        actions_for_q = [acts_b[j] if j != i else test_act for j in range(self.n)]
+                        critic_input_temp = self._build_critic_input(global_state, actions_for_q)
+                        with torch.no_grad():
+                            q_val = self.critic1(critic_input_temp)  # [batch]
+                        q_all_actions.append(q_val)
 
-                advantage = q_pi - q_base
-                actor_loss = self.compute_actor_loss(i,logp,entropy,advantage,episode=self.current_episode)
+                    q_all_actions = torch.stack(q_all_actions, dim=-1)  # [batch, n_actions]
 
+                    # Counterfactual baseline: ∑_a' π(a'|s) * Q(s, (u^-i, a'))
+                    pi_probs = F.softmax(logits, dim=-1).detach()
+                    baseline = torch.sum(pi_probs * q_all_actions, dim=-1)  # [batch]
+
+                    # Q value of the action actually taken in buffer
+                    critic_input_real = self._build_critic_input(global_state, acts_b)
+                    with torch.no_grad():
+                        q_real = self.critic1(critic_input_real)
+
+                    # Counterfactual advantage = Q(real) - baseline
+                    advantage = (q_real - baseline).detach()
+                    q_monitor = q_real  # for logging
+
+                else:
+                    # === Standard Actor-Critic / REINFORCE ===
+                    with torch.no_grad():
+                        critic_input_base = self._build_critic_input(global_state, acts_b)
+                        q1_base = self.critic1(critic_input_base)
+                        q2_base = self.critic2(critic_input_base)
+                        q_base = torch.min(q1_base, q2_base)
+                    advantage = q_base.detach()
+                    q_monitor = q_base  # for logging
+
+                # 4. Unified policy gradient loss
+                actor_loss = self.compute_refined_actor_loss(
+                    i, logp_buffer, entropy, advantage, mode=self.actor_loss_mode, episode=self.current_episode)
+
+                # 5. Backprop and update
                 self.actor_optims[i].zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), 0.5)
                 self.actor_optims[i].step()
 
-            self.q_pi_history.append(q_pi.mean().item())
+            self.q_pi_history.append(q_monitor.mean().item())
 
-        # --- Soft updates for targets ---
-        self._soft_update(self.critic1, self.target_critic1)
-        self._soft_update(self.critic2, self.target_critic2)
-        for i in range(self.n):
-            self._soft_update(self.actors[i], self.target_actors[i])
+            # --- Soft updates for targets (after each gradient step) ---
+            self._soft_update(self.critic1, self.target_critic1)
+            self._soft_update(self.critic2, self.target_critic2)
+            for i in range(self.n):
+                self._soft_update(self.actors[i], self.target_actors[i])
 
 
     def _soft_update(self, source, target):
@@ -454,55 +921,46 @@ class MADDPG:
             'crit1': self.critic1.state_dict(),
             'crit2': self.critic2.state_dict()
         }
-        torch.save(state, path)
+        if self.coma_critic is not None:
+            state['coma_critic'] = self.coma_critic.state_dict()
         torch.save(state, path)
 
-    def compute_actor_loss(self, i, logp, entropy, advantage, episode,max_episode=800):
+    def compute_refined_actor_loss(self, i, logp, entropy, advantage, mode, episode, max_episode=800):
         """
-        计算单个 agent 的 actor loss，包含 advantage 标准化和自适应 entropy 衰减。
+        Unified actor policy gradient loss (supports both COMA and REINFORCE/AC modes).
+        Both modes use standard PG form: -(logp * advantage_norm).mean()
         """
+        # Standard COMA is the plain counterfactual policy-gradient objective.
+        # The historical normalized-advantage and adaptive-entropy objective is
+        # intentionally retained below for legacy experiments.
+        if self.standard_coma:
+            actor_loss = -(logp * advantage.detach()).mean()
+            self.actor_losses_history[i].append(actor_loss.item())
+            self.entropy_history[i].append(entropy.mean().item())
+            return actor_loss
 
-        # --- Advantage 标准化 ---
-        advantage = advantage.detach()
+        # --- Advantage normalization ---
         adv_mean = advantage.mean()
         adv_std = advantage.std(unbiased=False) + 1e-6
         advantage_norm = (advantage - adv_mean) / adv_std
 
-        # --- 自适应 entropy 系数 ---
-        # 计算该 agent 的动作分布方差，作为稳定性指标
-        # 这里假设你在外部维护了 self.action_freq[i]，记录最近一个 episode 的动作频率
-        if hasattr(self, "last_action_freq") and len(self.last_action_freq[i]) > 0 and self.last_action_freq[i][
-            0] is not None:
-            self.action_var = np.var(self.last_action_freq[i])  # 越小越稳定
+        # --- Adaptive entropy coefficient ---
+        if hasattr(self, "last_action_freq") and len(self.last_action_freq[i]) > 0 and self.last_action_freq[i][0] is not None:
+            self.current_action_var = np.var(self.last_action_freq[i])
         else:
-            # 改动1
-            self.action_var = 0.5  # 默认中等波动为0.5
+            self.current_action_var = 0.5
 
-        # 基础 schedule: 线性衰减
         ratio = min(episode / max_episode, 1.0)
         base_entropy_coef = self.entropy_start + (self.entropy_end - self.entropy_start) * ratio
-
-        # 指数衰减
-        # 改动2
-        # 改动3 把max episode改成了800
-        # decay_rate = self.entropy_end / self.entropy_start  # 衰减比例
-        # decay_progress = episode / max_episode  # 归一化进度 (0~1)
-        # base_entropy_coef = self.entropy_start * (decay_rate ** decay_progress)
-
-        # 自适应调整：波动大的区域保持更高熵
-        adapt_factor = 1.0 + self.action_var  # 方差大 → 系数放大
+        adapt_factor = 1.0 + self.current_action_var
         entropy_coef = base_entropy_coef * adapt_factor
 
-        # entropy_coef = self.get_entropy_coef()
-
-        # --- Actor loss ---
+        # --- Policy gradient loss ---
         actor_loss = -(logp * advantage_norm).mean() - entropy_coef * entropy.mean()
 
-        # --- 记录指标 ---
+        # --- Record metrics ---
         self.actor_losses_history[i].append(actor_loss.item())
         self.entropy_history[i].append(entropy.mean().item())
-        if hasattr(self, "entropy_coef_history"):
-            self.entropy_coef_history[i].append(entropy_coef)
 
         return actor_loss
 
@@ -526,7 +984,13 @@ class MADDPG:
                 self.target_actors[i].load_state_dict(self.actors[i].state_dict())
             self.target_critic1.load_state_dict(self.critic1.state_dict())
             self.target_critic2.load_state_dict(self.critic2.state_dict())
+            if self.coma_critic is not None:
+                if 'coma_critic' not in state:
+                    raise ValueError(
+                        'This checkpoint predates the action-vector standard COMA critic. '
+                        'Use it only with the legacy scalar-critic configuration.'
+                    )
+                self.coma_critic.load_state_dict(state['coma_critic'])
+                self.target_coma_critic.load_state_dict(self.coma_critic.state_dict())
         else:
             print("No specified loading path, not test dynamic matching")
-
-

@@ -1,13 +1,10 @@
-"""Stage-two COMA training for the selected grid/frequency scenarios."""
+"""Legacy warmup-data generator for replay-based dynamic matching experiments."""
 
 import multiprocessing as mp
 import os
 from pathlib import Path
-import random
 import sys
 import time
-
-import numpy as np
 
 for name in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS"):
     os.environ.setdefault(name, "1")
@@ -20,8 +17,8 @@ import torch
 
 from dynamic_matching.dynamic_matching_agent.maddpd_discreate import MADDPG
 from dynamic_matching.marl_stage2_common import (
-    DECISION_FREQS, GRID_NUMS, TRAIN_DATES, TRAINING_OUTPUT_PATH,
-    load_shared_inputs, stage2_task,
+    DECISION_FREQS, GRID_NUMS, TRAIN_DATES, WARMUP_OUTPUT_PATH, load_shared_inputs,
+    stage2_task,
 )
 from src.agents.sarsa import SarsaAgent
 from src.env.simulator_env import Simulator
@@ -33,42 +30,18 @@ REQUEST_DICT, MAPPING_DICT, ROAD_NETWORK, DRIVER_INFO_DICT = load_shared_inputs(
 
 def run_simulation_and_train(config, worker_id):
     torch.set_num_threads(1)
-    config = dict(config)
-    model_seed = int(config["model_seed"])
-    random.seed(model_seed)
-    np.random.seed(model_seed)
-    torch.manual_seed(model_seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(model_seed)
-    if torch.cuda.is_available():
-        gpu_id = worker_id % torch.cuda.device_count()
-        config['device'] = f'cuda:{gpu_id}'
-        print(f"[Worker {worker_id}] assigned to {config['device']}")
-    else:
-        config['device'] = 'cpu'
-    grid_num, decision_freq = config["grid_num"], config["decision_freq"]
-    print(
-        f"[Worker {worker_id}] task={grid_num}/{decision_freq} "
-        f"model_seed={model_seed}"
-    )
+    grid_num = config["grid_num"]
     score_agent = SarsaAgent(**config)
     total_state_dim = grid_num * 3 + 2
-    actor_obs_dim = 3 + 2  # local grid features + shared time encoding
-    agent = MADDPG(obs_dims=[actor_obs_dim] * grid_num, n_actions=[3] * grid_num,
+    agent = MADDPG(obs_dims=[total_state_dim + grid_num] * grid_num, n_actions=[3] * grid_num,
                    transitions=None, state_scaler=None, **config)
     simulator = Simulator(score_agent=score_agent, dynamic_matching_agent=agent,
                           mapping_dict=MAPPING_DICT, road_network=ROAD_NETWORK, **config)
-    SimulatorTrainer(simulator, score_agent, agent).dynamic_matching_train({
-        # 160 macro epochs × 5 training dates = 800 daily training episodes,
-        # matching the former 801-episode training budget while scoring each
-        # checkpoint on a five-day aggregate.
-        "num_epochs": 400, "num_macro_epochs": 80,
-        "days_per_macro_epoch": len(TRAIN_DATES),
-        "checkpoint_interval_macro_epochs": 10,
-        "train_dates": TRAIN_DATES, "driver_num": 1000,
-        "output_path": str(TRAINING_OUTPUT_PATH), "flag_load": True, "parallel": True,
-        "worker_id": worker_id, "hyper_parameters": config,
+    SimulatorTrainer(simulator, score_agent, agent).generate_warmup_data({
+        "train_dates": TRAIN_DATES, "driver_num": 1000, "output_path": str(WARMUP_OUTPUT_PATH),
+        "parallel": True, "worker_id": worker_id, "hyper_parameters": config,
         "DRIVER_INFO": DRIVER_INFO_DICT[grid_num], "REQUEST_DICT": REQUEST_DICT,
+        "ROAD_NETWORK": ROAD_NETWORK,
     })
 
 
@@ -88,15 +61,13 @@ def worker_process(task_queue, worker_id):
             raise
 
 
-if __name__ == "__main__":
+def main():
     mp.set_start_method("fork", force=True)
-    tasks = [stage2_task(grid, freq, "train_dynamic_matching") for grid in GRID_NUMS for freq in DECISION_FREQS]
+    tasks = [stage2_task(grid, freq, "generate_warmup_data") for grid in GRID_NUMS for freq in DECISION_FREQS]
     assert len(tasks) == len(GRID_NUMS) * len(DECISION_FREQS)
     queue = mp.Queue()
     for task in tasks:
         queue.put(task)
-    # One CUDA worker is the safe default.  Increase explicitly only when
-    # there are isolated GPU devices for the additional workers.
     num_workers = min(len(tasks), int(os.environ.get("STAGE2_NUM_WORKERS", "1")))
     workers = [mp.Process(target=worker_process, args=(queue, i)) for i in range(num_workers)]
     for worker in workers:
@@ -105,4 +76,8 @@ if __name__ == "__main__":
         worker.join()
     failed = [worker.pid for worker in workers if worker.exitcode != 0]
     if failed:
-        raise RuntimeError(f"COMA training failed in worker processes: {failed}")
+        raise RuntimeError(f"Warmup generation failed in worker processes: {failed}")
+
+
+if __name__ == "__main__":
+    main()
