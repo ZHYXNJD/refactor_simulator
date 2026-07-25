@@ -663,13 +663,21 @@ class Simulator:
             self.driver_table.loc[cor_driver[~con_remain], ['status', 'remaining_time', 'total_idle_time']] = 0
 
             # order not cancelled
-            new_matched_requests = df_matched[con_remain]
+            new_matched_requests = df_matched[con_remain].copy()
             new_matched_requests['t_matched'] = self.time
-            new_matched_requests['pickup_distance'] = matched_itinerary_df[con_remain]['pickup_distance'].values
-            new_matched_requests['pickup_time'] = new_matched_requests[
-                                                      'pickup_distance'].values / self.vehicle_speed * 3600
-            new_matched_requests['t_end'] = self.time + new_matched_requests['pickup_time'].values + \
-                                            new_matched_requests['trip_time'].values
+            # ``matched_itinerary_df`` is created from empty columns and can
+            # consequently retain an object dtype.  Newer Pandas versions no
+            # longer coerce that object array when it is assigned back into
+            # the driver's float ``remaining_time`` column.  Make the numeric
+            # boundary explicit so simulation behaviour is version-invariant.
+            pickup_distance = np.asarray(
+                matched_itinerary_df.loc[con_remain, 'pickup_distance'], dtype=float
+            )
+            pickup_time = pickup_distance / self.vehicle_speed * 3600.0
+            trip_time = new_matched_requests['trip_time'].to_numpy(dtype=float)
+            new_matched_requests['pickup_distance'] = pickup_distance
+            new_matched_requests['pickup_time'] = pickup_time
+            new_matched_requests['t_end'] = self.time + pickup_time + trip_time
             # driver_status更新
             new_matched_requests['status'] = 1
             new_matched_requests['driver_id'] = matched_pair_index_df[con_remain]['driver_id'].values
@@ -689,11 +697,13 @@ class Simulator:
 
             # driver_status更新
             self.driver_table.loc[cor_driver[con_remain], 'status'] = 2
-            self.driver_table.loc[cor_driver[con_remain], 'target_loc_lng'] = new_matched_requests['dest_lng'].values
-            self.driver_table.loc[cor_driver[con_remain], 'target_loc_lat'] = new_matched_requests['dest_lat'].values
+            self.driver_table.loc[cor_driver[con_remain], 'target_loc_lng'] = \
+                new_matched_requests['dest_lng'].to_numpy(dtype=float)
+            self.driver_table.loc[cor_driver[con_remain], 'target_loc_lat'] = \
+                new_matched_requests['dest_lat'].to_numpy(dtype=float)
             self.driver_table.loc[cor_driver[con_remain], 'target_grid_id'] = new_matched_requests[
-                'dest_grid_id'].values
-            self.driver_table.loc[cor_driver[con_remain], 'remaining_time'] = new_matched_requests['pickup_time'].values
+                'dest_grid_id'].to_numpy(dtype=int)
+            self.driver_table.loc[cor_driver[con_remain], 'remaining_time'] = pickup_time
             self.driver_table.loc[cor_driver[con_remain], 'matched_order_id'] = new_matched_requests['order_id'].values
             self.driver_table.loc[cor_driver[con_remain], 'total_idle_time'] = 0
             self.driver_table.loc[cor_driver[con_remain], 'time_to_last_cruising'] = 0
@@ -705,9 +715,12 @@ class Simulator:
             self.driver_table.loc[cor_driver[con_remain], 'itinerary_segment_dis_list'] = \
                 (matched_itinerary_df[con_remain]['itinerary_segment_dis_list'] + new_matched_requests[
                     'itinerary_segment_dis_list']).values
-            self.driver_table.loc[cor_driver[con_remain], 'remaining_time_for_current_node'] = \
-                matched_itinerary_df[con_remain]['itinerary_segment_dis_list'].map(
-                    lambda x: x[0]).values / self.vehicle_speed * 3600
+            self.driver_table.loc[cor_driver[con_remain], 'remaining_time_for_current_node'] = np.asarray(
+                matched_itinerary_df.loc[con_remain, 'itinerary_segment_dis_list'].map(
+                    lambda x: x[0]
+                ),
+                dtype=float,
+            ) / self.vehicle_speed * 3600.0
 
             if self.rl_mode in ['matching', 'reposition'] and self.experiment_mode == 'train_value':
 
