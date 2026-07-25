@@ -76,7 +76,7 @@ def _require_sb3():
         raise RuntimeError(
             "Stable-Baselines3 is required for this baseline. Install a "
             "Gymnasium-compatible version, for example: "
-            "python -m pip install stable-baselines3==2.0.0"
+            "python -m pip install stable-baselines3==2.7.1"
         ) from exc
     return PPO, Monitor
 
