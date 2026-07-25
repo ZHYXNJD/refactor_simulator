@@ -2,6 +2,7 @@
 my_data/
 dynamic_matching/warmup_transitions/
 dynamic_matching/evaluate_results/
+dynamic_matching/centralized_ppo_results/
 dynamic_matching/value_estimation_result/
 *.zip
 dynamic_repo/sarsa_value_estimation_result/
