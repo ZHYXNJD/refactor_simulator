@@ -51,6 +51,13 @@ venv/
 dynamic_reposition/
 dynamic_reposition/warmup_data/
 dynamic_reposition/train_output/
-dynamic_matching/idqn_result/
+dynamic_matching/all_output/idqn_result/
+
+dynamic_matching/all_output/
+dynamic_matching/qtable_state_6to21_full_data/
+dynamic_matching/qtable_state_6to21_sample030_stratified/
+dynamic_matching/qtable_state_6to21_sample050_stratified/
+
+evaluate_results/
 
 result_server/

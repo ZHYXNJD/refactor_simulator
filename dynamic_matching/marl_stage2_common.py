@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import json
+import math
 import os
 from pathlib import Path
 import pickle
@@ -22,6 +24,11 @@ SAMPLE_RATIO = 0.30
 T_INITIAL = 6 * 3600
 T_END = 21 * 3600
 QTABLE_ROOT = PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_sample030_stratified"
+QTABLE_ROOTS = {
+    0.30: QTABLE_ROOT,
+    0.50: PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_sample050_stratified",
+    None: PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_full_data",
+}
 WARMUP_OUTPUT_PATH = PROJECT_ROOT / "dynamic_matching" / "warmup_transitions" / "stage2_coma"
 TRAINING_OUTPUT_PATH = Path(
     os.environ.get(
@@ -29,7 +36,7 @@ TRAINING_OUTPUT_PATH = Path(
         PROJECT_ROOT / "dynamic_matching" / "marl_coma_stage2_coma_vector",
     )
 )
-GRID_NUMS = (8, 35, 63)
+GRID_NUMS = (35,)
 ALL_DECISION_FREQS = (5, 10, 20, 30)
 
 # Start stage two with the middle time scale only.  It is the most useful
@@ -59,9 +66,9 @@ BASE_DECISION_FREQ = 5
 BASE_GAMMA = 0.95
 # Strict COMA performs one actor and one critic update for each newly sampled
 # on-policy rollout. Extra fitted-critic passes remain an explicit ablation.
-CRITIC_UPDATES_PER_EPISODE = int(os.environ.get("STAGE2_CRITIC_UPDATES", "1"))
-ACTOR_LR = float(os.environ.get("STAGE2_ACTOR_LR", "5e-4"))
-CRITIC_LR = float(os.environ.get("STAGE2_CRITIC_LR", "5e-4"))
+CRITIC_UPDATES_PER_EPISODE = int(os.environ.get("STAGE2_CRITIC_UPDATES", "8"))
+ACTOR_LR = float(os.environ.get("STAGE2_ACTOR_LR", "3e-4"))
+CRITIC_LR = float(os.environ.get("STAGE2_CRITIC_LR", "3e-4"))
 TARGET_CRITIC_UPDATE_INTERVAL = int(
     os.environ.get("STAGE2_TARGET_CRITIC_UPDATE_INTERVAL", "10")
 )
@@ -71,6 +78,20 @@ COMA_EPSILON_ANNEAL_EPISODES = int(
     os.environ.get("STAGE2_COMA_EPSILON_ANNEAL_EPISODES", "750")
 )
 BASE_MODEL_SEED = int(os.environ.get("STAGE2_BASE_MODEL_SEED", "20260724"))
+ENVIRONMENT_SEED_BASE = int(
+    os.environ.get("STAGE2_ENVIRONMENT_SEED_BASE", "2026080200")
+)
+
+
+def environment_seed_sequence(num_episodes, base_seed=None):
+    """Return the shared reproducible per-episode environment seed schedule."""
+    if num_episodes <= 0:
+        raise ValueError("num_episodes must be positive.")
+    first_seed = ENVIRONMENT_SEED_BASE if base_seed is None else int(base_seed)
+    last_seed = first_seed + int(num_episodes) - 1
+    if first_seed < 0 or last_seed >= 2 ** 32:
+        raise ValueError("Environment seeds must lie in NumPy's uint32 range.")
+    return tuple(range(first_seed, last_seed + 1))
 
 # Best checkpoint per scenario, selected by test_gmv_mean in
 # qtable_test_results_6to21_sample030_stratified/qtable_test_summary.csv.
@@ -90,12 +111,87 @@ QTABLE_PATHS = {
 }
 
 
-def load_request_dict(dates):
-    """Load fixed 30% stratified samples for the requested episode dates."""
+def normalize_sample_ratio(sample_ratio):
+    """Normalize supported data scopes; ``None`` denotes original full data."""
+    if sample_ratio is None:
+        return None
+    ratio = float(sample_ratio)
+    for supported in (0.30, 0.50):
+        if math.isclose(ratio, supported, rel_tol=0.0, abs_tol=1e-12):
+            return supported
+    if math.isclose(ratio, 1.0, rel_tol=0.0, abs_tol=1e-12):
+        return None
+    raise ValueError(
+        f"Unsupported scenario sample ratio {sample_ratio!r}; "
+        "expected 0.30, 0.50, or full/1.0."
+    )
+
+
+def sample_scope_name(sample_ratio):
+    ratio = normalize_sample_ratio(sample_ratio)
+    return "full" if ratio is None else f"sample{int(ratio * 100):03d}"
+
+
+def _validate_qtable_scope(qtable_path, sample_ratio):
+    """Fail fast when a Q-table belongs to a different order-data scope."""
+    hyper_parameters_path = qtable_path.parent / "hyper_parameters.json"
+    if not hyper_parameters_path.exists():
+        raise FileNotFoundError(
+            f"Missing Q-table hyper-parameters: {hyper_parameters_path}"
+        )
+    with hyper_parameters_path.open(encoding="utf-8") as file:
+        hyper_parameters = json.load(file)
+    actual = float(hyper_parameters.get("scenario_sample_ratio", -1.0))
+    expected = 1.0 if normalize_sample_ratio(sample_ratio) is None else float(sample_ratio)
+    if not math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-12):
+        raise ValueError(
+            "Q-table data-scope mismatch: "
+            f"checkpoint={qtable_path}, checkpoint_ratio={actual}, "
+            f"requested_ratio={expected}."
+        )
+
+
+def qtable_path_for_sample_ratio(grid_num, decision_freq, sample_ratio=SAMPLE_RATIO):
+    """Resolve the training-selected best Q-table for one exact data scope."""
+    ratio = normalize_sample_ratio(sample_ratio)
+    key = (int(grid_num), int(decision_freq))
+    if ratio == SAMPLE_RATIO:
+        qtable_path = QTABLE_PATHS[key]
+    else:
+        qtable_root = QTABLE_ROOTS[ratio]
+        summaries = sorted(
+            qtable_root.glob(
+                f"grid_{key[0]}_freq_{key[1]}_*/checkpoint_summary.json"
+            )
+        )
+        if len(summaries) != 1:
+            raise FileNotFoundError(
+                "Expected exactly one matching Q-table training run for "
+                f"scope={sample_scope_name(ratio)}, grid={key[0]}, "
+                f"freq={key[1]}; found {len(summaries)} under {qtable_root}."
+            )
+        with summaries[0].open(encoding="utf-8") as file:
+            checkpoint_summary = json.load(file)
+        qtable_path = summaries[0].parent / checkpoint_summary["best"]["path"]
+    if not qtable_path.exists():
+        raise FileNotFoundError(f"Missing scenario Q-table: {qtable_path}")
+    _validate_qtable_scope(qtable_path, ratio)
+    return qtable_path
+
+
+def load_request_dict(dates, sample_ratio=SAMPLE_RATIO):
+    """Load fixed stratified samples or the original full request files."""
+    ratio = normalize_sample_ratio(sample_ratio)
     request_dict = {}
     for date in dates:
-        path = sampled_order_path(DATA_ROOT, date, SAMPLE_RATIO)
+        path = (
+            DATA_ROOT / "cleaned_orders_pickle" / f"orders_grid35_{date}.pkl"
+            if ratio is None
+            else sampled_order_path(DATA_ROOT, date, ratio)
+        )
         if not path.exists():
+            if ratio is None:
+                raise FileNotFoundError(f"Missing full request file: {path}")
             raise FileNotFoundError(
                 f"Missing fixed stratified sample: {path}. Run "
                 "dynamic_matching/generate_stratified_order_samples.py first."
@@ -106,9 +202,19 @@ def load_request_dict(dates):
     return request_dict
 
 
-def load_shared_inputs():
-    """Load exactly the fixed samples and driver draw used by stage one."""
-    request_dict = load_request_dict(TRAIN_DATES)
+def load_shared_inputs(grids=None, dates=None, sample_ratio=SAMPLE_RATIO):
+    """Load fixed samples and driver mappings for the requested scenarios.
+
+    ``GRID_NUMS`` remains the historical default, while new 8-grid experiments
+    can request only their own mapping without mutating project-wide defaults.
+    """
+    selected_grids = tuple(GRID_NUMS if grids is None else grids)
+    selected_dates = tuple(TRAIN_DATES if dates is None else dates)
+    if not selected_grids:
+        raise ValueError("At least one grid size must be requested.")
+    if not selected_dates:
+        raise ValueError("At least one experiment date must be requested.")
+    request_dict = load_request_dict(selected_dates, sample_ratio=sample_ratio)
 
     with (DATA_ROOT / "drivers_grid35_1000.pickle").open("rb") as file:
         driver_info = pickle.load(file).sample(n=1000, replace=False, random_state=42)
@@ -116,7 +222,7 @@ def load_shared_inputs():
         mapping_dict = pickle.load(file)
 
     road_network, driver_info_dict = {}, {}
-    for grid_num in GRID_NUMS:
+    for grid_num in selected_grids:
         network = pd.read_csv(DATA_ROOT / f"new_grids_{grid_num}.csv", index_col="node_id", dtype={"node_id": float})
         road_network[grid_num] = network
         driver_grid = pd.merge(
@@ -129,19 +235,30 @@ def load_shared_inputs():
     return request_dict, mapping_dict, road_network, driver_info_dict
 
 
-def stage2_task(grid_num, decision_freq, experiment_mode):
-    qtable_path = QTABLE_PATHS[(grid_num, decision_freq)]
-    if not qtable_path.exists():
-        raise FileNotFoundError(f"Missing scenario Q-table: {qtable_path}")
+def stage2_task(
+    grid_num,
+    decision_freq,
+    experiment_mode,
+    sample_ratio=SAMPLE_RATIO,
+):
+    ratio = normalize_sample_ratio(sample_ratio)
+    qtable_path = qtable_path_for_sample_ratio(
+        grid_num, decision_freq, sample_ratio=ratio
+    )
     return {
         "grid_num": grid_num,
         "decision_freq": decision_freq,
         "t_initial": T_INITIAL,
         "t_end": T_END,
         "driver_num": 1000,
-        "order_sample_ratio": 1.0,  # samples are already materialized at 30%
-        "scenario_sample_ratio": SAMPLE_RATIO,
-        "sampling_scheme": "300s_x_origin_grid35_fixed",
+        "order_sample_ratio": 1.0,  # requests are already materialized
+        "scenario_sample_ratio": 1.0 if ratio is None else ratio,
+        "sample_scope": sample_scope_name(ratio),
+        "sampling_scheme": (
+            "full_original_orders"
+            if ratio is None
+            else "300s_x_origin_grid35_fixed"
+        ),
         "experiment_mode": experiment_mode,
         "pickup_mode": "ma",
         "method": "dynamic_matching",
@@ -154,6 +271,9 @@ def stage2_task(grid_num, decision_freq, experiment_mode):
         "standard_coma": True,
         "use_replay_buffer": False,
         "normalize_states": False,
+        # When a follow-up experiment enables normalization, calibrate on one
+        # complete pass over the five training dates, then freeze the scaler.
+        "state_normalizer_warmup_episodes": len(TRAIN_DATES),
         "decentralized_actor": True,
         "global_state_dim": grid_num * 3 + 2,
         "critic_updates_per_episode": CRITIC_UPDATES_PER_EPISODE,

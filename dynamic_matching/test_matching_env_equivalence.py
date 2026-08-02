@@ -2,9 +2,8 @@
 
 This is an integration experiment, not a synthetic unit test.  It runs the
 same fixed daily request sample, driver draw, Q-table scorer, seed and fixed
-grid policy through both control paths.  The adapter intentionally uses the
-legacy all-zero rule for the first interval because the historic trainer did
-not query its policy at ``t_initial``.
+grid policy through both control paths. Both paths query the policy at
+``t_initial`` and therefore cover every decision interval.
 
 Example
 -------
@@ -39,13 +38,17 @@ class FixedMatchingPolicy:
     def __init__(self, grid_num: int, action: int):
         self.grid_num = grid_num
         self.action = action
+        self.selection_count = 0
+        self.transition_count = 0
 
     def select_actions(self, global_state, deterministic=False):
         del global_state, deterministic
+        self.selection_count += 1
         return [self.action] * self.grid_num, [0.0] * self.grid_num
 
     def record_on_policy_transition(self, *args, **kwargs):
         del args, kwargs
+        self.transition_count += 1
 
     def update(self, *args, **kwargs):
         del args, kwargs
@@ -77,9 +80,10 @@ def run_legacy_fixed_policy(
     mapping_dict,
     road_network,
 ) -> dict[str, Any]:
+    policy = FixedMatchingPolicy(config["grid_num"], action)
     simulator = Simulator(
         score_agent=_new_score_agent(config),
-        dynamic_matching_agent=FixedMatchingPolicy(config["grid_num"], action),
+        dynamic_matching_agent=policy,
         mapping_dict=mapping_dict,
         road_network=road_network,
         **config,
@@ -92,7 +96,11 @@ def run_legacy_fixed_policy(
     )
     for _ in range(simulator.finish_run_step + 1):
         simulator.rl_step_train_matching_method()
-    return _metrics(simulator)
+    return {
+        **_metrics(simulator),
+        "policy_selection_count": policy.selection_count,
+        "transition_count": policy.transition_count,
+    }
 
 
 def run_parallel_env_fixed_policy(
@@ -117,14 +125,8 @@ def run_parallel_env_fixed_policy(
         reward_mode="team",
     )
     env.reset(seed=seed)
-    is_first_interval = True
     while env.agents:
-        # Historic ``rl_step_train_matching_method`` leaves its default all-0
-        # action active from t_initial until the first decision boundary.  This
-        # preserves exactly that timing for an equivalence—not performance—test.
-        selected_action = 0 if is_first_interval else action
-        env.step({agent: selected_action for agent in env.agents})
-        is_first_interval = False
+        env.step({agent: action for agent in env.agents})
     metrics = _metrics(env.simulator)
     env.close()
     return metrics
@@ -191,6 +193,22 @@ def run_equivalence_experiment(
             road_network=road_network,
         )
         assert_equivalent(legacy, parallel)
+        expected_intervals = int(
+            (config["t_end"] - config["t_initial"])
+            / (config["decision_freq"] * 60)
+        )
+        if legacy["policy_selection_count"] != expected_intervals:
+            raise AssertionError(
+                "Legacy trainer did not query every decision interval: "
+                f"expected {expected_intervals}, got "
+                f"{legacy['policy_selection_count']}."
+            )
+        if legacy["transition_count"] != expected_intervals:
+            raise AssertionError(
+                "Legacy trainer did not record every transition: "
+                f"expected {expected_intervals}, got "
+                f"{legacy['transition_count']}."
+            )
         rows.append({"action": action, **legacy})
         print(f"equivalence passed: action={action}", flush=True)
     return rows

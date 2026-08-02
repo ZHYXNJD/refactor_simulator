@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import argparse
 from copy import deepcopy
 from pathlib import Path
 
@@ -36,45 +37,61 @@ from src.env.simulator_trainer import SimulatorTrainer
 
 DATA_ROOT = PROJECT_ROOT / 'my_data'
 TRAIN_DATE = ['2015-05-05', '2015-05-06', '2015-05-07', '2015-05-08','2015-05-11']
-# First-stage Q-table sweep: 06:00--21:00, fixed 30% stratified demand sample,
-# and 1,000 drivers. Keep it separate from former experiments.
-SAMPLE_RATIO = 0.30
-OUTPUT_PATH = str(Path(__file__).resolve().parent / 'qtable_state_6to21_sample030_stratified')
+# Training data is loaded in ``main`` before the workers are forked.  Keeping
+# it out of module import makes this file reusable by the 50% and full-data
+# launchers without accidentally loading the 30% sample first.
+SAMPLE_RATIO = None
+OUTPUT_PATH = None
 REQUEST_DICT = {}
-for date in TRAIN_DATE:
-    data_path = sampled_order_path(DATA_ROOT, date, SAMPLE_RATIO)
-    if not data_path.exists():
-        raise FileNotFoundError(
-            f'Missing fixed stratified sample: {data_path}. Generate it first with '
-            'python dynamic_matching/generate_stratified_order_samples.py --sample-ratio 0.30'
-        )
-    with open(data_path, 'rb') as f:
-        print(f"load request file: {data_path}")
-        REQUEST_DICT[date] = pickle.load(f)
-
-driver_path = DATA_ROOT / 'drivers_grid35_1000.pickle'
-with open(driver_path, 'rb') as f:
-    DRIVER_INFO = pickle.load(f)
-
-DRIVER_INFO = DRIVER_INFO.sample(n=1000,replace=False, random_state=42)
-
-with (DATA_ROOT / 'node_to_grid.pkl').open('rb') as f:
-    MAPPING_DICT = pickle.load(f)
-
+DRIVER_INFO = None
+MAPPING_DICT = None
 ROAD_NETWORK = {}
 DRIVER_INFO_DICT = {}
 
-for grid_num in [8,35,63]:
 
-    result = pd.read_csv(DATA_ROOT / f'new_grids_{grid_num}.csv', index_col='node_id', dtype={'node_id': float})
-    ROAD_NETWORK[grid_num] = result
-    driver_origin_loc = DRIVER_INFO[['lng', 'lat']]
-    driver_origin_loc_grid = pd.merge(driver_origin_loc, result[['lng', 'lat', 'grid_id']],on=['lng', 'lat'], how='left')
-    driver_info = deepcopy(DRIVER_INFO)
-    # The merge creates a new RangeIndex, while DRIVER_INFO keeps its shuffled
-    # sample index. Assign positionally so each grid_id stays with its lng/lat.
-    driver_info['grid_id'] = driver_origin_loc_grid['grid_id'].to_numpy()
-    DRIVER_INFO_DICT[grid_num] = driver_info
+def load_shared_data(sample_ratio) -> str:
+    """Load either a fixed stratified sample or the original full requests."""
+    global SAMPLE_RATIO, REQUEST_DICT, DRIVER_INFO, MAPPING_DICT
+    global ROAD_NETWORK, DRIVER_INFO_DICT
+
+    SAMPLE_RATIO = sample_ratio
+    REQUEST_DICT = {}
+    for date in TRAIN_DATE:
+        if sample_ratio is None:
+            data_path = DATA_ROOT / 'cleaned_orders_pickle' / f'orders_grid35_{date}.pkl'
+        else:
+            data_path = sampled_order_path(DATA_ROOT, date, sample_ratio)
+        if not data_path.exists():
+            if sample_ratio is None:
+                raise FileNotFoundError(f'Missing full request file: {data_path}')
+            raise FileNotFoundError(
+                f'Missing fixed stratified sample: {data_path}. Generate it first with '
+                f'python dynamic_matching/generate_stratified_order_samples.py '
+                f'--sample-ratio {sample_ratio:.2f}'
+            )
+        with data_path.open('rb') as file:
+            print(f'load request file: {data_path}')
+            REQUEST_DICT[date] = pickle.load(file)
+
+    with (DATA_ROOT / 'drivers_grid35_1000.pickle').open('rb') as file:
+        DRIVER_INFO = pickle.load(file).sample(n=1000, replace=False, random_state=42)
+    with (DATA_ROOT / 'node_to_grid.pkl').open('rb') as file:
+        MAPPING_DICT = pickle.load(file)
+
+    ROAD_NETWORK = {}
+    DRIVER_INFO_DICT = {}
+    for grid_num in [8, 35, 63]:
+        result = pd.read_csv(DATA_ROOT / f'new_grids_{grid_num}.csv', index_col='node_id', dtype={'node_id': float})
+        ROAD_NETWORK[grid_num] = result
+        driver_origin_loc = DRIVER_INFO[['lng', 'lat']]
+        driver_origin_loc_grid = pd.merge(
+            driver_origin_loc, result[['lng', 'lat', 'grid_id']], on=['lng', 'lat'], how='left'
+        )
+        driver_info = deepcopy(DRIVER_INFO)
+        driver_info['grid_id'] = driver_origin_loc_grid['grid_id'].to_numpy()
+        DRIVER_INFO_DICT[grid_num] = driver_info
+
+    return 'full_data' if sample_ratio is None else f'sample{int(sample_ratio * 100):03d}_stratified'
 
 
 # --- 2. 仿真与训练逻辑 ---
@@ -145,7 +162,41 @@ def worker_process(task_queue, worker_id):
 
 
 # --- 4. 主程序 ---
-if __name__ == "__main__":
+def main(
+    default_sample_ratio=0.30,
+    full_sample_default: bool = False,
+) -> None:
+    """Run the 24-way sweep; ``None`` selects the original full order files."""
+    parser = argparse.ArgumentParser(description='Parallel Q-table training sweep')
+    parser.add_argument(
+        '--sample-ratio', type=float, default=default_sample_ratio,
+        help='Fixed stratified order-sample ratio (0 < ratio <= 1).',
+    )
+    parser.add_argument(
+        '--full-sample', action='store_true', default=full_sample_default,
+        help='Load original orders_grid35_<date>.pkl files instead of a sampled dataset.',
+    )
+    parser.add_argument(
+        '--output-path', type=Path,
+        help='Optional training-output directory. Defaults to a ratio-specific directory.',
+    )
+    args = parser.parse_args()
+    if args.full_sample:
+        if args.sample_ratio is not None and args.sample_ratio != default_sample_ratio:
+            parser.error('--full-sample cannot be combined with a different --sample-ratio')
+        sample_ratio = None
+    else:
+        sample_ratio = args.sample_ratio
+        if sample_ratio is None or not 0 < sample_ratio <= 1:
+            parser.error('--sample-ratio must satisfy 0 < ratio <= 1')
+
+    global OUTPUT_PATH
+    data_label = load_shared_data(sample_ratio)
+    OUTPUT_PATH = str(
+        args.output_path
+        or Path(__file__).resolve().parent / f'qtable_state_6to21_{data_label}'
+    )
+    print(f'Using {data_label}; output path: {OUTPUT_PATH}')
 
     # 必须使用 fork 以共享内存
     mp.set_start_method('fork', force=True)
@@ -169,26 +220,26 @@ if __name__ == "__main__":
     }
 
     ablation_configs = [
-        {
-            'ablation_name': 'state_raw_reward',
-            'matching_score_mode': 'state_value',
-            'reward_discount_mode': 'undiscounted',
-        },
-        {
-            'ablation_name': 'advantage_raw_reward',
-            'matching_score_mode': 'advantage',
-            'reward_discount_mode': 'undiscounted',
-        },
+        # {
+        #     'ablation_name': 'state_raw_reward',
+        #     'matching_score_mode': 'state_value',
+        #     'reward_discount_mode': 'undiscounted',
+        # },
+        # {
+        #     'ablation_name': 'advantage_raw_reward',
+        #     'matching_score_mode': 'advantage',
+        #     'reward_discount_mode': 'undiscounted',
+        # },
         {
             'ablation_name': 'state_discounted_reward',
             'matching_score_mode': 'state_value',
             'reward_discount_mode': 'uniform_discounted',
-        },
-        {
-            'ablation_name': 'advantage_discounted_reward',
-            'matching_score_mode': 'advantage',
-            'reward_discount_mode': 'uniform_discounted',
-        },
+        }
+        # {
+        #     'ablation_name': 'advantage_discounted_reward',
+        #     'matching_score_mode': 'advantage',
+        #     'reward_discount_mode': 'uniform_discounted',
+        # },
     ]
 
     # The three time scales are intentionally independent:
@@ -206,7 +257,9 @@ if __name__ == "__main__":
         }
     ]
     for grid_num in [8, 35, 63]:
+    # for grid_num in [8]:
         for decision_freq in [5, 10, 20, 30]:
+        # for decision_freq in [5]:
             for ablation_config in selected_ablations:
                 tasks.append({
                     **base_config,
@@ -217,12 +270,15 @@ if __name__ == "__main__":
                     'driver_num': 1000,
                     # REQUEST_DICT is already sampled offline. Do not sample again.
                     'order_sample_ratio': 1.0,
-                    'scenario_sample_ratio': SAMPLE_RATIO,
-                    'sampling_scheme': '300s_x_origin_grid35_fixed',
+                    'scenario_sample_ratio': 1.0 if sample_ratio is None else sample_ratio,
+                    'sampling_scheme': (
+                        'full_original_orders' if sample_ratio is None
+                        else '300s_x_origin_grid35_fixed'
+                    ),
                     **ablation_config,
                 })
 
-    assert len(tasks) == 24
+    assert len(tasks) == 12
 
     # >>> 3. 填充任务队列 <<<
     task_queue = mp.Queue()
@@ -247,4 +303,8 @@ if __name__ == "__main__":
     for p in processes:
         p.join()
 
-    print(">>> All experiments finished!")
+    print(">>>  All experiments finished!")
+
+
+if __name__ == "__main__":
+    main()

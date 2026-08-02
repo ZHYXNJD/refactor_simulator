@@ -167,6 +167,13 @@ class MADDPG:
         self.standard_coma = bool(HYPERPARAMS.get('standard_coma', False))
         self.use_replay_buffer = bool(HYPERPARAMS.get('use_replay_buffer', True))
         self.normalize_states = bool(HYPERPARAMS.get('normalize_states', True))
+        self.state_normalizer_warmup_episodes = int(
+            HYPERPARAMS.get('state_normalizer_warmup_episodes', 5)
+        )
+        if self.state_normalizer_warmup_episodes <= 0:
+            raise ValueError('state_normalizer_warmup_episodes must be positive.')
+        self.state_normalizer_warmup_episodes_seen = 0
+        self.state_normalizer_calibration_states = []
         self.decentralized_actor = bool(HYPERPARAMS.get('decentralized_actor', False))
         self.global_state_dim = int(HYPERPARAMS.get('global_state_dim', obs_dims[0] - HYPERPARAMS.get('grid_num', 35)))
         self.td_lambda = float(HYPERPARAMS.get('td_lambda', 0.8))
@@ -174,6 +181,9 @@ class MADDPG:
         self.coma_epsilon_end = float(HYPERPARAMS.get('coma_epsilon_end', 0.02))
         self.coma_epsilon_anneal_episodes = int(
             HYPERPARAMS.get('coma_epsilon_anneal_episodes', 750)
+        )
+        self.initial_action2_logit_bias = float(
+            HYPERPARAMS.get('initial_action2_logit_bias', 0.0)
         )
         if not 0.0 <= self.td_lambda <= 1.0:
             raise ValueError('td_lambda must lie in [0, 1].')
@@ -188,11 +198,25 @@ class MADDPG:
             )
         )
         self.actor_updates_per_episode = int(HYPERPARAMS.get('actor_updates_per_episode', 1))
+        # Optional critic-only warm-up for standard on-policy COMA.  This is
+        # counted in complete environment episodes (including any
+        # state-normalizer calibration episodes) so experiment manifests can
+        # describe one unambiguous actor start episode.  The default preserves
+        # all historical runs.
+        self.actor_warmup_episodes = int(
+            HYPERPARAMS.get('actor_warmup_episodes', 0)
+        )
         self.target_critic_update_interval = int(
             HYPERPARAMS.get('target_critic_update_interval', 10)
         )
         if self.critic_updates_per_episode <= 0 or self.actor_updates_per_episode <= 0:
             raise ValueError('Updates per episode must be positive.')
+        if self.actor_warmup_episodes < 0:
+            raise ValueError('actor_warmup_episodes must be non-negative.')
+        if self.actor_warmup_episodes and self.actor_update_mode != 'on_policy':
+            raise ValueError(
+                'actor_warmup_episodes is supported only for on-policy actor updates.'
+            )
         if self.target_critic_update_interval <= 0:
             raise ValueError('target_critic_update_interval must be positive.')
         self.driver_num = HYPERPARAMS.get('driver_num',1000)
@@ -275,6 +299,13 @@ class MADDPG:
         for i in range(self.n):
             actor_input_dim = obs_dims[i]  # global state + grid ID one-hot
             a = Actor(actor_input_dim, self.actor_hidden, self.n_actions[i]).to(self.device)
+            if self.initial_action2_logit_bias != 0.0:
+                if self.n_actions[i] <= 2:
+                    raise ValueError(
+                        'initial_action2_logit_bias requires action index 2.'
+                    )
+                with torch.no_grad():
+                    a.net[-1].bias[2].add_(self.initial_action2_logit_bias)
             ta = copy.deepcopy(a).to(self.device)
             # Strict COMA uses RMSProp; legacy replay experiments retain Adam.
             optimizer_class = optim.RMSprop if self.standard_coma else optim.Adam
@@ -531,10 +562,90 @@ class MADDPG:
     def _normalize_states(self, states):
         if not self.normalize_states:
             return states.to(dtype=torch.float32, device=self.device)
+        if not self.is_scaler_fitted:
+            raise RuntimeError(
+                'State normalization was requested before the scaler was fitted.'
+            )
         return torch.tensor(
             self.state_scaler.transform(states.cpu().numpy()),
             dtype=torch.float32, device=self.device,
         )
+
+    def prepare_on_policy_state_normalizer(self):
+        """Calibrate and freeze a scaler without violating on-policy updates.
+
+        Rollouts collected before the scaler is fitted used raw observations,
+        so they must never be replayed through a newly normalized policy.  The
+        first configured number of episodes are calibration-only: their states
+        fit one frozen scaler and their policy/critic rollout is discarded.
+        """
+        if not self.normalize_states:
+            return True
+        if self.is_scaler_fitted:
+            return True
+        if self.actor_update_mode != 'on_policy':
+            raise RuntimeError(
+                'On-policy state-normalizer calibration requires '
+                "actor_update_mode='on_policy'."
+            )
+        if not self.on_policy_rollout:
+            return False
+
+        episode_states = [
+            np.asarray(transition.obs, dtype=np.float32)
+            for transition in self.on_policy_rollout
+        ]
+        episode_states.append(
+            np.asarray(self.on_policy_rollout[-1].next_obs, dtype=np.float32)
+        )
+        self.state_normalizer_calibration_states.extend(episode_states)
+        self.state_normalizer_warmup_episodes_seen += 1
+        self.clear_on_policy_rollout()
+
+        if (
+            self.state_normalizer_warmup_episodes_seen
+            < self.state_normalizer_warmup_episodes
+        ):
+            return False
+
+        self.state_scaler.fit(
+            np.stack(self.state_normalizer_calibration_states, axis=0)
+        )
+        self.is_scaler_fitted = True
+        self.state_normalizer_calibration_states = []
+        return False
+
+    def _state_normalizer_state(self):
+        if not self.normalize_states or not self.is_scaler_fitted:
+            return None
+        return {
+            'mean': np.asarray(self.state_scaler.mean_, dtype=np.float64),
+            'var': np.asarray(self.state_scaler.var_, dtype=np.float64),
+            'scale': np.asarray(self.state_scaler.scale_, dtype=np.float64),
+            'n_features_in': int(self.state_scaler.n_features_in_),
+            'n_samples_seen': np.asarray(self.state_scaler.n_samples_seen_),
+        }
+
+    def load_state_normalizer_state(self, state):
+        """Restore the frozen training scaler used by normalized policies."""
+        if state is None:
+            if self.normalize_states:
+                raise ValueError(
+                    'Normalized policy checkpoint is missing state_normalizer.'
+                )
+            return
+        scaler = StandardScaler()
+        scaler.mean_ = np.asarray(state['mean'], dtype=np.float64)
+        scaler.var_ = np.asarray(state['var'], dtype=np.float64)
+        scaler.scale_ = np.asarray(state['scale'], dtype=np.float64)
+        scaler.n_features_in_ = int(state['n_features_in'])
+        samples_seen = np.asarray(state['n_samples_seen'])
+        scaler.n_samples_seen_ = (
+            samples_seen.item() if samples_seen.ndim == 0 else samples_seen
+        )
+        self.state_scaler = scaler
+        self.is_scaler_fitted = True
+        self.state_normalizer_calibration_states = []
 
     def _update_critic_only(self, num_updates):
         """Off-policy TD updates are valid for the centralized critic only."""
@@ -587,10 +698,24 @@ class MADDPG:
             self._soft_update(self.critic1, self.target_critic1)
             self._soft_update(self.critic2, self.target_critic2)
 
+    def actor_update_ready(self):
+        """Return whether the critic-only actor warm-up has completed."""
+        return self.current_episode >= self.actor_warmup_episodes
+
     def update_on_policy_actor(self):
-        """One COMA actor update from the just-collected behaviour rollout."""
+        """One COMA actor update from the just-collected behaviour rollout.
+
+        During the configured critic-only warm-up the rollout has already
+        trained the critic, but must then be discarded: retaining it would
+        violate the strict on-policy update used by the next actor step.
+        The boolean return is used by the trainer for explicit TensorBoard
+        diagnostics.
+        """
         if self.actor_update_mode != 'on_policy' or not self.on_policy_rollout:
-            return
+            return False
+        if not self.actor_update_ready():
+            self.clear_on_policy_rollout()
+            return False
         states = torch.tensor(
             np.stack([transition.obs for transition in self.on_policy_rollout]),
             dtype=torch.float32, device=self.device,
@@ -660,6 +785,7 @@ class MADDPG:
             for actor, target_actor in zip(self.actors, self.target_actors):
                 self._soft_update(actor, target_actor)
         self.clear_on_policy_rollout()
+        return True
 
     def update_standard_coma_critic(self):
         """Fit the centralized critic from this rollout with TD(lambda).
@@ -919,7 +1045,8 @@ class MADDPG:
         state = {
             'actors': [a.state_dict() for a in self.actors],
             'crit1': self.critic1.state_dict(),
-            'crit2': self.critic2.state_dict()
+            'crit2': self.critic2.state_dict(),
+            'state_normalizer': self._state_normalizer_state(),
         }
         if self.coma_critic is not None:
             state['coma_critic'] = self.coma_critic.state_dict()
@@ -992,5 +1119,6 @@ class MADDPG:
                     )
                 self.coma_critic.load_state_dict(state['coma_critic'])
                 self.target_coma_critic.load_state_dict(self.coma_critic.state_dict())
+            self.load_state_normalizer_state(state.get('state_normalizer'))
         else:
             print("No specified loading path, not test dynamic matching")

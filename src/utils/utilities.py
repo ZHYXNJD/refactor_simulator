@@ -665,6 +665,27 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
             final_order_ids = order_data[final_m_indices, 2]
             final_order_weights = order_data[final_m_indices, 3]  # 这是原始 reward
             final_driver_ids = driver_data[final_n_indices, 2]
+            dynamic_methods = None
+            if method == 'dynamic_matching':
+                if 'dynamic_matching_array' not in wait_requests.columns:
+                    raise ValueError(
+                        "dynamic_matching dispatch requires a "
+                        "'dynamic_matching_array' order column."
+                    )
+                dynamic_methods = wait_requests.iloc[final_m_indices][
+                    'dynamic_matching_array'
+                ].to_numpy(dtype=int)
+                invalid_methods = ~np.isin(dynamic_methods, [0, 1, 2])
+                if np.any(invalid_methods):
+                    raise ValueError(
+                        'Dynamic matching actions must be 0, 1, or 2; '
+                        f'got {np.unique(dynamic_methods[invalid_methods]).tolist()}.'
+                    )
+                if np.any(dynamic_methods == 2) and advantage_context is None:
+                    raise ValueError(
+                        'Dynamic matching action 2 requires the same Q-table '
+                        'candidate-scoring context used by direct Q-table dispatch.'
+                    )
 
             if advantage_context is not None:
                 score_agent = advantage_context['score_agent']
@@ -713,7 +734,7 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
                 if score_mode == 'advantage':
                     origin_values = q_table[current_slice, driver_grids]
                     comparison_baseline_values = origin_values
-                    final_order_weights = order_action_values - origin_values
+                    qtable_order_weights = order_action_values - origin_values
                     reject_nonpositive = True
                 elif score_mode == 'idle_relative_advantage':
                     # Rejecting the current order does not commit a driver to
@@ -733,14 +754,30 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
                         comparison_baseline_values = (
                             idle_discount * q_table[idle_next_slice, driver_grids]
                         )
-                    final_order_weights = (
+                    qtable_order_weights = (
                         order_action_values - comparison_baseline_values
                     )
                     reject_nonpositive = True
                 elif score_mode == 'state_value':
-                    final_order_weights = order_action_values
+                    qtable_order_weights = order_action_values
                 else:
                     raise ValueError(f'Unknown score_mode={score_mode!r}')
+
+                if dynamic_methods is None:
+                    # Direct first-stage Q-table matching scores every
+                    # candidate edge with the Q-table.
+                    final_order_weights = qtable_order_weights
+                else:
+                    # Dynamic actions 0 and 1 retain their original semantics.
+                    # Only action 2 uses the exact candidate-level Q-table
+                    # score computed above.
+                    qtable_mask = dynamic_methods == 2
+                    final_order_weights = np.asarray(
+                        final_order_weights, dtype=float
+                    ).copy()
+                    final_order_weights[qtable_mask] = qtable_order_weights[
+                        qtable_mask
+                    ]
 
                 advantage_context['diagnostics'] = {
                     'candidate_weights': np.asarray(final_order_weights, dtype=float),
@@ -758,7 +795,20 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
 
             order_driver_pair_list = []
 
-            if method in ['dynamic_matching','static_multi_choice']:
+            if method == 'dynamic_matching':
+                for i in range(len(final_order_ids)):
+                    if dynamic_methods[i] == 1:
+                        reward_unit = 5000 - final_dis_array[i]
+                    else:
+                        reward_unit = final_order_weights[i]
+                    order_driver_pair_list.append([
+                        final_order_ids[i],
+                        final_driver_ids[i],
+                        reward_unit,
+                        final_dis_array[i]
+                    ])
+
+            elif method == 'static_multi_choice':
                 # reward_unit 是 (max_dist - dist), flag 是 原始 weight
                 # 需要找到权重为1的order 并将权重替换为相应的distance
                 # 按照之前的分析 还需要用一个大数减去distance

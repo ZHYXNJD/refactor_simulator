@@ -18,6 +18,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import multiprocessing as mp
+import os
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -25,6 +27,15 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 import numpy as np
 import pandas as pd
+
+
+for name in (
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(name, "1")
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -47,6 +58,7 @@ DEFAULT_SEEDS = [0, 42, 3407, 1024, 215]
 DEFAULT_ABLATIONS = [
     "state_discounted_reward",
 ]
+_WORKER_CONTEXT: Dict[str, Any] = {}
 
 
 def parse_csv_strings(value: str) -> List[str]:
@@ -136,16 +148,46 @@ def discover_tasks(
     return tasks
 
 
+def validate_task_sample_scope(
+    tasks: Sequence[Dict[str, Any]],
+    scenario_sample_ratio: float | None,
+) -> None:
+    """Fail fast when checkpoint training data and evaluation data differ."""
+    for task in tasks:
+        hyper_parameters = task["hyper_parameters"]
+        training_ratio = hyper_parameters.get("scenario_sample_ratio")
+        sampling_scheme = hyper_parameters.get("sampling_scheme")
+        if scenario_sample_ratio is None:
+            if sampling_scheme != "full_original_orders":
+                raise ValueError(
+                    "Full-data evaluation requires a full-data checkpoint; "
+                    f"got sampling_scheme={sampling_scheme!r} for {task['qtable_path']}."
+                )
+        elif training_ratio is None or not np.isclose(
+            float(training_ratio), scenario_sample_ratio
+        ):
+            raise ValueError(
+                "Evaluation sample ratio does not match checkpoint training ratio: "
+                f"evaluation={scenario_sample_ratio}, training={training_ratio}, "
+                f"checkpoint={task['qtable_path']}."
+            )
+
+
 def load_test_data(
     data_root: Path,
     test_dates: Sequence[str],
     grids: Iterable[int],
     driver_num: int,
-    scenario_sample_ratio: float,
+    scenario_sample_ratio: float | None,
 ):
     request_dict = {}
     for date in test_dates:
-        request_path = sampled_order_path(data_root, date, scenario_sample_ratio)
+        if scenario_sample_ratio is None:
+            request_path = (
+                data_root / "cleaned_orders_pickle" / f"orders_grid35_{date}.pkl"
+            )
+        else:
+            request_path = sampled_order_path(data_root, date, scenario_sample_ratio)
         if not request_path.exists():
             raise FileNotFoundError(f"Missing request data: {request_path}")
         print(f"Loading requests: {request_path}")
@@ -451,6 +493,13 @@ def evaluate_task(
     }
 
 
+def _evaluate_task_worker(task: Dict[str, Any]) -> Dict[str, Any]:
+    """Evaluate one task using read-only data inherited through Linux fork."""
+    if not _WORKER_CONTEXT:
+        raise RuntimeError("Q-table evaluation worker context was not initialized.")
+    return evaluate_task(task=task, **_WORKER_CONTEXT)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Evaluate trained Q-tables without a dynamic matching agent or TD updates."
@@ -499,6 +548,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Ratio of the fixed stratified order files generated before training/testing.",
     )
     parser.add_argument(
+        "--full-sample",
+        action="store_true",
+        help="Use original unsampled orders_grid35_<date>.pkl files.",
+    )
+    parser.add_argument(
         "--order-sample-ratio",
         type=float,
         default=1.0,
@@ -514,6 +568,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Split the discovered tasks into this many independent shards.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel task workers. Values above one require Linux fork.",
     )
     parser.add_argument(
         "--shard-index",
@@ -550,12 +610,15 @@ def main() -> None:
         raise ValueError("At least one seed is required")
     if args.driver_num <= 0:
         raise ValueError("driver-num must be positive")
-    if not 0 < args.scenario_sample_ratio <= 1:
+    scenario_sample_ratio = None if args.full_sample else args.scenario_sample_ratio
+    if scenario_sample_ratio is not None and not 0 < scenario_sample_ratio <= 1:
         raise ValueError("scenario-sample-ratio must satisfy 0 < ratio <= 1")
     if not 0 < args.order_sample_ratio <= 1:
         raise ValueError("order-sample-ratio must satisfy 0 < ratio <= 1")
     if args.num_shards <= 0:
         raise ValueError("num-shards must be positive")
+    if args.workers <= 0:
+        raise ValueError("workers must be positive")
     if not 0 <= args.shard_index < args.num_shards:
         raise ValueError("shard-index must satisfy 0 <= shard-index < num-shards")
     if args.max_steps is not None and args.max_steps <= 0:
@@ -568,6 +631,7 @@ def main() -> None:
             f"Shard {args.shard_index}/{args.num_shards} contains no tasks; "
             "reduce num-shards or change the filters"
         )
+    validate_task_sample_scope(tasks, scenario_sample_ratio)
     print(f"Discovered {len(tasks)} Q-table evaluation tasks")
     for task in tasks:
         print(
@@ -577,28 +641,42 @@ def main() -> None:
         )
 
     request_dict, driver_info_by_grid, mapping_dict, road_network = load_test_data(
-        data_root, test_dates, grids, args.driver_num, args.scenario_sample_ratio
+        data_root, test_dates, grids, args.driver_num, scenario_sample_ratio
     )
     output_root.mkdir(parents=True, exist_ok=True)
 
-    master_rows = []
-    for task in tasks:
-        master_rows.append(
-            evaluate_task(
-                task=task,
-                test_dates=test_dates,
-                seeds=seeds,
-                request_dict=request_dict,
-                driver_info_by_grid=driver_info_by_grid,
-                mapping_dict=mapping_dict,
-                road_network=road_network,
-                output_root=output_root,
-                driver_num=args.driver_num,
-                order_sample_ratio=args.order_sample_ratio,
-                save_orders=args.save_orders,
-                max_steps=args.max_steps,
-            )
-        )
+    worker_kwargs = {
+        "test_dates": test_dates,
+        "seeds": seeds,
+        "request_dict": request_dict,
+        "driver_info_by_grid": driver_info_by_grid,
+        "mapping_dict": mapping_dict,
+        "road_network": road_network,
+        "output_root": output_root,
+        "driver_num": args.driver_num,
+        "order_sample_ratio": args.order_sample_ratio,
+        "save_orders": args.save_orders,
+        "max_steps": args.max_steps,
+    }
+    if args.workers == 1:
+        master_rows = [evaluate_task(task=task, **worker_kwargs) for task in tasks]
+    else:
+        if "fork" not in mp.get_all_start_methods():
+            raise RuntimeError("Parallel Q-table evaluation requires Linux fork.")
+        _WORKER_CONTEXT.clear()
+        _WORKER_CONTEXT.update(worker_kwargs)
+        context = mp.get_context("fork")
+        master_rows = []
+        with context.Pool(processes=min(args.workers, len(tasks))) as pool:
+            for completed, result in enumerate(
+                pool.imap_unordered(_evaluate_task_worker, tasks, chunksize=1),
+                start=1,
+            ):
+                master_rows.append(result)
+                print(
+                    f"[qtable-eval] completed={completed}/{len(tasks)}",
+                    flush=True,
+                )
 
     master_results = pd.DataFrame(master_rows).sort_values(
         ["grid_num", "test_gmv_mean"], ascending=[True, False]
@@ -609,6 +687,31 @@ def main() -> None:
             f"qtable_test_summary_shard_{args.shard_index}_of_{args.num_shards}.csv"
         )
     master_results.to_csv(output_root / summary_filename, index=False)
+    evaluation_manifest = {
+        "experiment": "frozen_best_qtable_evaluation",
+        "qtable_root": str(qtable_root),
+        "data_root": str(data_root),
+        "sample_scope": (
+            "full_original_orders"
+            if scenario_sample_ratio is None
+            else f"fixed_stratified_{int(round(100 * scenario_sample_ratio))}pct"
+        ),
+        "scenario_sample_ratio": scenario_sample_ratio,
+        "test_dates": test_dates,
+        "seeds": [int(seeds[index % len(seeds)]) for index in range(len(test_dates))],
+        "checkpoint_kinds": checkpoints,
+        "grids": grids,
+        "workers": min(args.workers, len(tasks)),
+        "task_count": len(tasks),
+        "complete_day_required": args.max_steps is None,
+    }
+    manifest_filename = "evaluation_manifest.json"
+    if args.num_shards > 1:
+        manifest_filename = (
+            f"evaluation_manifest_shard_{args.shard_index}_of_{args.num_shards}.json"
+        )
+    with (output_root / manifest_filename).open("w", encoding="utf-8") as file:
+        json.dump(evaluation_manifest, file, ensure_ascii=False, indent=2)
     print("\nFrozen Q-table evaluation complete")
     print(master_results.to_string(index=False))
     print(f"Results saved to: {output_root}")

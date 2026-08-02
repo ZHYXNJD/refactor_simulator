@@ -212,9 +212,18 @@ class SimulatorTrainer:
             train_config: 训练配置字典
             logger: MetricsLogger 实例
         """
-        seed_list = [0, 42, 3407, 1024,
-                     215]  # 一切的开始 / 《银河系漫游指南》 / 《Torch.manual_seed(3407) is all you need》 / 程序员的信仰 / 太上老君生日
-        seed = seed_list[epoch % len(seed_list)]
+        seed_list = train_config.get(
+            'environment_seed_sequence',
+            [0, 42, 3407, 1024, 215],
+        )
+        if len(seed_list) < int(train_config['num_epochs']):
+            if 'environment_seed_sequence' in train_config:
+                raise ValueError(
+                    'environment_seed_sequence must cover every training episode.'
+                )
+            seed = seed_list[epoch % len(seed_list)]
+        else:
+            seed = int(seed_list[epoch])
         # Set up simulator for this epoch
         self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
         if not train_config['parallel']:
@@ -243,15 +252,24 @@ class SimulatorTrainer:
         for step in range(self.simulator.finish_run_step + 1):
             self.simulator.rl_step_train_matching_method()
 
+        normalizer_ready = False
+        actor_update_performed = False
         if self.simulator.dynamic_matching_agent.actor_update_mode == 'on_policy':
-            if self.simulator.dynamic_matching_agent.standard_coma:
-                self.simulator.dynamic_matching_agent.update_standard_coma_critic()
-            else:
-                self.simulator.dynamic_matching_agent.update(
-                    update_actor=False,
-                    num_updates=self.simulator.dynamic_matching_agent.critic_updates_per_episode,
+            normalizer_ready = (
+                self.simulator.dynamic_matching_agent
+                .prepare_on_policy_state_normalizer()
+            )
+            if normalizer_ready:
+                if self.simulator.dynamic_matching_agent.standard_coma:
+                    self.simulator.dynamic_matching_agent.update_standard_coma_critic()
+                else:
+                    self.simulator.dynamic_matching_agent.update(
+                        update_actor=False,
+                        num_updates=self.simulator.dynamic_matching_agent.critic_updates_per_episode,
+                    )
+                actor_update_performed = bool(
+                    self.simulator.dynamic_matching_agent.update_on_policy_actor()
                 )
-            self.simulator.dynamic_matching_agent.update_on_policy_actor()
 
         self.simulator.dynamic_matching_agent.current_episode += 1
 
@@ -279,6 +297,21 @@ class SimulatorTrainer:
             logger.log_rl_metrics(epoch, step_actor_losses, step_critic1_loss, step_critic2_loss, step_action_counts,
                                   step_q_pi, step_entropy)
             logger.log_env_metrics(epoch, self.simulator.total_reward)
+            logger.writer.add_scalar(
+                'Training/StateNormalizerReady', int(normalizer_ready), epoch
+            )
+            logger.writer.add_scalar(
+                'Training/ActorUpdatePerformed', int(actor_update_performed), epoch
+            )
+            logger.writer.add_scalar(
+                'Training/ActorWarmupRemainingEpisodes',
+                max(
+                    0,
+                    int(self.simulator.dynamic_matching_agent.actor_warmup_episodes)
+                    - int(self.simulator.dynamic_matching_agent.current_episode),
+                ),
+                epoch,
+            )
         elif isinstance(self.simulator.dynamic_matching_agent, IDQN):
             step_loss = self.simulator.dynamic_matching_agent.loss_history
             step_action_counts = self.simulator.dynamic_matching_agent.actor_counts
@@ -549,10 +582,13 @@ class SimulatorTrainer:
         actor_loss_mode = train_config['hyper_parameters'].get('actor_loss_mode', 'reinforce')
         os.makedirs(write_path, exist_ok=True)
         if train_config['parallel']:
+            model_seed = train_config['hyper_parameters']['model_seed']
             writer_filename = os.path.join(
                 write_path,
                 f'{grid_num}_{decision_freq}_{agent_type}_{actor_loss_mode}_'
-                f'{datetime.now().strftime("%H%M%S")}_{train_config["worker_id"]}',
+                f'seed{model_seed}_'
+                f'{datetime.now().strftime("%Y%m%d_%H%M%S_%f")}_'
+                f'{train_config["worker_id"]}',
             )
         else:
             writer_filename = os.path.join(write_path, datetime.now().strftime('training_%Y%m%d_%H%M%S'))
@@ -568,6 +604,15 @@ class SimulatorTrainer:
             raise ValueError('Dynamic-matching macro epochs must cover every training date.')
         if num_macro_epochs <= 0 or checkpoint_interval <= 0:
             raise ValueError('num_macro_epochs and checkpoint_interval_macro_epochs must be positive.')
+        total_training_episodes = num_macro_epochs * days_per_macro_epoch
+        if total_training_episodes != int(train_config['num_epochs']):
+            raise ValueError(
+                'Dynamic-matching training budget mismatch: '
+                f'num_macro_epochs({num_macro_epochs}) * '
+                f'days_per_macro_epoch({days_per_macro_epoch}) = '
+                f'{total_training_episodes}, but num_epochs='
+                f'{train_config["num_epochs"]}.'
+            )
 
         num_actions = int(self.simulator.dynamic_matching_agent.n_actions[0])
         logger = MetricsLogger(log_dir=writer_filename, num_agents=self.simulator.grid_num, num_actions=num_actions)
@@ -601,6 +646,11 @@ class SimulatorTrainer:
                     'training_episode': (macro_epoch + 1) * days_per_macro_epoch,
                     'train_reward_mean': train_score,
                     'train_reward_by_date': dict(zip(train_dates, daily_rewards)),
+                    'model_seed': train_config['hyper_parameters']['model_seed'],
+                    'pair_id': train_config['hyper_parameters'].get('pair_id'),
+                    'initialization_variant': train_config['hyper_parameters'].get(
+                        'initialization_variant'
+                    ),
                     'path': os.path.basename(model_path),
                 }
                 checkpoint_records.append(record)
@@ -615,6 +665,16 @@ class SimulatorTrainer:
             'checkpoint_interval_macro_epochs': checkpoint_interval,
             'num_macro_epochs': num_macro_epochs,
             'days_per_macro_epoch': days_per_macro_epoch,
+            'total_training_episodes': total_training_episodes,
+            'model_seed': train_config['hyper_parameters']['model_seed'],
+            'replicate_id': train_config['hyper_parameters'].get('replicate_id'),
+            'pair_id': train_config['hyper_parameters'].get('pair_id'),
+            'initialization_variant': train_config['hyper_parameters'].get(
+                'initialization_variant'
+            ),
+            'initial_action2_logit_bias': train_config['hyper_parameters'].get(
+                'initial_action2_logit_bias', 0.0
+            ),
             'best_training_checkpoint': best_checkpoint,
             'checkpoints': checkpoint_records,
         }
@@ -1103,10 +1163,14 @@ class SimulatorTrainer:
 
                 # use RL's decision as the input
                 # 应该在抽取新订单时做修改
-                matched_pair_actual_indexes, matched_itinerary = utilities.order_dispatch(wait_requests, driver_table,
-                                                                                          simulator.maximal_pickup_distance,
-                                                                                          simulator.dispatch_method,
-                                                                                          simulator.method)
+                matched_pair_actual_indexes, matched_itinerary = utilities.order_dispatch(
+                    wait_requests,
+                    driver_table,
+                    simulator.maximal_pickup_distance,
+                    simulator.dispatch_method,
+                    simulator.method,
+                    advantage_context=simulator._matching_value_context(),
+                )
                 # Step 2: driver/passenger reaction after dispatching
                 df_new_matched_requests, df_update_wait_requests = simulator.update_info_after_matching_multi_process(
                     matched_pair_actual_indexes, matched_itinerary)

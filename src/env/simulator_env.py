@@ -1029,32 +1029,13 @@ class Simulator:
                             # 需要在order dynamic dispatch中找到这些order 并将权重替换为相应的distance
                             dynamic_matching_array[i] = 1
                             pass
-                        else:  # RL
-                            current_time_slice = int((self.time - self.t_initial - 1) / (self.decision_freq * 60))
-                            num_slices = int((self.t_end - self.t_initial) / (self.decision_freq * 60))
-                            estimated_elapsed_seconds = (
-                                    0.5 * self.maximal_pickup_distance /
-                                    self.vehicle_speed * 3600 + travel_time)
-                            end_time_slice = int((
-                                                             self.time + estimated_elapsed_seconds - self.t_initial - 1) / (
-                                                             self.decision_freq * 60))
-                            if end_time_slice >= num_slices:
-                                original_trip_score = reward
-                            else:
-                                # 只用一个qtable small size乘以的缩放系数为0.3
-                                # middle size 系数0.5
-                                # original_trip_score = reward + scale_coeff * (
-                                #         qTable_params['discount_rate'] ** (end_time_slice - current_time_slice)) * \
-                                #                       score_agent.strategy.q_value_table[next_state]
-                                # train dynamic matching的时候打开这个
-                                discount = self._score_discount_factor(
-                                    estimated_elapsed_seconds,
-                                    end_time_slice - current_time_slice,
-                                    score_agent,
-                                )
-                                original_trip_score = reward + discount * \
-                                                      score_agent.q_value_table[end_time_slice, int(dest_grid_id)]
-                            weight_array[i] = original_trip_score
+                        else:  # Q-table
+                            # Action 2 is evaluated for every feasible
+                            # order-driver edge inside ``order_dispatch``. The
+                            # actual pickup distance is unavailable while an
+                            # order is entering the queue, so any Q-table score
+                            # computed here would be approximate and stale.
+                            weight_array[i] = reward
                             dynamic_matching_array[i] = 2
 
                 elif self.rl_mode == 'reposition':
@@ -1379,7 +1360,7 @@ class Simulator:
     # =========================================================================
     def rl_step_test_dynamic(self):  # rl for matching
 
-        if self.time % (self.decision_freq * 60) == 0 and self.time > self.t_initial:
+        if self.time % (self.decision_freq * 60) == 0 and self.time >= self.t_initial:
             matching_state_current = self.get_global_state()
             self.state_at_decision_time = matching_state_current
             actions, _ = self.dynamic_matching_agent.select_actions(matching_state_current, deterministic=True)
@@ -1396,7 +1377,8 @@ class Simulator:
         # 应该在抽取新订单时做修改
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
-                                                                        self.dispatch_method, self.method)
+                                                                        self.dispatch_method, self.method,
+                                                                        advantage_context=self._matching_value_context())
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -1470,8 +1452,16 @@ class Simulator:
 
     def _matching_value_context(self):
         """Return edge-level value settings for Q-table matching."""
-        if (self.score_agent is None or self.method not in {'rl', 'sarsa'} or
-                self.rl_mode != 'matching'):
+        if self.score_agent is None:
+            return None
+        direct_qtable = (
+            self.method in {'rl', 'sarsa'} and self.rl_mode == 'matching'
+        )
+        dynamic_qtable = (
+            self.method == 'dynamic_matching'
+            and self.rl_mode in {'dynamic_matching', 'heuristic_matching'}
+        )
+        if not (direct_qtable or dynamic_qtable):
             return None
         return {
             'score_agent': self.score_agent,
@@ -2540,7 +2530,7 @@ class Simulator:
 
         # --- 1. Agent 决策与数据存储 ---
         if (self.time % (self.decision_freq * 60) == 0 and
-                self.time > self.t_initial and
+                self.time >= self.t_initial and
                 not self.external_dynamic_matching_actions):
 
             # --- A. 存储上一个 15 分钟的 (S_k, A_k, R_sum, S_k+1) ---
@@ -2571,7 +2561,8 @@ class Simulator:
                     [1 if self.time == self.t_end else 0] * self.grid_num,
                 )
                 if (self.dynamic_matching_agent.normalize_states and
-                        not self.dynamic_matching_agent.is_scaler_fitted):
+                        not self.dynamic_matching_agent.is_scaler_fitted and
+                        self.dynamic_matching_agent.actor_update_mode != 'on_policy'):
                     self.dynamic_matching_agent.warmup_states.append(s0)
 
                 # 检查agent是否更新
@@ -2605,7 +2596,8 @@ class Simulator:
         # use RL's decision as the input
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
-                                                                        self.dispatch_method, self.method)
+                                                                        self.dispatch_method, self.method,
+                                                                        advantage_context=self._matching_value_context())
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)

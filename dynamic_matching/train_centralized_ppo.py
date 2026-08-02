@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import gymnasium as gym
 import numpy as np
@@ -26,11 +27,14 @@ from dynamic_matching.matching_parallel_env import (
     MatchingParallelEnv,
 )
 from dynamic_matching.marl_stage2_common import (
+    ENVIRONMENT_SEED_BASE,
     PROJECT_ROOT,
     TRAIN_DATES,
+    environment_seed_sequence,
     load_shared_inputs,
     stage2_task,
 )
+from dynamic_matching.test_qtable import DEFAULT_SEEDS
 from src.agents.sarsa import SarsaAgent
 
 
@@ -45,20 +49,28 @@ class CyclingEpisodeDataEnv(gym.Wrapper):
         driver_info,
         dates: tuple[str, ...],
         base_seed: int,
+        episode_offset: int = 0,
+        episode_stride: int = 1,
     ):
         super().__init__(env)
         self.request_dict = request_dict
         self.driver_info = driver_info
         self.dates = dates
         self.base_seed = base_seed
-        self.episode_index = 0
+        self.episode_index = int(episode_offset)
+        self.episode_stride = int(episode_stride)
+        if self.episode_index < 0 or self.episode_stride <= 0:
+            raise ValueError("Invalid episode schedule offset/stride.")
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[dict] = None):
         if options is not None:
             return self.env.reset(seed=seed, options=options)
+        # Training resets use one global, worker-strided episode schedule.  The
+        # Gym seed argument is deliberately not allowed to replace it, because
+        # PPO and COMA must see the same reproducible set of environment seeds.
         date = self.dates[self.episode_index % len(self.dates)]
-        episode_seed = self.base_seed + self.episode_index if seed is None else seed
-        self.episode_index += 1
+        episode_seed = self.base_seed + self.episode_index
+        self.episode_index += self.episode_stride
         return self.env.reset(
             seed=episode_seed,
             options={
@@ -85,13 +97,18 @@ def _require_sb3():
         from stable_baselines3 import PPO
         from stable_baselines3.common.callbacks import BaseCallback
         from stable_baselines3.common.monitor import Monitor
+        from stable_baselines3.common.vec_env import (
+            DummyVecEnv,
+            SubprocVecEnv,
+            VecNormalize,
+        )
     except ModuleNotFoundError as exc:
         raise RuntimeError(
             "Stable-Baselines3 is required for this baseline. Install a "
             "Gymnasium-compatible version, for example: "
             "python -m pip install stable-baselines3==2.7.1"
         ) from exc
-    return PPO, Monitor, BaseCallback
+    return PPO, Monitor, BaseCallback, DummyVecEnv, SubprocVecEnv, VecNormalize
 
 
 def make_centralized_env(
@@ -103,8 +120,10 @@ def make_centralized_env(
     driver_info,
     dates: tuple[str, ...],
     seed: int,
+    episode_offset: int = 0,
+    episode_stride: int = 1,
 ) -> CyclingEpisodeDataEnv:
-    """Construct one non-vectorized SB3 environment with cycling train days."""
+    """Construct one centralized environment with a deterministic schedule."""
     score_agent = SarsaAgent(**config)
     parallel_env = MatchingParallelEnv(
         config,
@@ -119,7 +138,46 @@ def make_centralized_env(
         driver_info=driver_info,
         dates=dates,
         base_seed=seed,
+        episode_offset=episode_offset,
+        episode_stride=episode_stride,
     )
+
+
+def make_training_env_factory(
+    *,
+    grid_num: int,
+    decision_freq: int,
+    dates: tuple[str, ...],
+    request_dict,
+    mapping_dict,
+    road_network,
+    driver_info,
+    environment_seed_base: int,
+    worker_rank: int,
+    num_envs: int,
+    monitor_dir: Path,
+):
+    """Return a subprocess factory backed by parent-loaded shared data."""
+    def factory():
+        _, Monitor, _, _, _, _ = _require_sb3()
+        config = stage2_task(grid_num, decision_freq, "centralized_ppo")
+        env = make_centralized_env(
+            config,
+            request_dict=request_dict,
+            mapping_dict=mapping_dict,
+            road_network=road_network,
+            driver_info=driver_info,
+            dates=dates,
+            seed=environment_seed_base,
+            episode_offset=worker_rank,
+            episode_stride=num_envs,
+        )
+        return Monitor(
+            env,
+            filename=str(monitor_dir / f"worker_{worker_rank}"),
+        )
+
+    return factory
 
 
 def _summarize_evaluation(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -137,13 +195,19 @@ def evaluate_action_policy(
     env: CyclingEpisodeDataEnv,
     *,
     dates: tuple[str, ...],
-    seed: int,
+    seeds: Sequence[int],
 ) -> list[dict[str, Any]]:
     """Evaluate one fixed action rule on the identical scenario for every date."""
+    if len(dates) != len(seeds):
+        raise ValueError("Evaluation dates and seeds must be paired one-to-one.")
     records = []
     grid_num = env.unwrapped.parallel_env.simulator.grid_num
     for date_index, date in enumerate(dates):
-        observation, info = env.reset_for_evaluation(date=date, seed=seed + date_index)
+        evaluation_seed = int(seeds[date_index])
+        observation, info = env.reset_for_evaluation(
+            date=date,
+            seed=evaluation_seed,
+        )
         done = False
         action_counts = np.zeros((grid_num, 3), dtype=np.int64)
         episode_reward = 0.0
@@ -175,18 +239,28 @@ def evaluate_policies(
     env: CyclingEpisodeDataEnv,
     *,
     dates: tuple[str, ...],
-    seed: int,
+    seeds: Sequence[int],
     include_baselines: bool,
+    observation_normalizer=None,
 ) -> dict[str, dict[str, Any]]:
     """Evaluate PPO and, optionally, all frozen matching-rule baselines.
 
     Actions 0/1 are the two non-learning rules and action 2 uses the frozen
     scenario Q-table through the simulator's preloaded score agent.
     """
+    def ppo_action(observation, grid_num):
+        model_observation = np.asarray(observation, dtype=np.float32)
+        if observation_normalizer is not None:
+            model_observation = observation_normalizer.normalize_obs(
+                model_observation.reshape(1, -1)
+            )[0]
+        return np.asarray(
+            model.predict(model_observation, deterministic=True)[0],
+            dtype=np.int64,
+        ).reshape(grid_num)
+
     policies: dict[str, Callable[[np.ndarray, int], np.ndarray]] = {
-        "ppo": lambda observation, grid_num: np.asarray(
-            model.predict(observation, deterministic=True)[0], dtype=np.int64
-        ).reshape(grid_num),
+        "ppo": ppo_action,
     }
     if include_baselines:
         policies.update({
@@ -196,7 +270,7 @@ def evaluate_policies(
         })
     return {
         name: _summarize_evaluation(
-            evaluate_action_policy(selector, env, dates=dates, seed=seed)
+            evaluate_action_policy(selector, env, dates=dates, seeds=seeds)
         )
         for name, selector in policies.items()
     }
@@ -207,7 +281,7 @@ def make_periodic_evaluation_callback(
     *,
     evaluation_env: CyclingEpisodeDataEnv,
     dates: tuple[str, ...],
-    seed: int,
+    seeds: Sequence[int],
     eval_every_timesteps: int,
     output_dir: Path,
     baseline_metrics: dict[str, dict[str, Any]],
@@ -227,16 +301,22 @@ def make_periodic_evaluation_callback(
             step = int(self.num_timesteps)
             checkpoint_path = output_dir / "checkpoints" / f"ppo_step_{step:09d}"
             self.model.save(str(checkpoint_path))
+            normalizer_path = checkpoint_path.with_name(
+                checkpoint_path.name + "_vecnormalize.pkl"
+            )
+            self.training_env.save(str(normalizer_path))
             ppo_metrics = evaluate_policies(
                 self.model,
                 evaluation_env,
                 dates=dates,
-                seed=seed,
+                seeds=seeds,
                 include_baselines=False,
+                observation_normalizer=self.training_env,
             )["ppo"]
             record = {
                 "sampled_timesteps": step,
                 "checkpoint": str(checkpoint_path.with_suffix(".zip")),
+                "vecnormalize": str(normalizer_path),
                 "ppo": ppo_metrics,
                 "baselines": baseline_metrics,
             }
@@ -258,55 +338,123 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--grid-num", type=int, default=8, choices=(8, 35, 63))
     parser.add_argument("--decision-freq", type=int, default=10, choices=(5, 10, 20, 30))
-    parser.add_argument("--total-timesteps", type=int, default=4096)
-    parser.add_argument("--n-steps", type=int, default=64)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--total-timesteps", type=int, default=18000)
+    parser.add_argument("--n-envs", type=int, default=4)
+    parser.add_argument("--n-steps", type=int, default=450)
+    parser.add_argument("--batch-size", type=int, default=300)
     parser.add_argument("--n-epochs", type=int, default=4)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--seed", type=int, default=20260725)
+    parser.add_argument("--seed", type=int, default=20264234)
+    parser.add_argument(
+        "--environment-seed-base",
+        type=int,
+        default=ENVIRONMENT_SEED_BASE,
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--eval-episodes", type=int, default=len(TRAIN_DATES))
     parser.add_argument(
+        "--subproc-start-method",
+        default="forkserver",
+        choices=("fork", "forkserver", "spawn"),
+    )
+    parser.add_argument(
         "--eval-every-timesteps",
         type=int,
-        default=8192,
+        default=9000,
         help="Save a PPO checkpoint and evaluate it every N sampled joint decisions; 0 means final only.",
+    )
+    parser.add_argument(
+        "--evaluate-fixed-baselines",
+        action="store_true",
+        help="Re-evaluate all-0/1/2 on diagnostic dates (normally skipped because baselines already exist).",
     )
     parser.add_argument(
         "--output-dir",
         type=Path,
-        default=PROJECT_ROOT / "dynamic_matching" / "centralized_ppo_results",
+        default=(
+            PROJECT_ROOT
+            / "dynamic_matching"
+            / "step05_grid8_freq10_corrected_ppo_random3"
+        ),
     )
     args = parser.parse_args()
-    if args.total_timesteps <= 0 or args.n_steps <= 1:
-        raise ValueError("total_timesteps must be positive and n_steps must exceed one.")
-    if args.n_steps % args.batch_size != 0:
-        raise ValueError("batch_size must divide n_steps for a reproducible PPO update.")
+    if args.total_timesteps <= 0 or args.n_steps <= 1 or args.n_envs <= 0:
+        raise ValueError("Timesteps/n_steps/n_envs must be positive and n_steps must exceed one.")
+    rollout_size = args.n_steps * args.n_envs
+    if rollout_size % args.batch_size != 0:
+        raise ValueError("batch_size must divide n_steps * n_envs.")
+    if args.total_timesteps % rollout_size != 0:
+        raise ValueError(
+            "total_timesteps must be divisible by n_steps * n_envs so SB3 does not overrun the budget."
+        )
     if args.eval_every_timesteps < 0:
         raise ValueError("eval_every_timesteps must be non-negative.")
     if not 1 <= args.eval_episodes <= len(TRAIN_DATES):
         raise ValueError(f"eval_episodes must be in [1, {len(TRAIN_DATES)}].")
 
-    PPO, Monitor, BaseCallback = _require_sb3()
-    request_dict, mapping_dict, road_network, driver_info_dict = load_shared_inputs()
+    decisions_per_day = int(15 * 60 / args.decision_freq)
+    if args.total_timesteps % decisions_per_day != 0:
+        raise ValueError("total_timesteps must represent an integer number of complete days.")
+    training_episodes = args.total_timesteps // decisions_per_day
+    scheduled_seeds = environment_seed_sequence(
+        training_episodes,
+        base_seed=args.environment_seed_base,
+    )
+
+    PPO, _, BaseCallback, DummyVecEnv, SubprocVecEnv, VecNormalize = _require_sb3()
     config = stage2_task(args.grid_num, args.decision_freq, "centralized_ppo")
     evaluation_dates = tuple(TRAIN_DATES[:args.eval_episodes])
-    env = make_centralized_env(
-        config,
-        request_dict=request_dict,
-        mapping_dict=mapping_dict,
-        road_network=road_network,
-        driver_info=driver_info_dict[args.grid_num],
+    evaluation_seeds = tuple(DEFAULT_SEEDS[:args.eval_episodes])
+    # Match the existing parallel_qtable/multi_region_parallel pattern: load
+    # the large fixed dataset once in the parent. Linux fork workers inherit
+    # these read-only objects copy-on-write instead of reloading them per env.
+    request_dict, mapping_dict, road_network, driver_info_dict = load_shared_inputs(
+        grids=(args.grid_num,),
         dates=tuple(TRAIN_DATES),
-        seed=args.seed,
     )
-    output_dir = args.output_dir / f"grid_{args.grid_num}_freq_{args.decision_freq}"
+    output_dir = (
+        args.output_dir
+        / f"grid_{args.grid_num}_freq_{args.decision_freq}"
+        / f"seed_{args.seed}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "checkpoints").mkdir(exist_ok=True)
-    monitored_env = Monitor(env, filename=str(output_dir / "monitor"))
+    monitor_dir = output_dir / "monitor"
+    monitor_dir.mkdir(exist_ok=True)
+    env_factories = [
+        make_training_env_factory(
+            grid_num=args.grid_num,
+            decision_freq=args.decision_freq,
+            dates=tuple(TRAIN_DATES),
+            request_dict=request_dict,
+            mapping_dict=mapping_dict,
+            road_network=road_network,
+            driver_info=driver_info_dict[args.grid_num],
+            environment_seed_base=args.environment_seed_base,
+            worker_rank=worker_rank,
+            num_envs=args.n_envs,
+            monitor_dir=monitor_dir,
+        )
+        for worker_rank in range(args.n_envs)
+    ]
+    if args.n_envs == 1:
+        vector_env = DummyVecEnv(env_factories)
+    else:
+        vector_env = SubprocVecEnv(
+            env_factories,
+            start_method=args.subproc_start_method,
+        )
+    training_env = VecNormalize(
+        vector_env,
+        training=True,
+        norm_obs=True,
+        norm_reward=False,
+        clip_obs=10.0,
+        gamma=float(config["gamma"]),
+    )
     model = PPO(
         policy="MlpPolicy",
-        env=monitored_env,
+        env=training_env,
         learning_rate=args.learning_rate,
         n_steps=args.n_steps,
         batch_size=args.batch_size,
@@ -331,14 +479,15 @@ def main():
         road_network=road_network,
         driver_info=driver_info_dict[args.grid_num],
         dates=evaluation_dates,
-        seed=args.seed,
+        seed=args.environment_seed_base,
     )
     initial_metrics = evaluate_policies(
         model,
         evaluation_env,
         dates=evaluation_dates,
-        seed=args.seed,
-        include_baselines=True,
+        seeds=evaluation_seeds,
+        include_baselines=args.evaluate_fixed_baselines,
+        observation_normalizer=training_env,
     )
     baseline_metrics = {
         name: metrics for name, metrics in initial_metrics.items() if name != "ppo"
@@ -362,23 +511,27 @@ def main():
             BaseCallback,
             evaluation_env=evaluation_env,
             dates=evaluation_dates,
-            seed=args.seed,
+            seeds=evaluation_seeds,
             eval_every_timesteps=args.eval_every_timesteps,
             output_dir=output_dir,
             baseline_metrics=baseline_metrics,
         )
     model.learn(total_timesteps=args.total_timesteps, callback=callback, progress_bar=False)
     model.save(str(output_dir / "final_model"))
+    final_vecnormalize_path = output_dir / "final_vecnormalize.pkl"
+    training_env.save(str(final_vecnormalize_path))
     final_ppo_metrics = evaluate_policies(
         model,
         evaluation_env,
         dates=evaluation_dates,
-        seed=args.seed,
+        seeds=evaluation_seeds,
         include_baselines=False,
+        observation_normalizer=training_env,
     )["ppo"]
     final_record = {
         "sampled_timesteps": int(model.num_timesteps),
         "checkpoint": str((output_dir / "final_model.zip")),
+        "vecnormalize": str(final_vecnormalize_path),
         "ppo": final_ppo_metrics,
         "baselines": baseline_metrics,
     }
@@ -390,9 +543,18 @@ def main():
         "grid_num": args.grid_num,
         "decision_freq": args.decision_freq,
         "total_timesteps": args.total_timesteps,
+        "training_episodes": training_episodes,
+        "n_envs": args.n_envs,
         "n_steps": args.n_steps,
         "batch_size": args.batch_size,
         "seed": args.seed,
+        "environment_seed_base": args.environment_seed_base,
+        "environment_seed_first": int(scheduled_seeds[0]),
+        "environment_seed_last": int(scheduled_seeds[-1]),
+        "evaluation_dates": list(evaluation_dates),
+        "evaluation_seeds": list(evaluation_seeds),
+        "observation_normalization": True,
+        "reward_normalization": False,
         "eval_every_timesteps": args.eval_every_timesteps,
         "initial_ppo": initial_metrics["ppo"],
         "baselines": baseline_metrics,
@@ -405,7 +567,7 @@ def main():
     with (output_dir / "summary.json").open("w", encoding="utf-8") as file:
         json.dump(summary, file, ensure_ascii=False, indent=2)
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    env.close()
+    training_env.close()
     evaluation_env.close()
 
 
