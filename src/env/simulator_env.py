@@ -18,6 +18,13 @@ import os
 from dynamic_matching.dynamic_matching_agent.maddpd_discreate import *
 from src.repos.repo_util import get_centroid_coordinates, get_three_hop_neighbors
 from src.env.simulator_pattern import SimulatorPattern
+from src.env.price_response import (
+    DriverOffer,
+    PassengerMatch,
+    PassengerOffer,
+    PriceResponseModel,
+    create_price_response_model,
+)
 from src.agents.value_estimator import ValueNetwork
 from src.utils.utilities import *
 import warnings
@@ -66,10 +73,50 @@ class Simulator:
                 - driver_num: 司机数量 (默认 1000)
                 - order_sample_ratio: 订单采样比例
                 - driver_sample_ratio: 司机采样比例
+                - price_response_model: 统一的司乘价格响应模型名称或模型实例
+                - passenger_response_model: 仅乘客侧使用的模型名称或实例
+                - driver_response_model: 仅司机侧使用的模型名称或实例
+                - passenger_response_config: 乘客模型对应的类型化配置
+                - driver_response_config: 司机模型对应的类型化配置
+                - price_multiplier: 外部给定的价格倍数（标量、区域映射、数组或函数）
+                - demand_input_mode: 'observed_requests'（默认）或 'potential'
         """
 
         # basic parameters: time & sample
-        self.price_per_km = 5
+        # Pricing is exogenous in the simulator.  Response models consume these
+        # values but never optimize or change them.
+        self.price_per_km = kwargs.get('price_per_km', 5.0)
+        self.price_multiplier = kwargs.get('price_multiplier', 1.0)
+        self.commission_rate = kwargs.get('commission_rate', 0.25)
+        if self.price_per_km < 0:
+            raise ValueError("price_per_km must be non-negative")
+        if not 0 <= self.commission_rate <= 1:
+            raise ValueError("commission_rate must be between 0 and 1")
+
+        response_parameters = kwargs.get('price_response_parameters', {})
+        response_config = kwargs.get('price_response_config', None)
+        configured_response_model = kwargs.get('price_response_model', None)
+        self.passenger_response_model = self._build_response_model(
+            kwargs.get('passenger_response_model', configured_response_model),
+            kwargs.get('passenger_response_parameters', response_parameters),
+            kwargs.get('passenger_response_config', response_config),
+        )
+        self.driver_response_model = self._build_response_model(
+            kwargs.get('driver_response_model', configured_response_model),
+            kwargs.get('driver_response_parameters', response_parameters),
+            kwargs.get('driver_response_config', response_config),
+        )
+        self.demand_input_mode = kwargs.get('demand_input_mode', 'observed_requests')
+        if self.demand_input_mode not in {'observed_requests', 'potential'}:
+            raise ValueError("demand_input_mode must be 'observed_requests' or 'potential'")
+        self.demand_reference_price_multiplier = float(
+            kwargs.get('demand_reference_price_multiplier', 1.0)
+        )
+        self.maximum_demand_multiplier = float(kwargs.get('maximum_demand_multiplier', 10.0))
+        if self.demand_reference_price_multiplier < 0:
+            raise ValueError("demand_reference_price_multiplier must be non-negative")
+        if self.maximum_demand_multiplier <= 0:
+            raise ValueError("maximum_demand_multiplier must be positive")
         self.seed = None
         self.seed_list = [0, 42, 3407, 1024, 215]
         self.t_initial = 18000
@@ -326,7 +373,11 @@ class Simulator:
                                 'itinerary_segment_dis_list', 'trip_time', 'cancel_prob', 't_matched',
                                 'pickup_time', 'wait_time', 't_end', 'status', 'driver_id', 'maximum_wait_time',
                                 'designed_reward',
-                                'pickup_distance']
+                                'pickup_distance', 'base_fare', 'price_multiplier', 'quoted_fare',
+                                'commission_rate', 'driver_payment', 'platform_revenue',
+                                'passenger_request_probability', 'passenger_cancel_probability',
+                                'baseline_passenger_request_probability', 'demand_adjustment_factor',
+                                'driver_accept_probability']
 
         self.wait_requests = None
         self.matched_requests = None
@@ -351,6 +402,107 @@ class Simulator:
         # pattern = SimulatorPattern(self.experiment_date)
         # self.request_databases = pattern.request_all  # a dictionary with 0 to 86400
         # self.driver_info = pattern.driver_info.sample(n=1000, replace=False, random_state=42)
+
+    @staticmethod
+    def _build_response_model(model, parameters=None, config=None):
+        """Resolve a response-model name or accept a ready-to-use instance."""
+        if parameters and config is not None:
+            raise TypeError("Use either response parameters or a typed response config, not both")
+        if model is None or model == 'legacy':
+            return None
+        if isinstance(model, PriceResponseModel):
+            if parameters or config is not None:
+                raise TypeError("Do not pass response parameters/config with a model instance")
+            return model
+        if not isinstance(model, str):
+            raise TypeError("price response model must be a model name or PriceResponseModel instance")
+        if config is not None:
+            return create_price_response_model(model, config=config)
+        return create_price_response_model(model, parameters=dict(parameters or {}))
+
+    def set_price_multiplier(self, price_multiplier):
+        """Set an external scalar, grid mapping, array, or callable price scenario."""
+        self.price_multiplier = price_multiplier
+
+    def _resolve_price_multiplier(self, orders):
+        """Resolve exogenous price multipliers for an order DataFrame."""
+        source = self.price_multiplier
+        if callable(source):
+            values = source(self.time, orders.copy())
+        elif isinstance(source, dict):
+            values = orders['origin_grid_id'].map(source).fillna(1.0).values
+        else:
+            values = source
+
+        values = np.asarray(values, dtype=float)
+        if values.ndim == 0:
+            values = np.full(len(orders), float(values))
+        if len(values) != len(orders):
+            raise ValueError("price_multiplier must resolve to one value per order")
+        if not np.all(np.isfinite(values)) or np.any(values < 0):
+            raise ValueError("price multipliers must be finite and non-negative")
+        return values
+
+    def _ensure_rng(self):
+        if self.rng is None:
+            self.rng = np.random.RandomState(self.seed)
+        return self.rng
+
+    @staticmethod
+    def _attach_profiles(table, profiles):
+        """Attach model-owned profile arrays to a DataFrame."""
+        for field_name, values in profiles.items():
+            values = np.asarray(values)
+            if values.ndim == 0:
+                values = np.full(len(table), values.item())
+            if len(values) != len(table):
+                raise ValueError(
+                    f"Profile field '{field_name}' has {len(values)} values for {len(table)} records"
+                )
+            table[field_name] = values
+        return table
+
+    @staticmethod
+    def _profiles_from_table(table, field_names):
+        return {
+            field_name: table[field_name].astype(float).values
+            for field_name in field_names
+            if field_name in table.columns
+        }
+
+    def _resample_orders_by_demand_factor(self, orders, demand_factor):
+        """Thin or replicate baseline orders according to a relative demand factor."""
+        if len(orders) == 0:
+            return orders.copy()
+        factor = np.asarray(demand_factor, dtype=float)
+        if factor.ndim == 0:
+            factor = np.full(len(orders), float(factor))
+        if len(factor) != len(orders):
+            raise ValueError("demand_factor must contain one value per order")
+        if not np.all(np.isfinite(factor)):
+            raise ValueError("demand_factor values must be finite")
+        factor = np.clip(factor, 0.0, self.maximum_demand_multiplier)
+        if np.all(factor == 1.0):
+            return orders.copy().reset_index(drop=True)
+        integer_count = np.floor(factor).astype(int)
+        fractional_count = self._ensure_rng().random(len(factor)) < (factor - integer_count)
+        repeat_count = integer_count + fractional_count.astype(int)
+        positions = np.repeat(np.arange(len(orders)), repeat_count)
+        adjusted = orders.iloc[positions].copy().reset_index(drop=True)
+
+        if len(adjusted) > 0:
+            duplicate_mask = adjusted.duplicated('order_id', keep='first')
+            duplicate_count = int(duplicate_mask.sum())
+            if duplicate_count:
+                new_ids = np.arange(
+                    self.synthetic_order_id_counter,
+                    self.synthetic_order_id_counter - duplicate_count,
+                    -1,
+                    dtype=int,
+                )
+                adjusted.loc[duplicate_mask, 'order_id'] = new_ids
+                self.synthetic_order_id_counter -= duplicate_count
+        return adjusted
 
     # =========================================================================
     # 基础表初始化 (Base Table Initialization) - [共用]
@@ -389,6 +541,13 @@ class Simulator:
         # construct driver table
         self.driver_table = sample_all_drivers(self.driver_info, self.t_initial, self.t_end, self.driver_sample_ratio)
         self.driver_table['target_grid_id'] = self.driver_table['target_grid_id'].values.astype(int)
+        if self.driver_response_model is not None:
+            self._attach_profiles(
+                self.driver_table,
+                self.driver_response_model.create_driver_profiles(
+                    len(self.driver_table), self._ensure_rng()
+                ),
+            )
 
         if self.rl_mode == 'matching':
             self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]),
@@ -420,6 +579,11 @@ class Simulator:
         self.matched_medium_requests_num = 0
         self.matched_short_requests_num = 0
         self.matched_requests_num = 0.0000001
+        self.potential_request_num = 0
+        self.baseline_request_num = 0
+        self.accepted_quote_num = 0
+        self.passenger_cancelled_requests_num = 0
+        self.driver_rejected_requests_num = 0
 
         self.transfer_request_num = 0
         self.long_requests_num = 0.0000001
@@ -462,6 +626,7 @@ class Simulator:
         self.cross_grid_count = 0
 
         self.temp_total_request_record = pd.DataFrame(columns=self.request_columns)
+        self.synthetic_order_id_counter = -1
 
     # =========================================================================
     # 环境重置 (Environment Reset) - [共用]
@@ -531,28 +696,75 @@ class Simulator:
                     idle_driver_table[idle_driver_table['driver_id'] == matched_pair_index_df['driver_id'][i]].index[0])
             cor_driver = np.array(cor_driver)
             df_matched = df_matched.iloc[cor_order, :]
-            # driver decide whether cancelled（司机匹配后取消逻辑）
-            # 现在暂时不让其取消。需考虑时可用self.driver_cancel_prob_array来计算
-            driver_cancel_prob = np.zeros(len(matched_pair_index_df))
-            # np.random.seed(42)
-            prob_array = np.random.rand(len(driver_cancel_prob))
-            con_driver_remain = prob_array >= driver_cancel_prob
+            pickup_dis_array = np.asarray(matched_itinerary_df['pickup_distance'].values, dtype=float)
+            pickup_time_array = np.asarray(matched_itinerary_df['pickup_time'].values, dtype=float)
 
+            if self.driver_response_model is not None:
+                driver_table = self.driver_table.loc[cor_driver]
+                driver_profile = self._profiles_from_table(
+                    driver_table,
+                    self.driver_response_model.driver_profile_fields,
+                )
+                reference_payment = (
+                    df_matched['base_fare'].astype(float).values
+                    * (1.0 - df_matched['commission_rate'].astype(float).values)
+                )
+                driver_accept_probability = self.driver_response_model.driver_accept_probability(
+                    offer=DriverOffer(
+                        driver_payment=df_matched['driver_payment'].astype(float).values,
+                        reference_payment=reference_payment,
+                        pickup_distance=pickup_dis_array,
+                        trip_distance=df_matched['trip_distance'].astype(float).values,
+                    ),
+                    profile=driver_profile,
+                )
+                df_matched['driver_accept_probability'] = driver_accept_probability
+                con_driver_remain = self.driver_response_model.sample(
+                    driver_accept_probability, self._ensure_rng()
+                )
+            else:
+                # Legacy behavior: drivers never reject a matched request.
+                df_matched['driver_accept_probability'] = 1.0
+                con_driver_remain = np.ones(len(df_matched), dtype=bool)
 
-            # ✅ 模拟乘客取消（基于定价和接驾距离）
-            designed_price_array = df_matched['designed_reward'].values
-            pickup_dis_array = matched_itinerary_df['pickup_distance'].values
-            designed_price_array = np.array(designed_price_array, dtype=float)
-            pickup_dis_array = np.array(pickup_dis_array, dtype=float)
-
-            cancel_prob_array = 0.05 + 0.005 * (designed_price_array - 2.5) + 0.05 * pickup_dis_array
-            cancel_prob_array = np.clip(cancel_prob_array, 0, 0.9)
-            threshold = 0.9  # ✅ 越高，保留的订单越多
-            con_passenger_remain = cancel_prob_array < threshold
+            if self.passenger_response_model is not None:
+                passenger_profile = self._profiles_from_table(
+                    df_matched,
+                    self.passenger_response_model.passenger_profile_fields,
+                )
+                passenger_cancel_probability = self.passenger_response_model.passenger_cancel_probability(
+                    match=PassengerMatch(
+                        quoted_fare=df_matched['quoted_fare'].astype(float).values,
+                        base_fare=df_matched['base_fare'].astype(float).values,
+                        wait_time=df_matched['wait_time'].astype(float).values,
+                        pickup_time=pickup_time_array,
+                        maximum_wait_time=df_matched['maximum_wait_time'].astype(float).values,
+                    ),
+                    profile=passenger_profile,
+                )
+                df_matched['passenger_cancel_probability'] = passenger_cancel_probability
+                passenger_cancelled = self.passenger_response_model.sample(
+                    passenger_cancel_probability, self._ensure_rng()
+                )
+                con_passenger_remain = ~passenger_cancelled
+            else:
+                # Preserve the pre-existing deterministic legacy rule.
+                designed_price_array = np.asarray(df_matched['designed_reward'].values, dtype=float)
+                cancel_prob_array = 0.05 + 0.005 * (designed_price_array - 2.5) + 0.05 * pickup_dis_array
+                cancel_prob_array = np.clip(cancel_prob_array, 0, 0.9)
+                df_matched['passenger_cancel_probability'] = cancel_prob_array
+                con_passenger_remain = cancel_prob_array < 0.9
 
             con_remain = con_driver_remain & con_passenger_remain
-            # order after cancelled
-            update_wait_requests = df_matched[~con_remain]
+            if self.passenger_response_model is None:
+                # Preserve the original queue behavior in legacy mode.
+                update_wait_requests = df_matched[~con_remain]
+            else:
+                # A driver rejection returns the request to the queue.  A passenger
+                # cancellation exits the market and must not be re-queued.
+                update_wait_requests = df_matched[(~con_driver_remain) & con_passenger_remain]
+            self.driver_rejected_requests_num += int(np.sum((~con_driver_remain) & con_passenger_remain))
+            self.passenger_cancelled_requests_num += int(np.sum(~con_passenger_remain))
 
             # driver after cancelled
             # 若匹配上后又被取消，目前假定司机按原计划继续cruising or repositioning
@@ -729,7 +941,79 @@ class Simulator:
                     wait_info['order_id'] = wait_info['order_id'].astype(float)
                     wait_info = pd.merge(wait_info, self.mapping_dict[self.experiment_date], how='left', on='order_id')
 
-                dynamic_matching_array = np.zeros(len(sampled_requests)) + 0.01
+                # Exogenous quote and accounting fields.  These are deliberately
+                # separate from designed_reward, which remains the matching/RL score.
+                wait_info['base_fare'] = wait_info['trip_distance'].astype(float) * self.price_per_km
+                wait_info['price_multiplier'] = self._resolve_price_multiplier(wait_info)
+                wait_info['quoted_fare'] = wait_info['base_fare'] * wait_info['price_multiplier']
+                wait_info['commission_rate'] = self.commission_rate
+                wait_info['driver_payment'] = wait_info['quoted_fare'] * (1.0 - self.commission_rate)
+                wait_info['platform_revenue'] = wait_info['quoted_fare'] * self.commission_rate
+                self.baseline_request_num += len(wait_info)
+                self.potential_request_num += len(wait_info)
+
+                if self.passenger_response_model is not None:
+                    rng = self._ensure_rng()
+                    self._attach_profiles(
+                        wait_info,
+                        self.passenger_response_model.create_passenger_profiles(
+                            len(wait_info),
+                            wait_info['base_fare'].astype(float).values,
+                            rng,
+                        ),
+                    )
+                    passenger_profile = self._profiles_from_table(
+                        wait_info,
+                        self.passenger_response_model.passenger_profile_fields,
+                    )
+                    current_offer = PassengerOffer(
+                        quoted_fare=wait_info['quoted_fare'].astype(float).values,
+                        base_fare=wait_info['base_fare'].astype(float).values,
+                        expected_wait_time=np.zeros(len(wait_info)),
+                        trip_time=wait_info['trip_time'].astype(float).values,
+                        maximum_wait_time=self.maximum_wait_time_mean,
+                    )
+                    request_probability = self.passenger_response_model.passenger_accept_probability(
+                        offer=current_offer,
+                        profile=passenger_profile,
+                    )
+                    wait_info['passenger_request_probability'] = request_probability
+
+                    if self.demand_input_mode == 'observed_requests':
+                        reference_offer = PassengerOffer(
+                            quoted_fare=(
+                                wait_info['base_fare'].astype(float).values
+                                * self.demand_reference_price_multiplier
+                            ),
+                            base_fare=wait_info['base_fare'].astype(float).values,
+                            expected_wait_time=np.zeros(len(wait_info)),
+                            trip_time=wait_info['trip_time'].astype(float).values,
+                            maximum_wait_time=self.maximum_wait_time_mean,
+                        )
+                        baseline_probability = self.passenger_response_model.passenger_accept_probability(
+                            offer=reference_offer,
+                            profile=passenger_profile,
+                        )
+                        demand_factor = np.asarray(request_probability, dtype=float) / np.maximum(
+                            np.asarray(baseline_probability, dtype=float),
+                            1e-9,
+                        )
+                    else:
+                        baseline_probability = np.ones(len(wait_info), dtype=float)
+                        demand_factor = np.asarray(request_probability, dtype=float)
+
+                    wait_info['baseline_passenger_request_probability'] = baseline_probability
+                    wait_info['demand_adjustment_factor'] = demand_factor
+                    wait_info = self._resample_orders_by_demand_factor(wait_info, demand_factor)
+                    self.accepted_quote_num += len(wait_info)
+                else:
+                    self.accepted_quote_num += len(wait_info)
+                    wait_info['passenger_request_probability'] = 1.0
+                    wait_info['baseline_passenger_request_probability'] = 1.0
+                    wait_info['demand_adjustment_factor'] = 1.0
+
+                weight_array = np.ones(len(wait_info))
+                dynamic_matching_array = np.zeros(len(wait_info)) + 0.01
 
                 self.temp_total_request_record = pd.concat([self.temp_total_request_record, wait_info], axis=0,
                                                            ignore_index=True)
@@ -846,8 +1130,9 @@ class Simulator:
                     self.maximum_price_passenger_can_tolerate_mean,
                     self.maximum_price_passenger_can_tolerate_std,
                     len(wait_info))
-                wait_info = wait_info[
-                    wait_info['maximum_price_passenger_can_tolerate'] >= wait_info['trip_distance'] * self.price_per_km]
+                if self.passenger_response_model is None:
+                    wait_info = wait_info[
+                        wait_info['maximum_price_passenger_can_tolerate'] >= wait_info['quoted_fare']]
                 wait_info['maximum_pickup_time_passenger_can_tolerate'] = np.random.normal(
                     self.maximum_pickup_time_passenger_can_tolerate_mean,
                     self.maximum_pickup_time_passenger_can_tolerate_std, len(wait_info))

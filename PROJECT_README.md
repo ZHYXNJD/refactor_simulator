@@ -52,6 +52,13 @@ python train_v1d3.py --epochs 50 --test
 
 ## 核心模块
 
+### 价格响应模型
+
+仿真器支持三种可独立调用的司乘价格响应模型：`aggregate_elasticity`、
+`utility_choice` 和 `bounded_rational_agent`。价格由外部实验场景提供，模型本身不执行
+动态定价。独立调用、参数配置和仿真器接入方式见
+[PRICE_RESPONSE_MODELS.md](./PRICE_RESPONSE_MODELS.md)。
+
 ### Simulator (src/env/simulator_env.py)
 
 仿真环境核心类，提供三种训练模式：
