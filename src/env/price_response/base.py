@@ -211,7 +211,19 @@ class PriceResponseModel(ABC):
         *,
         options: Optional[RepositionOptions] = None,
         temperature: float = 1.0,
+        profile: Optional[Profile] = None,
+        **legacy_profile: ArrayLike,
     ) -> np.ndarray:
+        # Generic models do not use individual profile fields in repositioning,
+        # but accepting their own driver profile keeps the public interface
+        # uniform across standalone model implementations.
+        combine_profile(
+            profile,
+            legacy_profile,
+            self.driver_profile_fields,
+            self.name,
+            "driver_reposition_probabilities",
+        )
         if options is not None:
             if expected_payments is not None:
                 raise TypeError("Use either options=RepositionOptions(...) or legacy payment arguments")

@@ -29,25 +29,29 @@ from .base import (
 
 @dataclass(frozen=True)
 class BoundedRationalConfig:
-    passenger_temperature: float = 0.2
-    reservation_multiplier_mean: float = 1.25
+    # Theory-constrained defaults.  These simulator-owned parameters are
+    # calibrated to produce smooth satisficing curves; paper-fixed functional
+    # forms and coefficients are not changed.
+    passenger_temperature: float = 0.25
+    reservation_multiplier_mean: float = 1.275
     reservation_multiplier_std: float = 0.15
     passenger_price_sensitivity_mean: float = 1.0
     passenger_price_sensitivity_std: float = 0.15
-    passenger_wait_sensitivity_mean: float = 1.0
+    passenger_wait_sensitivity_mean: float = 0.45
     passenger_wait_sensitivity_std: float = 0.15
     driver_temperature: float = 0.2
-    driver_target_payment_multiplier_mean: float = 0.9
+    driver_target_payment_multiplier_mean: float = 0.8
     driver_target_payment_multiplier_std: float = 0.15
     driver_price_sensitivity_mean: float = 1.0
     driver_price_sensitivity_std: float = 0.15
-    driver_pickup_sensitivity_mean: float = 0.6
+    driver_pickup_sensitivity_mean: float = 0.1
     driver_pickup_sensitivity_std: float = 0.15
     driver_order_opportunity_cost_mean: float = 0.0
     driver_order_opportunity_cost_std: float = 0.15
     driver_target_hourly_income_mean: float = 30.0
     driver_target_hourly_income_std: float = 5.0
     operating_cost_per_km: float = 0.5
+    reposition_income_scale: float = 30.0
     base_cancel_probability: float = 0.01
 
     def __post_init__(self) -> None:
@@ -63,9 +67,12 @@ class BoundedRationalConfig:
             "driver_order_opportunity_cost_std",
             "driver_target_hourly_income_std",
             "operating_cost_per_km",
+            "reposition_income_scale",
         ):
             if getattr(self, field_name) < 0:
                 raise ValueError(f"{field_name} must be non-negative")
+        if self.reposition_income_scale == 0:
+            raise ValueError("reposition_income_scale must be positive")
         if not 0 <= self.base_cancel_probability <= 1:
             raise ValueError("base_cancel_probability must be between 0 and 1")
 
@@ -312,17 +319,19 @@ class BoundedRationalAgentModel(PriceResponseModel):
             driver_payment, reference_payment, pickup_distance, trip_distance, offer
         )
         reference_payment = safe_positive(offer.reference_payment)
-        target_payment = as_float_array(
+        target_multiplier = as_float_array(
             profile.get(
-                "target_payment",
-                reference_payment
-                * as_float_array(
-                    profile.get(
-                        "driver_target_payment_multiplier",
-                        self.config.driver_target_payment_multiplier_mean,
-                    )
-                ),
+                "driver_target_payment_multiplier",
+                self.config.driver_target_payment_multiplier_mean,
             )
+        )
+        reference_net_payment = np.maximum(
+            reference_payment
+            - self.config.operating_cost_per_km * as_float_array(offer.trip_distance),
+            0.0,
+        )
+        target_payment = as_float_array(
+            profile.get("target_payment", reference_net_payment * target_multiplier)
         )
         price_sensitivity = as_float_array(
             profile.get(
@@ -407,7 +416,7 @@ class BoundedRationalAgentModel(PriceResponseModel):
         profile = combine_profile(
             profile,
             legacy_profile,
-            frozenset({"driver_price_sensitivity"}),
+            self.driver_profile_fields,
             self.name,
             "driver_reposition_probabilities",
         )
@@ -425,9 +434,15 @@ class BoundedRationalAgentModel(PriceResponseModel):
             )
         )
         temperature = self.config.driver_temperature if temperature is None else temperature
+        # Expected hourly earnings and empty-travel costs are absolute monetary
+        # values.  Normalize them before applying the dimensionless behavioral
+        # temperature; otherwise ordinary inter-zone income gaps make the
+        # softmax collapse to a deterministic choice.
         utility = price_sensitivity * (
             as_float_array(expected_payments) - as_float_array(reposition_costs)
-        ) / max(float(temperature), 1e-9)
+        ) / (
+            self.config.reposition_income_scale * max(float(temperature), 1e-9)
+        )
         if utility.ndim == 0:
             return np.array([1.0])
         utility = utility - np.max(utility, axis=-1, keepdims=True)

@@ -35,6 +35,17 @@ class AggregateElasticityModelTest(unittest.TestCase):
         )
         self.assertTrue(np.all(np.diff(probabilities) > 0))
 
+    def test_huang_power_cdf_equations(self):
+        model = AggregateElasticityModel(
+            maximum_price_multiplier=4.0,
+            maximum_payment_multiplier=2.0,
+            passenger_shape=2.0,
+            driver_shape=2.0,
+        )
+        self.assertAlmostEqual(model.passenger_accept_probability(20.0, 10.0), 0.75)
+        self.assertAlmostEqual(model.driver_accept_probability(10.0, 10.0), 0.25)
+        self.assertEqual(model.passenger_accept_probability(40.0, 10.0), 0.0)
+
 
 class UtilityChoiceModelTest(unittest.TestCase):
     def test_waiting_reduces_passenger_acceptance(self):
@@ -85,6 +96,43 @@ class BoundedRationalAgentModelTest(unittest.TestCase):
             reference_hourly_income=30.0,
         )
         self.assertLess(probabilities[0], probabilities[1])
+
+    def test_calibrated_passenger_curve_has_theory_constrained_landmarks(self):
+        model = BoundedRationalAgentModel()
+        reference = model.passenger_accept_probability(
+            10.0, 10.0, expected_wait_time=0.0, maximum_wait_time=300.0
+        )
+        maximum_wait = model.passenger_accept_probability(
+            10.0, 10.0, expected_wait_time=300.0, maximum_wait_time=300.0
+        )
+        higher_price = model.passenger_accept_probability(
+            12.0, 10.0, expected_wait_time=0.0, maximum_wait_time=300.0
+        )
+        self.assertTrue(0.70 <= reference <= 0.80)
+        self.assertTrue(0.25 <= maximum_wait <= 0.40)
+        self.assertTrue(0.50 <= higher_price <= 0.65)
+
+    def test_calibrated_driver_curve_uses_net_reference_target(self):
+        model = BoundedRationalAgentModel()
+        reference = model.driver_accept_probability(
+            7.5, 7.5, pickup_distance=0.5, trip_distance=3.0
+        )
+        far_pickup = model.driver_accept_probability(
+            7.5, 7.5, pickup_distance=1.5, trip_distance=3.0
+        )
+        self.assertTrue(0.55 <= reference <= 0.70)
+        self.assertTrue(0.35 <= far_pickup <= 0.50)
+        self.assertGreater(reference, far_pickup)
+
+    def test_reposition_calibration_avoids_deterministic_collapse(self):
+        model = BoundedRationalAgentModel()
+        probabilities = model.driver_reposition_probabilities(
+            expected_payments=np.array([20.0, 30.0, 25.0]),
+            reposition_costs=np.array([0.0, 2.0, 1.0]),
+        )
+        self.assertEqual(int(np.argmax(probabilities)), 1)
+        self.assertLess(float(probabilities.max()), 0.8)
+        self.assertGreater(float(probabilities.min()), 0.05)
 
 
 class CommonInterfaceTest(unittest.TestCase):
@@ -161,6 +209,21 @@ class CommonInterfaceTest(unittest.TestCase):
             bounded.passenger_profile_fields,
         )
 
+    def test_reposition_interface_accepts_each_models_own_profile(self):
+        rng = np.random.RandomState(7)
+        for model in (
+            AggregateElasticityModel(),
+            UtilityChoiceModel(),
+            BoundedRationalAgentModel(),
+        ):
+            profile = model.create_driver_profiles(1, rng)
+            probabilities = model.driver_reposition_probabilities(
+                expected_payments=np.array([20.0, 30.0]),
+                reposition_costs=np.array([0.0, 1.0]),
+                profile=profile,
+            )
+            self.assertAlmostEqual(float(probabilities.sum()), 1.0)
+
 
 class SimulatorPriceScenarioTest(unittest.TestCase):
     def setUp(self):
@@ -202,6 +265,35 @@ class SimulatorPriceScenarioTest(unittest.TestCase):
         config = UtilityChoiceConfig(passenger_intercept=0.5)
         model = Simulator._build_response_model('utility_choice', config=config)
         self.assertIs(model.config, config)
+
+    def test_driver_supply_response_preserves_baseline_and_reduces_low_price_supply(self):
+        simulator = Simulator.__new__(Simulator)
+        simulator.time = 0
+        simulator.delta_t = 60
+        simulator.driver_supply_response = True
+        simulator.driver_reference_hourly_income = 30.0
+        simulator.driver_response_model = UtilityChoiceModel(
+            driver_hourly_opportunity_cost_std=0.0
+        )
+        simulator.rng = np.random.RandomState(42)
+        simulator.driver_table = pd.DataFrame({
+            'driver_id': [1],
+            'start_time': [0],
+            'end_time': [3600],
+            'grid_id': [0],
+            'status': [0],
+            'driver_order_opportunity_cost': [0.0],
+            'driver_hourly_opportunity_cost': [30.0],
+            '_price_response_online_draw': [0.8],
+        })
+
+        simulator.price_multiplier = 1.0
+        simulator._apply_driver_supply_response(60)
+        self.assertEqual(simulator.driver_table.loc[0, 'status'], 0)
+
+        simulator.price_multiplier = 0.5
+        simulator._apply_driver_supply_response(60)
+        self.assertEqual(simulator.driver_table.loc[0, 'status'], 3)
 
     def test_observed_request_mode_keeps_reference_price_orders(self):
         simulator = Simulator.__new__(Simulator)

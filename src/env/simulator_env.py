@@ -69,7 +69,8 @@ class Simulator:
                 - decision_freq: 决策频率，单位分钟 (默认 10)
                 - rl_mode: RL 模式，可选 'reposition', 'matching', 'dynamic_matching'
                 - experiment_mode: 实验模式
-                - repo_mode: 重定位策略，可选 'random_repo', 'demand_greedy', 'rl_value'
+                - repo_mode: 重定位策略，包括 'random_repo'、'demand_greedy'、
+                  'price_response' 及已有价值函数策略
                 - driver_num: 司机数量 (默认 1000)
                 - order_sample_ratio: 订单采样比例
                 - driver_sample_ratio: 司机采样比例
@@ -80,6 +81,10 @@ class Simulator:
                 - driver_response_config: 司机模型对应的类型化配置
                 - price_multiplier: 外部给定的价格倍数（标量、区域映射、数组或函数）
                 - demand_input_mode: 'observed_requests'（默认）或 'potential'
+                - post_match_cancellation: 是否在正式匹配后再次模拟乘客取消（默认 False）
+                - driver_supply_response: 是否让历史班次内的空闲司机响应预期收入（默认 False）
+                - driver_reference_hourly_income: 参考价格下的司机小时收入（默认 30）
+                - reposition_cost_per_km: 价格响应重定位中的空驶成本（默认 0.5）
         """
 
         # basic parameters: time & sample
@@ -113,10 +118,24 @@ class Simulator:
             kwargs.get('demand_reference_price_multiplier', 1.0)
         )
         self.maximum_demand_multiplier = float(kwargs.get('maximum_demand_multiplier', 10.0))
+        # Quote acceptance, queue abandonment, driver acceptance and post-match
+        # cancellation are distinct behavioral stages.  The paper-faithful
+        # default keeps an accepted match, while allowing empirical studies to
+        # opt in to post-match cancellation explicitly.
+        self.post_match_cancellation = bool(kwargs.get('post_match_cancellation', False))
+        self.driver_supply_response = bool(kwargs.get('driver_supply_response', False))
+        self.driver_reference_hourly_income = float(
+            kwargs.get('driver_reference_hourly_income', 30.0)
+        )
+        self.reposition_cost_per_km = float(kwargs.get('reposition_cost_per_km', 0.5))
         if self.demand_reference_price_multiplier < 0:
             raise ValueError("demand_reference_price_multiplier must be non-negative")
         if self.maximum_demand_multiplier <= 0:
             raise ValueError("maximum_demand_multiplier must be positive")
+        if self.driver_reference_hourly_income <= 0:
+            raise ValueError("driver_reference_hourly_income must be positive")
+        if self.reposition_cost_per_km < 0:
+            raise ValueError("reposition_cost_per_km must be non-negative")
         self.seed = None
         self.seed_list = [0, 42, 3407, 1024, 215]
         self.t_initial = 18000
@@ -548,6 +567,12 @@ class Simulator:
                     len(self.driver_table), self._ensure_rng()
                 ),
             )
+            # A stable latent draw avoids artificial minute-to-minute churning:
+            # the same driver makes the same participation decision for a given
+            # income scenario throughout one simulation run.
+            self.driver_table['_price_response_online_draw'] = self._ensure_rng().random_sample(
+                len(self.driver_table)
+            )
 
         if self.rl_mode == 'matching':
             self.dispatch_transitions_buffer = [np.array([]).reshape([0, 2]), np.array([]),
@@ -671,9 +696,18 @@ class Simulator:
             matched_itinerary_df['itinerary_segment_dis_list'] = matched_itinerary[1]
             matched_itinerary_df['pickup_distance'] = matched_itinerary[2]
 
+        con_keep_wait = self.wait_requests['wait_time'] <= self.wait_requests['maximum_wait_time']
+        # Dispatch may have been computed immediately before a request crossed
+        # its patience limit.  Remove such pairs before correlating itinerary
+        # rows, otherwise an expired passenger can still be served (or make the
+        # pair/order indexing inconsistent when valid and expired pairs mix).
+        valid_order_ids = set(self.wait_requests.loc[con_keep_wait, 'order_id'])
+        valid_pair_mask = matched_pair_index_df['order_id'].isin(valid_order_ids).values
+        matched_pair_index_df = matched_pair_index_df.loc[valid_pair_mask].reset_index(drop=True)
+        if len(matched_itinerary_df) == len(valid_pair_mask):
+            matched_itinerary_df = matched_itinerary_df.loc[valid_pair_mask].reset_index(drop=True)
         matched_order_id_list = matched_pair_index_df['order_id'].values.tolist()
         con_matched = self.wait_requests['order_id'].isin(matched_order_id_list)
-        con_keep_wait = self.wait_requests['wait_time'] <= self.wait_requests['maximum_wait_time']
 
         # price and pickup time info which used to judge whether cancel the order-driver pair
         matched_itinerary_df['pickup_time'] = matched_itinerary_df['pickup_distance'].values / self.vehicle_speed * 3600
@@ -727,7 +761,7 @@ class Simulator:
                 df_matched['driver_accept_probability'] = 1.0
                 con_driver_remain = np.ones(len(df_matched), dtype=bool)
 
-            if self.passenger_response_model is not None:
+            if self.passenger_response_model is not None and self.post_match_cancellation:
                 passenger_profile = self._profiles_from_table(
                     df_matched,
                     self.passenger_response_model.passenger_profile_fields,
@@ -747,13 +781,19 @@ class Simulator:
                     passenger_cancel_probability, self._ensure_rng()
                 )
                 con_passenger_remain = ~passenger_cancelled
-            else:
+            elif self.passenger_response_model is None:
                 # Preserve the pre-existing deterministic legacy rule.
                 designed_price_array = np.asarray(df_matched['designed_reward'].values, dtype=float)
                 cancel_prob_array = 0.05 + 0.005 * (designed_price_array - 2.5) + 0.05 * pickup_dis_array
                 cancel_prob_array = np.clip(cancel_prob_array, 0, 0.9)
                 df_matched['passenger_cancel_probability'] = cancel_prob_array
                 con_passenger_remain = cancel_prob_array < 0.9
+            else:
+                # Huang (2022) and Xie (2023, 2025) retain an order after a
+                # successful match.  Waiting abandonment is handled by the
+                # maximum-wait-time queue rule, not by a second price decision.
+                df_matched['passenger_cancel_probability'] = 0.0
+                con_passenger_remain = np.ones(len(df_matched), dtype=bool)
 
             con_remain = con_driver_remain & con_passenger_remain
             if self.passenger_response_model is None:
@@ -1325,7 +1365,71 @@ class Simulator:
         """
         next_time = self.time + self.delta_t
         self.driver_table = driver_online_offline_decision(self.driver_table, next_time)
+        self._apply_driver_supply_response(next_time)
         return
+
+    def _driver_price_multipliers(self, driver_table):
+        """Resolve the exogenous price scenario at each driver's current grid."""
+        if len(driver_table) == 0:
+            return np.array([], dtype=float)
+        probe = pd.DataFrame({'origin_grid_id': driver_table['grid_id'].astype(int).values})
+        return self._resolve_price_multiplier(probe)
+
+    def _apply_driver_supply_response(self, next_time):
+        """Thin the historical active pool when net hourly income falls.
+
+        Historical shifts remain the reference supply.  Probabilities are
+        normalized at the reference price, so enabling the feature does not
+        alter the baseline run and never invents drivers outside the observed
+        shift pool.
+        """
+        if not self.driver_supply_response or self.driver_response_model is None:
+            return
+
+        eligible = (
+            (self.driver_table['start_time'] <= next_time)
+            & (self.driver_table['end_time'] > next_time)
+            & self.driver_table['status'].isin([0, 3])
+        )
+        if not eligible.any():
+            return
+
+        drivers = self.driver_table.loc[eligible]
+        multipliers = self._driver_price_multipliers(drivers)
+        reference_income = np.full(len(drivers), self.driver_reference_hourly_income)
+        expected_income = reference_income * multipliers
+        profile = self._profiles_from_table(
+            drivers, self.driver_response_model.driver_profile_fields
+        )
+        current_probability = np.asarray(
+            self.driver_response_model.driver_online_probability(
+                expected_hourly_income=expected_income,
+                reference_hourly_income=reference_income,
+                profile=profile,
+            ),
+            dtype=float,
+        )
+        reference_probability = np.asarray(
+            self.driver_response_model.driver_online_probability(
+                expected_hourly_income=reference_income,
+                reference_hourly_income=reference_income,
+                profile=profile,
+            ),
+            dtype=float,
+        )
+        participation = np.clip(
+            current_probability / np.maximum(reference_probability, 1e-9), 0.0, 1.0
+        )
+        if '_price_response_online_draw' not in self.driver_table.columns:
+            self.driver_table['_price_response_online_draw'] = self._ensure_rng().random_sample(
+                len(self.driver_table)
+            )
+        active = (
+            self.driver_table.loc[eligible, '_price_response_online_draw'].astype(float).values
+            < participation
+        )
+        eligible_index = self.driver_table.index[eligible]
+        self.driver_table.loc[eligible_index, 'status'] = np.where(active, 0, 3)
 
     # =========================================================================
     # 时间更新 (Time Update) - [共用]
@@ -1576,7 +1680,41 @@ class Simulator:
         # === 5. 时间计算 ===
         repo_time = dist_matrix / self.vehicle_speed * 3600
 
-        if self.repo_mode == 'random_repo':
+        if self.repo_mode == 'price_response':
+            if self.driver_response_model is None:
+                raise ValueError("repo_mode='price_response' requires driver_response_model")
+
+            # Xie-style relocation: compare destination earnings after platform
+            # commission with the cost of empty travel.  The exogenous price
+            # scenario is evaluated at every candidate destination grid.
+            grid_probe = pd.DataFrame({'origin_grid_id': self.zone_id_array})
+            income_by_grid = (
+                self.driver_reference_hourly_income
+                * self._resolve_price_multiplier(grid_probe)
+            )
+            best_grid = np.empty(N, dtype=int)
+            rng = self._ensure_rng()
+            for row, (driver_index, origin_grid) in enumerate(zip(repo_idx, grid_id_array)):
+                candidates = np.asarray(
+                    list(repo_candidate_by_grid.get(origin_grid, [origin_grid])), dtype=int
+                )
+                if len(candidates) == 0:
+                    candidates = np.asarray([origin_grid], dtype=int)
+                costs = dist_matrix[row, candidates] * self.reposition_cost_per_km
+                driver_row = self.driver_table.loc[[driver_index]]
+                profile = self._profiles_from_table(
+                    driver_row, self.driver_response_model.driver_profile_fields
+                )
+                probabilities = self.driver_response_model.driver_reposition_probabilities(
+                    expected_payments=income_by_grid[candidates],
+                    reposition_costs=costs,
+                    profile=profile,
+                )
+                best_grid[row] = rng.choice(candidates, p=np.asarray(probabilities, dtype=float))
+            best_dist = dist_matrix[np.arange(N), best_grid]
+            remaining_time = best_dist / self.vehicle_speed * 3600
+
+        elif self.repo_mode == 'random_repo':
             # 从距离最近的5个中随机选一个
             # K = 5
             # topk_idx = np.argpartition(dist_matrix, K, axis=1)[:, :K]  # (N,K)
