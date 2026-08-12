@@ -306,65 +306,89 @@ dynamic_matching/test_standard_coma_state_normalization.py
 
 服务器必须保留六个对应 best Q-table 及其同目录的 `hyper_parameters.json`、`checkpoint_summary.json`：30%／50%／全量各自的8-grid 10-min和30-min。启动器会读取checkpoint summary、验证 `scenario_sample_ratio`，并把实际路径和SHA256写入实验manifest；口径不一致会在加载订单和启动worker前失败。
 
-### 9.2 六个terminal同时启动
+### 9.2 六个nohup任务同时启动
 
-以下均为前台 `python -u file.py`，不使用 `.sh`、tmux或隐式nohup。服务器为两张用于本实验的A6000：GPU0运行全部10-min实验，GPU1运行全部30-min实验。每个scope/frequency启动3个workers，对应三个model seeds各自一个独立worker；因此每张卡同时运行9个模型，18个模型均有专属worker。
+以下全部使用 `nohup python -u file.py`，不使用 `.sh` 或tmux。每个任务写入独立log和PID文件，启动完成后可以关闭terminal或断开SSH。服务器为两张用于本实验的A6000：GPU0运行全部10-min实验，GPU1运行全部30-min实验。每个scope/frequency启动3个workers，对应三个model seeds各自一个独立worker；因此每张卡同时运行9个模型，18个模型均有专属worker。
 
 Terminal 1——30%、10-min、GPU0：
 
 ```bash
 cd /path/to/Transportation_Simulator
-python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+mkdir -p dynamic_matching/coma_warmup/logs
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
   --sample-scope sample030 --decision-freq 10 \
-  --gpu-id 0 --num-workers 3
+  --gpu-id 0 --num-workers 3 \
+  > dynamic_matching/coma_warmup/logs/sample030_freq10.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/coma_warmup/logs/sample030_freq10.pid
 ```
 
 Terminal 2——30%、30-min、GPU1：
 
 ```bash
 cd /path/to/Transportation_Simulator
-python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+mkdir -p dynamic_matching/coma_warmup/logs
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
   --sample-scope sample030 --decision-freq 30 \
-  --gpu-id 1 --num-workers 3
+  --gpu-id 1 --num-workers 3 \
+  > dynamic_matching/coma_warmup/logs/sample030_freq30.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/coma_warmup/logs/sample030_freq30.pid
 ```
 
 Terminal 3——50%、10-min、GPU0：
 
 ```bash
 cd /path/to/Transportation_Simulator
-python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+mkdir -p dynamic_matching/coma_warmup/logs
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
   --sample-scope sample050 --decision-freq 10 \
-  --gpu-id 0 --num-workers 3
+  --gpu-id 0 --num-workers 3 \
+  > dynamic_matching/coma_warmup/logs/sample050_freq10.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/coma_warmup/logs/sample050_freq10.pid
 ```
 
 Terminal 4——50%、30-min、GPU1：
 
 ```bash
 cd /path/to/Transportation_Simulator
-python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+mkdir -p dynamic_matching/coma_warmup/logs
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
   --sample-scope sample050 --decision-freq 30 \
-  --gpu-id 1 --num-workers 3
+  --gpu-id 1 --num-workers 3 \
+  > dynamic_matching/coma_warmup/logs/sample050_freq30.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/coma_warmup/logs/sample050_freq30.pid
 ```
 
 Terminal 5——全量、10-min、GPU0：
 
 ```bash
 cd /path/to/Transportation_Simulator
-python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+mkdir -p dynamic_matching/coma_warmup/logs
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
   --sample-scope full --decision-freq 10 \
-  --gpu-id 0 --num-workers 3
+  --gpu-id 0 --num-workers 3 \
+  > dynamic_matching/coma_warmup/logs/full_freq10.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/coma_warmup/logs/full_freq10.pid
 ```
 
 Terminal 6——全量、30-min、GPU1：
 
 ```bash
 cd /path/to/Transportation_Simulator
-python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+mkdir -p dynamic_matching/coma_warmup/logs
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
   --sample-scope full --decision-freq 30 \
-  --gpu-id 1 --num-workers 3
+  --gpu-id 1 --num-workers 3 \
+  > dynamic_matching/coma_warmup/logs/full_freq30.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/coma_warmup/logs/full_freq30.pid
 ```
 
-六个terminal合计18个模型、18个独立worker；同一scope/frequency的三个seed共享相同environment-seed序列。默认输出到 `dynamic_matching/coma_warmup/stage06_grid8_<scope>_freq<freq>_400ep_random_coma_epsanneal200_actorwarm50_seed3/`。每个seed含400个完整日；10/30-min分别为36,000/12,000 joint decisions，actor从episode50开始，理论上最多350次actor updates。
+六个nohup launcher合计18个模型、18个独立worker；同一scope/frequency的三个seed共享相同environment-seed序列。默认输出到 `dynamic_matching/coma_warmup/stage06_grid8_<scope>_freq<freq>_400ep_random_coma_epsanneal200_actorwarm50_seed3/`。每个seed含400个完整日；10/30-min分别为36,000/12,000 joint decisions，actor从episode50开始，理论上最多350次actor updates。
 
 ### 9.3 启动前dry-run和监控
 
@@ -380,4 +404,120 @@ Training/ActorWarmupRemainingEpisodes
 
 ```bash
 tensorboard --logdir dynamic_matching/coma_warmup --port 6006
+```
+
+检查六个launcher PID和日志：
+
+```bash
+cat dynamic_matching/coma_warmup/logs/*.pid
+tail -f dynamic_matching/coma_warmup/logs/sample030_freq10.log
+```
+
+PID文件记录的是每组的Python launcher；launcher会等待其三个worker全部结束，任一worker非零退出时launcher也会以失败状态退出。
+
+## 10. Stage-07：8-grid/10-min COMA 延长线与advantage尺度修正
+
+本轮只使用8-grid/10-min。8-grid已证明存在可学轨迹；10-min每个完整日有90个决策点，比30-min的30个决策点更适合首次判定尺度修正。暂不加30-min或35-grid，避免同时改变轨迹长度和联合动作空间。
+
+四组对照：
+
+1. sample030、raw advantage、800 episodes：只回答延长预算是否继续改善。
+2. sample030/sample050/full、per-agent on-policy rollout advantage standardization、各400 episodes：回答尺度修正能否跨数据口径传递。
+
+现有Stage-06 checkpoint没有保存optimizer state和可恢复的训练episode状态，因此800-episode延长线必须从相同model/environment seeds从头跑；前400 episodes与旧实验保持环境seed序列一致。不应只加载final权重并重置optimizer后声称是严格续训。
+
+### 10.1 需要上传的修改文件
+
+```text
+dynamic_matching/train_stage06_grid8_coma_warmup.py
+dynamic_matching/dynamic_matching_agent/maddpd_discreate.py
+src/env/simulator_trainer.py
+```
+
+### 10.2 四个nohup任务
+
+先执行一次：
+
+```bash
+cd /path/to/Transportation_Simulator
+mkdir -p dynamic_matching/all_output/coma_stage07/logs
+```
+
+Terminal 1——30%原算法延长到800，GPU0：
+
+```bash
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+  --sample-scope sample030 --decision-freq 10 \
+  --training-episodes 800 --actor-warmup-episodes 50 \
+  --epsilon-anneal-episodes 200 --gpu-id 0 --num-workers 3 \
+  --output-root dynamic_matching/all_output/coma_stage07/raw_800 \
+  > dynamic_matching/all_output/coma_stage07/logs/raw_sample030_freq10_800.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/all_output/coma_stage07/logs/raw_sample030_freq10_800.pid
+```
+
+Terminal 2——30%修改版400，GPU0：
+
+```bash
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+  --sample-scope sample030 --decision-freq 10 \
+  --training-episodes 400 --normalize-coma-advantages \
+  --actor-warmup-episodes 50 --epsilon-anneal-episodes 200 \
+  --gpu-id 0 --num-workers 3 \
+  --output-root dynamic_matching/all_output/coma_stage07/advnorm \
+  > dynamic_matching/all_output/coma_stage07/logs/advnorm_sample030_freq10.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/all_output/coma_stage07/logs/advnorm_sample030_freq10.pid
+```
+
+Terminal 3——50%修改版400，GPU1：
+
+```bash
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+  --sample-scope sample050 --decision-freq 10 \
+  --training-episodes 400 --normalize-coma-advantages \
+  --actor-warmup-episodes 50 --epsilon-anneal-episodes 200 \
+  --gpu-id 1 --num-workers 3 \
+  --output-root dynamic_matching/all_output/coma_stage07/advnorm \
+  > dynamic_matching/all_output/coma_stage07/logs/advnorm_sample050_freq10.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/all_output/coma_stage07/logs/advnorm_sample050_freq10.pid
+```
+
+Terminal 4——full修改版400，GPU1：
+
+```bash
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py \
+  --sample-scope full --decision-freq 10 \
+  --training-episodes 400 --normalize-coma-advantages \
+  --actor-warmup-episodes 50 --epsilon-anneal-episodes 200 \
+  --gpu-id 1 --num-workers 3 \
+  --output-root dynamic_matching/all_output/coma_stage07/advnorm \
+  > dynamic_matching/all_output/coma_stage07/logs/advnorm_full_freq10.log 2>&1 \
+  < /dev/null &
+echo $! > dynamic_matching/all_output/coma_stage07/logs/advnorm_full_freq10.pid
+```
+
+GPU0/GPU1各同时训练6个小网络模型，共12个独立simulator workers。计算量对A6000充足，但full数据的父进程和workers会增加RAM压力，启动后先检查RAM和两张GPU利用率。
+
+### 10.3 TensorBoard诊断
+
+新日志对raw延长线和advnorm修改版都启用：
+
+```text
+COMA/BehaviourEpsilon
+COMA/AdvantageNormalizationEnabled
+COMA/Critic/TargetMean|TargetStd|TargetMin|TargetMax
+COMA/Critic/QTakenMean|QTakenStd
+COMA/Critic/NormalizedMSE
+COMA/Critic/ExplainedVariance
+COMA/Critic/GradNormBeforeClip
+COMA/Critic/GradClippedFraction
+COMA/Actor_<grid>/AdvantageMean|AdvantageStd|AdvantageAbsMean|AdvantageMin|AdvantageMax
+COMA/Actor_<grid>/GradNormBeforeClip|GradClippedFraction
+COMA/ActorAggregate/<same metrics>
+```
+
+```bash
+tensorboard --logdir dynamic_matching/all_output/coma_stage07 --port 6006
 ```

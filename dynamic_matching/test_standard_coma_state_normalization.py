@@ -14,9 +14,13 @@ torch.set_num_threads(1)
 
 
 def _agent(
-    *, normalize_states: bool = True, actor_warmup_episodes: int = 0
+    *,
+    normalize_states: bool = True,
+    actor_warmup_episodes: int = 0,
+    normalize_coma_advantages: bool = False,
+    **overrides,
 ) -> MADDPG:
-    return MADDPG(
+    config = dict(
         obs_dims=[5, 5],
         n_actions=[3, 3],
         transitions=None,
@@ -34,9 +38,12 @@ def _agent(
         critic_updates_per_episode=1,
         actor_updates_per_episode=1,
         actor_warmup_episodes=actor_warmup_episodes,
+        normalize_coma_advantages=normalize_coma_advantages,
         target_critic_update_interval=1,
         device="cpu",
     )
+    config.update(overrides)
+    return MADDPG(**config)
 
 
 def _record_episode(agent: MADDPG, offset: float) -> list[np.ndarray]:
@@ -82,7 +89,14 @@ def test_on_policy_scaler_calibration_discards_raw_rollouts():
     assert agent.prepare_on_policy_state_normalizer()
     assert len(agent.on_policy_rollout) == 3
     agent.update_standard_coma_critic()
+    assert agent.critic_target_std_history
+    assert agent.critic_normalized_mse_history
+    assert agent.critic_explained_variance_history
+    assert agent.critic_grad_norm_history
+    assert np.isfinite(agent.critic_normalized_mse_history).all()
     agent.update_on_policy_actor()
+    assert all(agent.advantage_std_history)
+    assert all(agent.actor_grad_norm_history)
     assert agent.critic1_losses_history
     assert not agent.on_policy_rollout
 
@@ -134,12 +148,205 @@ def test_actor_warmup_discards_rollout_without_changing_actor():
         assert torch.equal(before, after)
 
 
+def test_structured_warmup_is_seed_independent_and_contains_time_switches():
+    common = dict(
+        normalize_states=False,
+        actor_warmup_episodes=2,
+        adaptive_actor_warmup=True,
+        actor_warmup_max_episodes=8,
+        structured_coma_warmup=True,
+        structured_warmup_decisions_per_episode=6,
+        epsilon_anneal_after_actor_start=True,
+    )
+    torch.manual_seed(1)
+    first = _agent(**common)
+    torch.manual_seed(999)
+    second = _agent(**common)
+    state = np.zeros(8, dtype=np.float32)
+
+    for episode in range(4):
+        first.current_episode = episode
+        second.current_episode = episode
+        first.begin_training_episode()
+        second.begin_training_episode()
+        first_actions = [first.select_actions(state)[0] for _ in range(6)]
+        second_actions = [second.select_actions(state)[0] for _ in range(6)]
+        assert first_actions == second_actions
+        if episode == 0:  # global all-0 constant template
+            assert first_actions == [[0, 0]] * 6
+        if episode == 1:  # three equal time blocks: all-0 -> all-1 -> all-2
+            assert first_actions[:2] == [[0, 0]] * 2
+            assert first_actions[2:4] == [[1, 1]] * 2
+            assert first_actions[4:] == [[2, 2]] * 2
+            assert first.structured_warmup_temporal_switches == 2
+        if episode == 2:  # one spatial counterfactual, constant through time
+            assert all(actions == first_actions[0] for actions in first_actions)
+            assert len(set(first_actions[0])) == 2
+        if episode == 3:  # spatial pattern rotates through all three actions
+            assert first_actions[0] != first_actions[2]
+            assert first_actions[2] != first_actions[4]
+            assert first.structured_warmup_temporal_switches == 2
+
+
+def test_adaptive_readiness_starts_next_episode_and_epsilon_counts_actor_updates():
+    agent = _agent(
+        normalize_states=False,
+        actor_warmup_episodes=2,
+        adaptive_actor_warmup=True,
+        actor_warmup_max_episodes=6,
+        critic_readiness_window=2,
+        critic_readiness_max_normalized_mse=0.2,
+        critic_readiness_min_explained_variance=0.8,
+        epsilon_anneal_after_actor_start=True,
+        coma_epsilon_start=0.5,
+        coma_epsilon_end=0.02,
+        coma_epsilon_anneal_episodes=4,
+    )
+    assert agent._coma_epsilon() == pytest.approx(0.5)
+    for episode in range(2):
+        agent.current_episode = episode
+        agent.critic_normalized_mse_history = [0.1]
+        agent.critic_explained_variance_history = [0.9]
+        assert agent._update_adaptive_actor_readiness() is (episode == 1)
+    assert agent.actor_start_episode == 2
+    assert agent.actor_readiness_reason == "critic_thresholds"
+
+    agent.current_episode = 2
+    agent.begin_training_episode()
+    assert agent._episode_is_actor_warmup is False
+    assert agent.last_behaviour_epsilon == pytest.approx(0.5)
+    _record_episode(agent, 0.0)
+    assert agent.update_on_policy_actor() is True
+    assert agent.actor_update_count == 1
+    assert agent._coma_epsilon() == pytest.approx(0.38)
+
+
+def test_8grid_structured_warmup_is_exactly_action_symmetric_at_safety_cap():
+    agent = MADDPG(
+        obs_dims=[5] * 8,
+        n_actions=[3] * 8,
+        grid_num=8,
+        global_state_dim=26,
+        decentralized_actor=True,
+        actor_loss_mode="coma",
+        actor_update_mode="on_policy",
+        standard_coma=True,
+        use_replay_buffer=False,
+        normalize_states=False,
+        load_offline_warmup=False,
+        critic_updates_per_episode=1,
+        actor_updates_per_episode=1,
+        actor_warmup_episodes=50,
+        adaptive_actor_warmup=True,
+        actor_warmup_max_episodes=120,
+        structured_coma_warmup=True,
+        structured_warmup_decisions_per_episode=30,
+        device="cpu",
+    )
+    state = np.zeros(26, dtype=np.float32)
+    action_totals = np.zeros(3, dtype=np.int64)
+    family_counts = np.zeros(5, dtype=np.int64)
+    for episode in range(120):
+        agent.current_episode = episode
+        agent.actor_training_started = False
+        agent.begin_training_episode()
+        family_counts[agent.structured_warmup_family] += 1
+        for _ in range(30):
+            actions, _ = agent.select_actions(state)
+            action_totals += np.bincount(actions, minlength=3)
+
+    assert family_counts[1:].tolist() == [30, 30, 30, 30]
+    assert action_totals.tolist() == [9600, 9600, 9600]
+    assert len({
+        tuple(agent._structured_spatial_pattern(index))
+        for index in range(48)
+    }) == 48
+
+
+def test_35grid_critic_visible_warmup_visits_every_agent_before_gate_can_open():
+    agent = MADDPG(
+        obs_dims=[5] * 35,
+        n_actions=[3] * 35,
+        grid_num=35,
+        global_state_dim=107,
+        decentralized_actor=True,
+        actor_loss_mode="coma",
+        actor_update_mode="on_policy",
+        standard_coma=True,
+        use_replay_buffer=False,
+        normalize_states=False,
+        load_offline_warmup=False,
+        critic_updates_per_episode=1,
+        actor_updates_per_episode=1,
+        actor_warmup_episodes=75,
+        adaptive_actor_warmup=True,
+        actor_warmup_max_episodes=120,
+        structured_coma_warmup=True,
+        structured_warmup_decisions_per_episode=30,
+        device="cpu",
+    )
+    state = np.zeros(107, dtype=np.float32)
+    deviating_agents = set()
+    # Episodes 0--4 calibrate the state scaler and their rollouts are discarded.
+    # Only interventions from episode 5 onward are visible to the critic.
+    for episode in range(5, 75):
+        agent.current_episode = episode
+        agent.actor_training_started = False
+        agent.begin_training_episode()
+        if agent.structured_warmup_family not in (3, 4):
+            continue
+        actions, _ = agent.select_actions(state)
+        counts = np.bincount(actions, minlength=3)
+        base_action = int(np.argmax(counts))
+        deviation = [
+            index for index, action in enumerate(actions)
+            if action != base_action
+        ]
+        assert len(deviation) == 1
+        deviating_agents.add(deviation[0])
+
+    assert deviating_agents == set(range(35))
+
+
 def test_normalized_policy_rejects_checkpoint_without_scaler():
     with pytest.raises(ValueError, match="missing state_normalizer"):
         _agent().load_state_normalizer_state(None)
 
     unnormalized = _agent(normalize_states=False)
     unnormalized.load_state_normalizer_state(None)
+
+
+def test_standard_coma_advantage_normalization_is_opt_in():
+    logp = torch.tensor([-0.2, -0.5, -0.9])
+    entropy = torch.zeros(3)
+    advantage = torch.tensor([10.0, 20.0, 40.0])
+
+    raw_agent = _agent(normalize_states=False)
+    raw_loss = raw_agent.compute_refined_actor_loss(
+        0, logp, entropy, advantage, mode="coma", episode=0
+    )
+    assert raw_loss.item() == pytest.approx(
+        float(-(logp * advantage).mean())
+    )
+
+    normalized_agent = _agent(
+        normalize_states=False, normalize_coma_advantages=True
+    )
+    normalized_loss = normalized_agent.compute_refined_actor_loss(
+        0, logp, entropy, advantage, mode="coma", episode=0
+    )
+    expected_advantage = (advantage - advantage.mean()) / (
+        advantage.std(unbiased=False) + 1e-6
+    )
+    assert normalized_loss.item() == pytest.approx(
+        float(-(logp * expected_advantage).mean())
+    )
+    assert normalized_agent.advantage_mean_history[0] == pytest.approx(
+        [float(advantage.mean())]
+    )
+    assert normalized_agent.advantage_std_history[0] == pytest.approx(
+        [float(advantage.std(unbiased=False))]
+    )
 
 
 def test_standard_coma_learns_known_additive_cooperative_game():

@@ -111,6 +111,108 @@ class MetricsLogger:
         # self.writer.add_scalar('Env/Avg_Wait_Time', avg_wait_time, episode)
         # self.writer.add_scalar('Env/Occupancy_Rate', occupancy_rate, episode)
 
+    def log_coma_diagnostics(self, episode, agent):
+        """Write scale/readiness diagnostics without changing training."""
+        if not getattr(agent, 'standard_coma', False):
+            return
+
+        def log_mean(tag, values):
+            if values:
+                self.writer.add_scalar(tag, float(np.mean(values)), episode)
+
+        epsilon = agent.last_behaviour_epsilon
+        self.writer.add_scalar('COMA/BehaviourEpsilon', epsilon, episode)
+        self.writer.add_scalar(
+            'COMA/ActorUpdateCount', agent.actor_update_count, episode
+        )
+        self.writer.add_scalar(
+            'COMA/AdvantageNormalizationEnabled',
+            int(agent.normalize_coma_advantages),
+            episode,
+        )
+
+        critic_metrics = {
+            'COMA/Critic/TargetMean': agent.critic_target_mean_history,
+            'COMA/Critic/TargetStd': agent.critic_target_std_history,
+            'COMA/Critic/TargetMin': agent.critic_target_min_history,
+            'COMA/Critic/TargetMax': agent.critic_target_max_history,
+            'COMA/Critic/QTakenMean': agent.critic_q_taken_mean_history,
+            'COMA/Critic/QTakenStd': agent.critic_q_taken_std_history,
+            'COMA/Critic/NormalizedMSE': agent.critic_normalized_mse_history,
+            'COMA/Critic/ExplainedVariance': (
+                agent.critic_explained_variance_history
+            ),
+            'COMA/Critic/GradNormBeforeClip': agent.critic_grad_norm_history,
+            'COMA/Critic/GradClippedFraction': (
+                agent.critic_grad_clipped_history
+            ),
+        }
+        for tag, values in critic_metrics.items():
+            log_mean(tag, values)
+
+        readiness_nmse, readiness_ev = agent.critic_readiness_window_metrics()
+        if np.isfinite(readiness_nmse):
+            self.writer.add_scalar(
+                'COMA/Readiness/WindowNormalizedMSE', readiness_nmse, episode
+            )
+        if np.isfinite(readiness_ev):
+            self.writer.add_scalar(
+                'COMA/Readiness/WindowExplainedVariance', readiness_ev, episode
+            )
+        self.writer.add_scalar(
+            'COMA/Readiness/ActorTrainingStarted',
+            int(agent.actor_update_ready()),
+            episode,
+        )
+        self.writer.add_scalar(
+            'COMA/Readiness/ActorStartEpisode',
+            -1 if agent.actor_start_episode is None else agent.actor_start_episode,
+            episode,
+        )
+        readiness_reason_codes = {
+            'warming_up': 0,
+            'critic_thresholds': 1,
+            'max_episode_cap': 2,
+            'fixed_schedule': 3,
+        }
+        self.writer.add_scalar(
+            'COMA/Readiness/ReasonCode',
+            readiness_reason_codes.get(agent.actor_readiness_reason, -1),
+            episode,
+        )
+        self.writer.add_scalar(
+            'COMA/Warmup/StructuredFamily',
+            agent.structured_warmup_family,
+            episode,
+        )
+        self.writer.add_scalar(
+            'COMA/Warmup/TemporalSwitches',
+            agent.structured_warmup_temporal_switches,
+            episode,
+        )
+
+        per_agent_metrics = {
+            'AdvantageMean': agent.advantage_mean_history,
+            'AdvantageStd': agent.advantage_std_history,
+            'AdvantageAbsMean': agent.advantage_abs_mean_history,
+            'AdvantageMin': agent.advantage_min_history,
+            'AdvantageMax': agent.advantage_max_history,
+            'GradNormBeforeClip': agent.actor_grad_norm_history,
+            'GradClippedFraction': agent.actor_grad_clipped_history,
+        }
+        for metric_name, histories in per_agent_metrics.items():
+            pooled = []
+            for agent_index, values in enumerate(histories):
+                if values:
+                    mean_value = float(np.mean(values))
+                    self.writer.add_scalar(
+                        f'COMA/Actor_{agent_index}/{metric_name}',
+                        mean_value,
+                        episode,
+                    )
+                    pooled.extend(values)
+            log_mean(f'COMA/ActorAggregate/{metric_name}', pooled)
+
     def close(self):
         """Close the logger"""
         self.writer.close()
@@ -241,6 +343,7 @@ class SimulatorTrainer:
             self.simulator.dynamic_matching_agent.entropy_history = [[] for _ in range(grid_num)]
             self.simulator.dynamic_matching_agent.critic1_losses_history = []
             self.simulator.dynamic_matching_agent.critic2_losses_history = []
+            self.simulator.dynamic_matching_agent.reset_coma_diagnostic_histories()
 
         elif isinstance(self.simulator.dynamic_matching_agent, IDQN):
             self.simulator.dynamic_matching_agent.loss_history = [[] for _ in range(grid_num)]
@@ -248,6 +351,8 @@ class SimulatorTrainer:
         self.simulator.dynamic_matching_agent.actor_counts = [[0] * self.simulator.dynamic_matching_agent.n_actions[0] for _ in range(grid_num)]
         self.simulator.dynamic_matching_agent.strategy_tracker = utilities.StrategyTracker(grid_num)
         self.simulator.dynamic_matching_agent.clear_on_policy_rollout()
+        if isinstance(self.simulator.dynamic_matching_agent, MADDPG):
+            self.simulator.dynamic_matching_agent.begin_training_episode()
 
         for step in range(self.simulator.finish_run_step + 1):
             self.simulator.rl_step_train_matching_method()
@@ -297,6 +402,9 @@ class SimulatorTrainer:
             logger.log_rl_metrics(epoch, step_actor_losses, step_critic1_loss, step_critic2_loss, step_action_counts,
                                   step_q_pi, step_entropy)
             logger.log_env_metrics(epoch, self.simulator.total_reward)
+            logger.log_coma_diagnostics(
+                epoch, self.simulator.dynamic_matching_agent
+            )
             logger.writer.add_scalar(
                 'Training/StateNormalizerReady', int(normalizer_ready), epoch
             )
@@ -305,9 +413,14 @@ class SimulatorTrainer:
             )
             logger.writer.add_scalar(
                 'Training/ActorWarmupRemainingEpisodes',
-                max(
+                0 if self.simulator.dynamic_matching_agent.actor_update_ready()
+                else max(
                     0,
-                    int(self.simulator.dynamic_matching_agent.actor_warmup_episodes)
+                    int(
+                        self.simulator.dynamic_matching_agent.actor_warmup_max_episodes
+                        if self.simulator.dynamic_matching_agent.adaptive_actor_warmup
+                        else self.simulator.dynamic_matching_agent.actor_warmup_episodes
+                    )
                     - int(self.simulator.dynamic_matching_agent.current_episode),
                 ),
                 epoch,
@@ -366,16 +479,32 @@ class SimulatorTrainer:
             discount_rate = train_config['hyper_parameters'].get('discount_rate',0.99)
             reward_scheme = train_config['hyper_parameters'].get('reward_scheme', 'fixed_penalty')
             ablation_name = train_config['hyper_parameters'].get('ablation_name', reward_scheme)
+            ablation_code = {
+                'state_raw_reward': 'sr',
+                'advantage_raw_reward': 'ar',
+                'state_discounted_reward': 'sd',
+                'advantage_discounted_reward': 'ad',
+                'idle_relative_raw_reward': 'irr',
+                'idle_relative_discounted_reward': 'ird',
+            }.get(ablation_name, str(ablation_name)[:8])
             writer_filename = os.path.join(write_path,
-                                           f'grid_{grid_num}_freq_{decision_freq}_{ablation_name}_' +
+                                           f'grid_{grid_num}_freq_{decision_freq}_{ablation_code}_' +
                                            datetime.now().strftime('%H%M%S') + f'_{discount_rate}_{worker_id}')
         else:
             grid_num = self.simulator.grid_num
             decision_freq = self.simulator.decision_freq
             reward_scheme = train_config['hyper_parameters'].get('reward_scheme', 'fixed_penalty')
             ablation_name = train_config['hyper_parameters'].get('ablation_name', reward_scheme)
+            ablation_code = {
+                'state_raw_reward': 'sr',
+                'advantage_raw_reward': 'ar',
+                'state_discounted_reward': 'sd',
+                'advantage_discounted_reward': 'ad',
+                'idle_relative_raw_reward': 'irr',
+                'idle_relative_discounted_reward': 'ird',
+            }.get(ablation_name, str(ablation_name)[:8])
             writer_filename = os.path.join(write_path,
-                                           f'grid_{grid_num}_freq_{decision_freq}_{ablation_name}_' +
+                                           f'grid_{grid_num}_freq_{decision_freq}_{ablation_code}_' +
                                            datetime.now().strftime('%H%M%S'))
 
         os.makedirs(writer_filename, exist_ok=True)
@@ -457,7 +586,7 @@ class SimulatorTrainer:
                 previous_best_path = best_checkpoint['path'] if best_checkpoint is not None else None
                 best_path = os.path.join(
                     writer_filename,
-                    f'qtable_best_grid_{grid_num}_freq_{decision_freq}_epoch_{epoch}_score{int(score)}.pickle',
+                    f'best_e{epoch}_s{int(score)}.pkl',
                 )
                 self.simulator.score_agent.save_parameters(best_path)
                 best_checkpoint = {'score': score, 'epoch': epoch, 'path': best_path}
@@ -472,7 +601,7 @@ class SimulatorTrainer:
                 else:
                     final_path = os.path.join(
                         writer_filename,
-                        f'qtable_final_grid_{grid_num}_freq_{decision_freq}_epoch_{epoch}_score{int(score)}.pickle',
+                        f'final_e{epoch}_s{int(score)}.pkl',
                     )
                     self.simulator.score_agent.save_parameters(final_path)
                     final_checkpoint = {'score': score, 'epoch': epoch, 'path': final_path}
@@ -898,7 +1027,11 @@ class SimulatorTrainer:
                 driver_table = deepcopy(simulator.driver_table)
                 matched_pair_actual_indexes, matched_itinerary = utilities.order_dispatch(
                     wait_requests, driver_table, simulator.maximal_pickup_distance,
-                    simulator.dispatch_method, simulator.method)
+                    simulator.dispatch_method, simulator.method,
+                    advantage_context=simulator._matching_value_context(),
+                    dynamic_actions=simulator._current_dynamic_matching_actions(),
+                    dynamic_edge_weight_mode=simulator.dynamic_edge_weight_mode,
+                )
                 df_new_matched_requests, df_update_wait_requests = simulator.update_info_after_matching_multi_process(
                     matched_pair_actual_indexes, matched_itinerary)
 
@@ -1170,6 +1303,8 @@ class SimulatorTrainer:
                     simulator.dispatch_method,
                     simulator.method,
                     advantage_context=simulator._matching_value_context(),
+                    dynamic_actions=simulator._current_dynamic_matching_actions(),
+                    dynamic_edge_weight_mode=simulator.dynamic_edge_weight_mode,
                 )
                 # Step 2: driver/passenger reaction after dispatching
                 df_new_matched_requests, df_update_wait_requests = simulator.update_info_after_matching_multi_process(

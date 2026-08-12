@@ -10,9 +10,16 @@ from pathlib import Path
 import pickle
 import sys
 
+import numpy as np
 import pandas as pd
 
 from src.utils.stratified_order_sampling import sampled_order_path
+from dynamic_matching.driver_service_window import (
+    DRIVER_SERVICE_END,
+    DRIVER_SERVICE_START,
+    service_window_metadata,
+    sha256_file,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -23,11 +30,11 @@ TRAIN_DATES = ["2015-05-05", "2015-05-06", "2015-05-07", "2015-05-08", "2015-05-
 SAMPLE_RATIO = 0.30
 T_INITIAL = 6 * 3600
 T_END = 21 * 3600
-QTABLE_ROOT = PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_sample030_stratified"
+QTABLE_ROOT = PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_driver0621_sample030_stratified"
 QTABLE_ROOTS = {
     0.30: QTABLE_ROOT,
-    0.50: PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_sample050_stratified",
-    None: PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_full_data",
+    0.50: PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_driver0621_sample050_stratified",
+    None: PROJECT_ROOT / "dynamic_matching" / "qtable_state_6to21_driver0621_full_data",
 }
 WARMUP_OUTPUT_PATH = PROJECT_ROOT / "dynamic_matching" / "warmup_transitions" / "stage2_coma"
 TRAINING_OUTPUT_PATH = Path(
@@ -93,24 +100,6 @@ def environment_seed_sequence(num_episodes, base_seed=None):
         raise ValueError("Environment seeds must lie in NumPy's uint32 range.")
     return tuple(range(first_seed, last_seed + 1))
 
-# Best checkpoint per scenario, selected by test_gmv_mean in
-# qtable_test_results_6to21_sample030_stratified/qtable_test_summary.csv.
-QTABLE_PATHS = {
-    (8, 5): QTABLE_ROOT / "grid_8_freq_5_state_discounted_reward_004631_0.9_1" / "qtable_best_grid_8_freq_5_epoch_13_score136390.pickle",
-    (8, 10): QTABLE_ROOT / "grid_8_freq_10_state_discounted_reward_004631_0.9_3" / "qtable_best_grid_8_freq_10_epoch_7_score136460.pickle",
-    (8, 20): QTABLE_ROOT / "grid_8_freq_20_state_discounted_reward_004632_0.9_5" / "qtable_best_grid_8_freq_20_epoch_3_score136696.pickle",
-    (8, 30): QTABLE_ROOT / "grid_8_freq_30_state_discounted_reward_004632_0.9_7" / "qtable_best_grid_8_freq_30_epoch_2_score136165.pickle",
-    (35, 5): QTABLE_ROOT / "grid_35_freq_5_state_discounted_reward_004632_0.9_9" / "qtable_best_grid_35_freq_5_epoch_17_score136436.pickle",
-    (35, 10): QTABLE_ROOT / "grid_35_freq_10_state_discounted_reward_004632_0.9_11" / "qtable_best_grid_35_freq_10_epoch_9_score136606.pickle",
-    (35, 20): QTABLE_ROOT / "grid_35_freq_20_state_discounted_reward_004633_0.9_13" / "qtable_best_grid_35_freq_20_epoch_4_score136521.pickle",
-    (35, 30): QTABLE_ROOT / "grid_35_freq_30_state_discounted_reward_004633_0.9_15" / "qtable_best_grid_35_freq_30_epoch_2_score136487.pickle",
-    (63, 5): QTABLE_ROOT / "grid_63_freq_5_state_discounted_reward_004633_0.9_17" / "qtable_best_grid_63_freq_5_epoch_19_score135928.pickle",
-    (63, 10): QTABLE_ROOT / "grid_63_freq_10_state_discounted_reward_004633_0.9_19" / "qtable_best_grid_63_freq_10_epoch_11_score136334.pickle",
-    (63, 20): QTABLE_ROOT / "grid_63_freq_20_state_discounted_reward_004634_0.9_21" / "qtable_best_grid_63_freq_20_epoch_5_score136166.pickle",
-    (63, 30): QTABLE_ROOT / "grid_63_freq_30_state_discounted_reward_004634_0.9_23" / "qtable_best_grid_63_freq_30_epoch_4_score136002.pickle",
-}
-
-
 def normalize_sample_ratio(sample_ratio):
     """Normalize supported data scopes; ``None`` denotes original full data."""
     if sample_ratio is None:
@@ -132,8 +121,8 @@ def sample_scope_name(sample_ratio):
     return "full" if ratio is None else f"sample{int(ratio * 100):03d}"
 
 
-def _validate_qtable_scope(qtable_path, sample_ratio):
-    """Fail fast when a Q-table belongs to a different order-data scope."""
+def _validate_qtable_scope(qtable_path, sample_ratio, grid_num, decision_freq):
+    """Fail fast when a Q-table does not match the requested scenario."""
     hyper_parameters_path = qtable_path.parent / "hyper_parameters.json"
     if not hyper_parameters_path.exists():
         raise FileNotFoundError(
@@ -149,34 +138,101 @@ def _validate_qtable_scope(qtable_path, sample_ratio):
             f"checkpoint={qtable_path}, checkpoint_ratio={actual}, "
             f"requested_ratio={expected}."
         )
+    expected_metadata = {
+        "grid_num": int(grid_num),
+        "decision_freq": int(decision_freq),
+        "t_initial": T_INITIAL,
+        "t_end": T_END,
+        "discount_mode": QTABLE_DISCOUNT_MODE,
+    }
+    mismatches = {
+        key: (hyper_parameters.get(key), expected_value)
+        for key, expected_value in expected_metadata.items()
+        if hyper_parameters.get(key) != expected_value
+    }
+    for key, expected_value in {
+        "discount_time_unit_seconds": QTABLE_DISCOUNT_TIME_UNIT_SECONDS,
+        "discount_rate": QTABLE_DISCOUNT_RATE,
+    }.items():
+        actual_value = float(hyper_parameters.get(key, float("nan")))
+        if not math.isclose(
+            actual_value, expected_value, rel_tol=0.0, abs_tol=1e-12
+        ):
+            mismatches[key] = (actual_value, expected_value)
+    if mismatches:
+        raise ValueError(
+            f"Q-table scenario metadata mismatch: checkpoint={qtable_path}, "
+            f"mismatches={mismatches}."
+        )
+    if hyper_parameters.get("driver_service_start") != DRIVER_SERVICE_START or (
+        hyper_parameters.get("driver_service_end") != DRIVER_SERVICE_END
+    ):
+        raise ValueError(
+            "Q-table driver-window mismatch: "
+            f"checkpoint={qtable_path}, expected=06:00-21:00, "
+            f"actual={hyper_parameters.get('driver_service_start')}-"
+            f"{hyper_parameters.get('driver_service_end')}."
+        )
+    current_driver_path = DATA_ROOT / "drivers_grid35_1000.pickle"
+    expected_driver_hash = hyper_parameters.get("driver_data_sha256")
+    current_driver_hash = sha256_file(current_driver_path)
+    if expected_driver_hash != current_driver_hash:
+        raise ValueError(
+            "Q-table driver-data mismatch: "
+            f"checkpoint={qtable_path}, checkpoint_sha256={expected_driver_hash}, "
+            f"current_sha256={current_driver_hash}."
+        )
+    with qtable_path.open("rb") as file:
+        qtable = np.asarray(pickle.load(file))
+    expected_shape = (
+        (T_END - T_INITIAL) // (int(decision_freq) * 60),
+        int(grid_num),
+    )
+    if qtable.shape != expected_shape or not np.isfinite(qtable).all():
+        raise ValueError(
+            "Q-table array mismatch: "
+            f"checkpoint={qtable_path}, actual_shape={qtable.shape}, "
+            f"expected_shape={expected_shape}, all_finite="
+            f"{bool(np.isfinite(qtable).all())}."
+        )
 
 
 def qtable_path_for_sample_ratio(grid_num, decision_freq, sample_ratio=SAMPLE_RATIO):
     """Resolve the training-selected best Q-table for one exact data scope."""
     ratio = normalize_sample_ratio(sample_ratio)
     key = (int(grid_num), int(decision_freq))
-    if ratio == SAMPLE_RATIO:
-        qtable_path = QTABLE_PATHS[key]
-    else:
-        qtable_root = QTABLE_ROOTS[ratio]
-        summaries = sorted(
-            qtable_root.glob(
-                f"grid_{key[0]}_freq_{key[1]}_*/checkpoint_summary.json"
-            )
+    qtable_root = QTABLE_ROOTS[ratio]
+    summaries = sorted(
+        qtable_root.glob(
+            f"grid_{key[0]}_freq_{key[1]}_*/checkpoint_summary.json"
         )
-        if len(summaries) != 1:
-            raise FileNotFoundError(
-                "Expected exactly one matching Q-table training run for "
-                f"scope={sample_scope_name(ratio)}, grid={key[0]}, "
-                f"freq={key[1]}; found {len(summaries)} under {qtable_root}."
-            )
-        with summaries[0].open(encoding="utf-8") as file:
-            checkpoint_summary = json.load(file)
-        qtable_path = summaries[0].parent / checkpoint_summary["best"]["path"]
+    )
+    if len(summaries) != 1:
+        raise FileNotFoundError(
+            "Expected exactly one corrected 06:00-21:00 Q-table training run for "
+            f"scope={sample_scope_name(ratio)}, grid={key[0]}, "
+            f"freq={key[1]}; found {len(summaries)} under {qtable_root}."
+        )
+    with summaries[0].open(encoding="utf-8") as file:
+        checkpoint_summary = json.load(file)
+    qtable_path = summaries[0].parent / checkpoint_summary["best"]["path"]
     if not qtable_path.exists():
         raise FileNotFoundError(f"Missing scenario Q-table: {qtable_path}")
-    _validate_qtable_scope(qtable_path, ratio)
+    _validate_qtable_scope(qtable_path, ratio, key[0], key[1])
     return qtable_path
+
+
+class _CorrectedQTablePaths:
+    """Backward-compatible mapping that never resolves stale Q-tables."""
+
+    def __getitem__(self, key):
+        grid_num, decision_freq = key
+        return qtable_path_for_sample_ratio(
+            grid_num, decision_freq, sample_ratio=SAMPLE_RATIO
+        )
+
+
+QTABLE_PATHS = _CorrectedQTablePaths()
 
 
 def load_request_dict(dates, sample_ratio=SAMPLE_RATIO):
@@ -202,6 +258,14 @@ def load_request_dict(dates, sample_ratio=SAMPLE_RATIO):
     return request_dict
 
 
+def load_driver_service_metadata():
+    """Validate and fingerprint the canonical driver artifact."""
+    driver_path = DATA_ROOT / "drivers_grid35_1000.pickle"
+    with driver_path.open("rb") as file:
+        driver_info = pickle.load(file)
+    return service_window_metadata(driver_info, driver_path)
+
+
 def load_shared_inputs(grids=None, dates=None, sample_ratio=SAMPLE_RATIO):
     """Load fixed samples and driver mappings for the requested scenarios.
 
@@ -216,8 +280,10 @@ def load_shared_inputs(grids=None, dates=None, sample_ratio=SAMPLE_RATIO):
         raise ValueError("At least one experiment date must be requested.")
     request_dict = load_request_dict(selected_dates, sample_ratio=sample_ratio)
 
-    with (DATA_ROOT / "drivers_grid35_1000.pickle").open("rb") as file:
+    driver_path = DATA_ROOT / "drivers_grid35_1000.pickle"
+    with driver_path.open("rb") as file:
         driver_info = pickle.load(file).sample(n=1000, replace=False, random_state=42)
+    service_window_metadata(driver_info, driver_path)
     with (DATA_ROOT / "node_to_grid.pkl").open("rb") as file:
         mapping_dict = pickle.load(file)
 

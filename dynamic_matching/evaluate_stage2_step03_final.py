@@ -24,6 +24,7 @@ from dynamic_matching.marl_stage2_common import (
     DATA_ROOT,
     QTABLE_PATHS,
     SAMPLE_RATIO,
+    load_driver_service_metadata,
     stage2_task,
 )
 from dynamic_matching.test_qtable import (
@@ -53,6 +54,7 @@ DEFAULT_BASELINE_DIR = (
 
 
 def _discover_final_checkpoints(result_root: Path) -> list[dict[str, Any]]:
+    driver_metadata = load_driver_service_metadata()
     tasks: list[dict[str, Any]] = []
     for summary_path in sorted(result_root.rglob("checkpoint_summary.json")):
         with summary_path.open("r", encoding="utf-8") as file:
@@ -72,6 +74,19 @@ def _discover_final_checkpoints(result_root: Path) -> list[dict[str, Any]]:
             raise FileNotFoundError(hyper_parameters_path)
         with hyper_parameters_path.open("r", encoding="utf-8") as file:
             hyper_parameters = json.load(file)
+        if (
+            hyper_parameters.get("driver_service_start")
+            != driver_metadata["driver_service_start"]
+            or hyper_parameters.get("driver_service_end")
+            != driver_metadata["driver_service_end"]
+            or hyper_parameters.get("driver_data_sha256")
+            != driver_metadata["driver_data_sha256"]
+        ):
+            raise ValueError(
+                "COMA checkpoint was trained with stale or unversioned driver "
+                f"data and cannot be evaluated in the corrected environment: "
+                f"{checkpoint_path}"
+            )
         tasks.append({
             "variant": summary["initialization_variant"],
             "model_seed": int(summary["model_seed"]),

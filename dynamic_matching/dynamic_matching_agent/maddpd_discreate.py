@@ -165,6 +165,15 @@ class MADDPG:
             )
         self.defer_critic_updates = bool(HYPERPARAMS.get('defer_critic_updates', False))
         self.standard_coma = bool(HYPERPARAMS.get('standard_coma', False))
+        # Optional scale correction for the standard COMA policy gradient.
+        # The default is deliberately false so existing experiments and
+        # checkpoints keep their historical raw-advantage objective.
+        self.normalize_coma_advantages = bool(
+            HYPERPARAMS.get('normalize_coma_advantages', False)
+        )
+        self.coma_advantage_normalization_epsilon = float(
+            HYPERPARAMS.get('coma_advantage_normalization_epsilon', 1e-6)
+        )
         self.use_replay_buffer = bool(HYPERPARAMS.get('use_replay_buffer', True))
         self.normalize_states = bool(HYPERPARAMS.get('normalize_states', True))
         self.state_normalizer_warmup_episodes = int(
@@ -206,6 +215,36 @@ class MADDPG:
         self.actor_warmup_episodes = int(
             HYPERPARAMS.get('actor_warmup_episodes', 0)
         )
+        self.adaptive_actor_warmup = bool(
+            HYPERPARAMS.get('adaptive_actor_warmup', False)
+        )
+        self.actor_warmup_max_episodes = int(
+            HYPERPARAMS.get(
+                'actor_warmup_max_episodes', self.actor_warmup_episodes
+            )
+        )
+        self.critic_readiness_window = int(
+            HYPERPARAMS.get('critic_readiness_window', 5)
+        )
+        self.critic_readiness_max_normalized_mse = float(
+            HYPERPARAMS.get(
+                'critic_readiness_max_normalized_mse', 0.2
+            )
+        )
+        self.critic_readiness_min_explained_variance = float(
+            HYPERPARAMS.get(
+                'critic_readiness_min_explained_variance', 0.8
+            )
+        )
+        self.structured_coma_warmup = bool(
+            HYPERPARAMS.get('structured_coma_warmup', False)
+        )
+        self.structured_warmup_decisions_per_episode = int(
+            HYPERPARAMS.get('structured_warmup_decisions_per_episode', 0)
+        )
+        self.epsilon_anneal_after_actor_start = bool(
+            HYPERPARAMS.get('epsilon_anneal_after_actor_start', False)
+        )
         self.target_critic_update_interval = int(
             HYPERPARAMS.get('target_critic_update_interval', 10)
         )
@@ -219,6 +258,42 @@ class MADDPG:
             )
         if self.target_critic_update_interval <= 0:
             raise ValueError('target_critic_update_interval must be positive.')
+        if self.adaptive_actor_warmup:
+            if self.actor_warmup_episodes <= 0:
+                raise ValueError(
+                    'adaptive_actor_warmup requires a positive minimum warm-up.'
+                )
+            if self.actor_warmup_max_episodes < self.actor_warmup_episodes:
+                raise ValueError(
+                    'actor_warmup_max_episodes must be at least the minimum warm-up.'
+                )
+            if self.critic_readiness_window <= 0:
+                raise ValueError('critic_readiness_window must be positive.')
+            if self.critic_readiness_max_normalized_mse <= 0:
+                raise ValueError(
+                    'critic_readiness_max_normalized_mse must be positive.'
+                )
+            if not 0.0 <= self.critic_readiness_min_explained_variance <= 1.0:
+                raise ValueError(
+                    'critic_readiness_min_explained_variance must lie in [0, 1].'
+                )
+        if self.structured_coma_warmup:
+            if not self.standard_coma or not self.adaptive_actor_warmup:
+                raise ValueError(
+                    'structured_coma_warmup requires adaptive standard COMA warm-up.'
+                )
+            if self.structured_warmup_decisions_per_episode <= 0:
+                raise ValueError(
+                    'structured_warmup_decisions_per_episode must be positive.'
+                )
+        if self.normalize_coma_advantages and not self.standard_coma:
+            raise ValueError(
+                'normalize_coma_advantages is supported only for standard COMA.'
+            )
+        if self.coma_advantage_normalization_epsilon <= 0:
+            raise ValueError(
+                'coma_advantage_normalization_epsilon must be positive.'
+            )
         self.driver_num = HYPERPARAMS.get('driver_num',1000)
 
         requested_device = HYPERPARAMS.get('device')
@@ -353,6 +428,7 @@ class MADDPG:
 
         self.q_pi_history = []
         self.entropy_history = [[] for _ in range(self.n)]
+        self.reset_coma_diagnostic_histories()
 
         # per-episode accumulators
         self.episode_reward = 0.0
@@ -364,6 +440,26 @@ class MADDPG:
 
 
         self.current_episode = 0
+        self.actor_update_count = 0
+        self.last_behaviour_epsilon = self._coma_epsilon()
+        self.actor_training_started = not self.adaptive_actor_warmup
+        self.actor_start_episode = (
+            0 if self.actor_training_started and self.actor_warmup_episodes == 0
+            else None
+        )
+        self.actor_readiness_reason = (
+            'fixed_schedule' if not self.adaptive_actor_warmup else 'warming_up'
+        )
+        self._critic_readiness_nmse = deque(
+            maxlen=self.critic_readiness_window
+        )
+        self._critic_readiness_explained_variance = deque(
+            maxlen=self.critic_readiness_window
+        )
+        self._episode_is_actor_warmup = None
+        self._episode_decision_index = 0
+        self.structured_warmup_family = 0
+        self.structured_warmup_temporal_switches = 0
 
         # ----- Entropy decay scheduler -----
         self.entropy_start = 0.05
@@ -395,10 +491,123 @@ class MADDPG:
 
     def _coma_epsilon(self):
         """Original COMA's linearly annealed epsilon-soft behaviour policy."""
-        progress = min(self.current_episode / self.coma_epsilon_anneal_episodes, 1.0)
+        schedule_step = (
+            self.actor_update_count
+            if self.epsilon_anneal_after_actor_start
+            else self.current_episode
+        )
+        progress = min(schedule_step / self.coma_epsilon_anneal_episodes, 1.0)
         return self.coma_epsilon_start + progress * (
             self.coma_epsilon_end - self.coma_epsilon_start
         )
+
+    def begin_training_episode(self):
+        """Reset the per-day warm-up action template state.
+
+        Adaptive warm-up deliberately starts actor training only on the next
+        complete episode after the critic gate fires.  This prevents a
+        structured, non-policy rollout from being used in an on-policy actor
+        update.
+        """
+        self._episode_decision_index = 0
+        self.last_behaviour_epsilon = self._coma_epsilon()
+        self.structured_warmup_temporal_switches = 0
+        self._episode_is_actor_warmup = not self.actor_update_ready()
+        if (
+            not self.adaptive_actor_warmup
+            and not self._episode_is_actor_warmup
+            and self.actor_start_episode is None
+        ):
+            self.actor_start_episode = self.current_episode
+        if not (
+            self.structured_coma_warmup and self._episode_is_actor_warmup
+        ):
+            self.structured_warmup_family = 0
+            return
+        # 1=global constant, 2=global temporal, 3=spatial constant,
+        # 4=spatiotemporal.  Interleaving makes every four warm-up days cover
+        # both spatial and temporal variation.
+        self.structured_warmup_family = 1 + self.current_episode % 4
+
+    def _structured_spatial_pattern(self, template_index):
+        """Return an action-symmetric all-k plus one-agent deviation."""
+        if self.n > 8:
+            # Large-grid warm-up must visit agents faster than the original
+            # 8-grid sequence.  The flattened spatial template index visits
+            # every agent once before repeating it, while action combinations
+            # remain globally balanced.  On later cycles choose a stride that
+            # is coprime to six so every agent eventually sees all six
+            # base/deviation combinations.
+            cycle, agent_index = divmod(int(template_index), self.n)
+            combination_stride = next(
+                offset for offset in range(6)
+                if math.gcd(self.n + offset, 6) == 1
+            )
+            combination = (
+                int(template_index) + cycle * combination_stride
+            ) % 6
+            base_action = combination // 2
+            offset = 1 + combination % 2
+            actions = [base_action] * self.n
+            actions[agent_index] = (base_action + offset) % 3
+            return actions
+
+        block, combination = divmod(int(template_index), 6)
+        # Every block of six templates contains both deviations from each of
+        # the three base actions.  Across 6*n templates, multiplying the
+        # block by n-1 rotates those six combinations through every agent.
+        agent_index = ((self.n - 1) * block + combination) % self.n
+        base_action = combination // 2
+        offset = 1 + combination % 2
+        actions = [base_action] * self.n
+        actions[agent_index] = (base_action + offset) % 3
+        return actions
+
+    def _structured_warmup_actions(self):
+        decisions = self.structured_warmup_decisions_per_episode
+        decision_index = min(self._episode_decision_index, decisions - 1)
+        temporal_segment = min(2, (3 * decision_index) // decisions)
+        template_index = self.current_episode // 4
+        family = self.structured_warmup_family
+
+        if family == 1:
+            actions = [template_index % 3] * self.n
+        elif family == 2:
+            permutations = (
+                (0, 1, 2), (0, 2, 1), (1, 0, 2),
+                (1, 2, 0), (2, 0, 1), (2, 1, 0),
+            )
+            action = permutations[template_index % len(permutations)][
+                temporal_segment
+            ]
+            actions = [action] * self.n
+        elif family in (3, 4):
+            spatial_template_index = template_index
+            if self.n > 8:
+                # Families 3 and 4 are distinct spatial samples.  Flattening
+                # both doubles coverage without changing the four-family
+                # episode schedule used by existing 8-grid checkpoints.
+                spatial_template_index = 2 * template_index + (family - 3)
+            actions = self._structured_spatial_pattern(spatial_template_index)
+            if family == 4:
+                actions = [
+                    (action + temporal_segment) % 3 for action in actions
+                ]
+        else:
+            raise RuntimeError('Structured warm-up family was not initialized.')
+
+        if (
+            family in (2, 4)
+            and self._episode_decision_index > 0
+            and (3 * self._episode_decision_index) // decisions
+            != (3 * (self._episode_decision_index - 1)) // decisions
+        ):
+            self.structured_warmup_temporal_switches += 1
+        self._episode_decision_index += 1
+        for agent_index, action in enumerate(actions):
+            self.actor_counts[agent_index][action] += 1
+        self.strategy_tracker.update(actions)
+        return actions, [0.0] * self.n
 
     def _policy_probs(self, logits):
         """Return the policy used for both sampling and the COMA baseline."""
@@ -469,6 +678,13 @@ class MADDPG:
         device = self.device
         actions = []
         log_probs = []
+
+        if (
+            not deterministic
+            and self.structured_coma_warmup
+            and self._episode_is_actor_warmup
+        ):
+            return self._structured_warmup_actions()
 
         # Convert global_state to tensor on correct device
         if not isinstance(global_state, torch.Tensor):
@@ -700,7 +916,93 @@ class MADDPG:
 
     def actor_update_ready(self):
         """Return whether the critic-only actor warm-up has completed."""
+        if self.adaptive_actor_warmup:
+            return self.actor_training_started
         return self.current_episode >= self.actor_warmup_episodes
+
+    def _update_adaptive_actor_readiness(self):
+        """Update the critic gate after one complete critic-only episode."""
+        if not self.adaptive_actor_warmup or self.actor_training_started:
+            return self.actor_training_started
+        if (
+            self.critic_normalized_mse_history
+            and self.critic_explained_variance_history
+        ):
+            self._critic_readiness_nmse.append(
+                float(np.mean(self.critic_normalized_mse_history))
+            )
+            self._critic_readiness_explained_variance.append(
+                float(np.mean(self.critic_explained_variance_history))
+            )
+
+        completed_episodes = self.current_episode + 1
+        enough_episodes = completed_episodes >= self.actor_warmup_episodes
+        full_window = (
+            len(self._critic_readiness_nmse) == self.critic_readiness_window
+            and len(self._critic_readiness_explained_variance)
+            == self.critic_readiness_window
+        )
+        thresholds_met = full_window and all(
+            value <= self.critic_readiness_max_normalized_mse
+            for value in self._critic_readiness_nmse
+        ) and all(
+            value >= self.critic_readiness_min_explained_variance
+            for value in self._critic_readiness_explained_variance
+        )
+        reached_safety_cap = (
+            completed_episodes >= self.actor_warmup_max_episodes
+        )
+        if enough_episodes and (thresholds_met or reached_safety_cap):
+            self.actor_training_started = True
+            self.actor_start_episode = completed_episodes
+            self.actor_readiness_reason = (
+                'critic_thresholds' if thresholds_met else 'max_episode_cap'
+            )
+        return self.actor_training_started
+
+    def critic_readiness_window_metrics(self):
+        """Return the persistent readiness window for TensorBoard logging."""
+        nmse = (
+            float(np.mean(self._critic_readiness_nmse))
+            if self._critic_readiness_nmse else float('nan')
+        )
+        explained_variance = (
+            float(np.mean(self._critic_readiness_explained_variance))
+            if self._critic_readiness_explained_variance else float('nan')
+        )
+        return nmse, explained_variance
+
+    def reset_coma_diagnostic_histories(self):
+        """Reset per-episode scale and optimisation diagnostics."""
+        self.advantage_mean_history = [[] for _ in range(self.n)]
+        self.advantage_std_history = [[] for _ in range(self.n)]
+        self.advantage_abs_mean_history = [[] for _ in range(self.n)]
+        self.advantage_min_history = [[] for _ in range(self.n)]
+        self.advantage_max_history = [[] for _ in range(self.n)]
+        self.actor_grad_norm_history = [[] for _ in range(self.n)]
+        self.actor_grad_clipped_history = [[] for _ in range(self.n)]
+        self.critic_target_mean_history = []
+        self.critic_target_std_history = []
+        self.critic_target_min_history = []
+        self.critic_target_max_history = []
+        self.critic_q_taken_mean_history = []
+        self.critic_q_taken_std_history = []
+        self.critic_normalized_mse_history = []
+        self.critic_explained_variance_history = []
+        self.critic_grad_norm_history = []
+        self.critic_grad_clipped_history = []
+
+    def _record_coma_advantage_diagnostics(self, agent_index, advantage):
+        values = advantage.detach()
+        self.advantage_mean_history[agent_index].append(values.mean().item())
+        self.advantage_std_history[agent_index].append(
+            values.std(unbiased=False).item()
+        )
+        self.advantage_abs_mean_history[agent_index].append(
+            values.abs().mean().item()
+        )
+        self.advantage_min_history[agent_index].append(values.min().item())
+        self.advantage_max_history[agent_index].append(values.max().item())
 
     def update_on_policy_actor(self):
         """One COMA actor update from the just-collected behaviour rollout.
@@ -712,6 +1014,15 @@ class MADDPG:
         diagnostics.
         """
         if self.actor_update_mode != 'on_policy' or not self.on_policy_rollout:
+            return False
+        episode_was_warmup = (
+            self._episode_is_actor_warmup
+            if self._episode_is_actor_warmup is not None
+            else not self.actor_update_ready()
+        )
+        if episode_was_warmup:
+            self._update_adaptive_actor_readiness()
+            self.clear_on_policy_rollout()
             return False
         if not self.actor_update_ready():
             self.clear_on_policy_rollout()
@@ -777,7 +1088,14 @@ class MADDPG:
                 )
                 self.actor_optims[i].zero_grad()
                 actor_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.actors[i].parameters(), 0.5)
+                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    self.actors[i].parameters(), 0.5
+                )
+                actor_grad_norm = float(actor_grad_norm)
+                self.actor_grad_norm_history[i].append(actor_grad_norm)
+                self.actor_grad_clipped_history[i].append(
+                    float(actor_grad_norm > 0.5)
+                )
                 self.actor_optims[i].step()
 
             if q_monitors:
@@ -785,6 +1103,7 @@ class MADDPG:
             for actor, target_actor in zip(self.actors, self.target_actors):
                 self._soft_update(actor, target_actor)
         self.clear_on_policy_rollout()
+        self.actor_update_count += 1
         return True
 
     def update_standard_coma_critic(self):
@@ -858,18 +1177,47 @@ class MADDPG:
                     running_target = rewards[index] + self.gamma * bootstrap
                 td_lambda_targets[index] = running_target
 
+        target_std = td_lambda_targets.std(unbiased=False)
+        self.critic_target_mean_history.append(td_lambda_targets.mean().item())
+        self.critic_target_std_history.append(target_std.item())
+        self.critic_target_min_history.append(td_lambda_targets.min().item())
+        self.critic_target_max_history.append(td_lambda_targets.max().item())
+
         joint_actions = torch.stack(actions, dim=1)
         for _ in range(self.critic_updates_per_episode):
             q_values = self._coma_q_values(global_state, actions)
             q_taken = q_values.gather(2, joint_actions.unsqueeze(-1)).squeeze(-1)
-            critic_loss = F.mse_loss(
-                q_taken,
-                td_lambda_targets.unsqueeze(1).expand_as(q_taken),
-            )
+            expanded_targets = td_lambda_targets.unsqueeze(1).expand_as(q_taken)
+            critic_loss = F.mse_loss(q_taken, expanded_targets)
+            with torch.no_grad():
+                residual = expanded_targets - q_taken
+                target_variance = expanded_targets.var(unbiased=False)
+                normalized_mse = critic_loss.detach() / (
+                    target_variance + self.coma_advantage_normalization_epsilon
+                )
+                residual_variance = residual.var(unbiased=False)
+                explained_variance = 1.0 - residual_variance / (
+                    target_variance + self.coma_advantage_normalization_epsilon
+                )
+                self.critic_q_taken_mean_history.append(q_taken.mean().item())
+                self.critic_q_taken_std_history.append(
+                    q_taken.std(unbiased=False).item()
+                )
+                self.critic_normalized_mse_history.append(normalized_mse.item())
+                self.critic_explained_variance_history.append(
+                    explained_variance.item()
+                )
             self.critic1_losses_history.append(critic_loss.item())
             self.coma_critic_optim.zero_grad()
             critic_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.coma_critic.parameters(), 0.5)
+            critic_grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.coma_critic.parameters(), 0.5
+            )
+            critic_grad_norm = float(critic_grad_norm)
+            self.critic_grad_norm_history.append(critic_grad_norm)
+            self.critic_grad_clipped_history.append(
+                float(critic_grad_norm > 0.5)
+            )
             self.coma_critic_optim.step()
             self._standard_coma_critic_steps += 1
             if self._standard_coma_critic_steps % self.target_critic_update_interval == 0:
@@ -1057,11 +1405,22 @@ class MADDPG:
         Unified actor policy gradient loss (supports both COMA and REINFORCE/AC modes).
         Both modes use standard PG form: -(logp * advantage_norm).mean()
         """
-        # Standard COMA is the plain counterfactual policy-gradient objective.
-        # The historical normalized-advantage and adaptive-entropy objective is
-        # intentionally retained below for legacy experiments.
+        # Standard COMA defaults to the historical raw counterfactual
+        # policy-gradient objective.  Scale-aware experiments can standardize
+        # each agent's just-collected rollout without changing the critic,
+        # behaviour policy, or entropy treatment.
         if self.standard_coma:
-            actor_loss = -(logp * advantage.detach()).mean()
+            advantage = advantage.detach()
+            self._record_coma_advantage_diagnostics(i, advantage)
+            if self.normalize_coma_advantages:
+                advantage_mean = advantage.mean()
+                advantage_std = advantage.std(unbiased=False)
+                policy_advantage = (advantage - advantage_mean) / (
+                    advantage_std + self.coma_advantage_normalization_epsilon
+                )
+            else:
+                policy_advantage = advantage
+            actor_loss = -(logp * policy_advantage).mean()
             self.actor_losses_history[i].append(actor_loss.item())
             self.entropy_history[i].append(entropy.mean().item())
             return actor_loss

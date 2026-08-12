@@ -2,6 +2,11 @@ import numpy as np
 
 def LD(dispatch_observ, method, reject_nonpositive=False):
 
+    method = {
+        'instant_reward': 'ir',
+        'pickup_distance': 'd',
+    }.get(method, method)
+
 
     dispatch_action = []
     if reject_nonpositive:

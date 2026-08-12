@@ -45,6 +45,11 @@ if str(PROJECT_ROOT) not in sys.path:
 from src.agents.sarsa import SarsaAgent
 from src.env.simulator_env import Simulator
 from src.utils.stratified_order_sampling import sampled_order_path
+from dynamic_matching.driver_service_window import (
+    DRIVER_SERVICE_END,
+    DRIVER_SERVICE_START,
+    service_window_metadata,
+)
 
 
 DEFAULT_TEST_DATES = [
@@ -58,6 +63,14 @@ DEFAULT_SEEDS = [0, 42, 3407, 1024, 215]
 DEFAULT_ABLATIONS = [
     "state_discounted_reward",
 ]
+ABLATION_CODES = {
+    "state_raw_reward": "sr",
+    "advantage_raw_reward": "ar",
+    "state_discounted_reward": "sd",
+    "advantage_discounted_reward": "ad",
+    "idle_relative_raw_reward": "irr",
+    "idle_relative_discounted_reward": "ird",
+}
 _WORKER_CONTEXT: Dict[str, Any] = {}
 
 
@@ -67,6 +80,20 @@ def parse_csv_strings(value: str) -> List[str]:
 
 def parse_csv_ints(value: str) -> List[int]:
     return [int(item) for item in parse_csv_strings(value)]
+
+
+def parse_grid_frequency_pairs(value: str) -> set[tuple[int, int]]:
+    pairs: set[tuple[int, int]] = set()
+    for item in parse_csv_strings(value):
+        try:
+            grid_text, frequency_text = item.split(":", maxsplit=1)
+            pairs.add((int(grid_text), int(frequency_text)))
+        except ValueError as error:
+            raise ValueError(
+                "Grid/frequency exclusions must use grid:frequency pairs; "
+                f"got {item!r}."
+            ) from error
+    return pairs
 
 
 def safe_ratio(numerator: float, denominator: float) -> float:
@@ -93,8 +120,11 @@ def discover_tasks(
     grids: Sequence[int],
     ablations: Sequence[str],
     checkpoint_kinds: Sequence[str],
+    frequencies: Sequence[int] | None = None,
+    excluded_grid_frequencies: set[tuple[int, int]] | None = None,
 ) -> List[Dict[str, Any]]:
     tasks: List[Dict[str, Any]] = []
+    excluded_grid_frequencies = excluded_grid_frequencies or set()
     if not qtable_root.exists():
         raise FileNotFoundError(f"Q-table root does not exist: {qtable_root}")
 
@@ -110,8 +140,14 @@ def discover_tasks(
             checkpoint_summary = json.load(file)
 
         grid_num = int(hyper_parameters["grid_num"])
+        decision_freq = int(hyper_parameters["decision_freq"])
         ablation_name = hyper_parameters.get("ablation_name", experiment_dir.name)
-        if grid_num not in grids or ablation_name not in ablations:
+        if (
+            grid_num not in grids
+            or (frequencies is not None and decision_freq not in frequencies)
+            or (grid_num, decision_freq) in excluded_grid_frequencies
+            or ablation_name not in ablations
+        ):
             continue
 
         seen_paths = set()
@@ -143,6 +179,8 @@ def discover_tasks(
         raise RuntimeError(
             "No Q-table tasks matched the requested filters. "
             f"root={qtable_root}, grids={list(grids)}, "
+            f"frequencies={None if frequencies is None else list(frequencies)}, "
+            f"excluded_grid_frequencies={sorted(excluded_grid_frequencies)}, "
             f"ablations={list(ablations)}, checkpoints={list(checkpoint_kinds)}"
         )
     return tasks
@@ -155,6 +193,13 @@ def validate_task_sample_scope(
     """Fail fast when checkpoint training data and evaluation data differ."""
     for task in tasks:
         hyper_parameters = task["hyper_parameters"]
+        if hyper_parameters.get("driver_service_start") != DRIVER_SERVICE_START or (
+            hyper_parameters.get("driver_service_end") != DRIVER_SERVICE_END
+        ):
+            raise ValueError(
+                "Evaluation requires a corrected 06:00-21:00 Q-table; "
+                f"checkpoint={task['qtable_path']}."
+            )
         training_ratio = hyper_parameters.get("scenario_sample_ratio")
         sampling_scheme = hyper_parameters.get("sampling_scheme")
         if scenario_sample_ratio is None:
@@ -201,6 +246,7 @@ def load_test_data(
         raise FileNotFoundError(f"Missing node-to-grid mapping: {mapping_path}")
 
     driver_info = pd.read_pickle(driver_path)
+    service_window_metadata(driver_info, driver_path)
     if len(driver_info) < driver_num:
         raise ValueError(
             f"Requested {driver_num} drivers, but {driver_path} contains only {len(driver_info)}"
@@ -251,6 +297,67 @@ def matched_orders(simulator: Simulator) -> pd.DataFrame:
     return pd.DataFrame(columns=simulator.request_columns)
 
 
+def driver_supply_by_grid(simulator: Simulator) -> pd.DataFrame:
+    """Snapshot the dispatch-time driver supply for every grid."""
+    grid_ids = pd.Index(range(simulator.grid_num), name="grid_id")
+    drivers = simulator.driver_table
+    status_by_grid = pd.crosstab(drivers["grid_id"], drivers["status"]).reindex(
+        index=grid_ids,
+        columns=[0, 1, 2, 4],
+        fill_value=0,
+    )
+    result = pd.DataFrame(index=grid_ids)
+    result["online_driver_num"] = (
+        drivers.groupby("grid_id").size().reindex(grid_ids, fill_value=0)
+    )
+    result["dispatchable_driver_num"] = status_by_grid[0] + status_by_grid[4]
+    result["cruising_driver_num"] = status_by_grid[0]
+    result["delivery_driver_num"] = status_by_grid[1]
+    result["pickup_driver_num"] = status_by_grid[2]
+    result["repositioning_driver_num"] = status_by_grid[4]
+    return result.reset_index().astype({column: int for column in result.reset_index().columns})
+
+
+def minute_grid_metrics(
+    simulator: Simulator,
+    date: str,
+    seed: int,
+    steps_run: int,
+    supply_snapshots: Sequence[pd.DataFrame],
+) -> pd.DataFrame:
+    """Flatten the environment's minute x grid evaluation table to CSV rows."""
+    if len(supply_snapshots) != steps_run:
+        raise AssertionError(
+            f"Expected {steps_run} driver-supply snapshots, got {len(supply_snapshots)}"
+        )
+    columns = list(simulator.evaluate_df.columns)
+    values = simulator.evaluate_table[:steps_run].reshape(-1, len(columns))
+    frame = pd.DataFrame(values, columns=columns)
+    frame = frame.rename(columns={"origin_grid_id": "grid_id"})
+    frame["grid_id"] = frame["grid_id"].astype(int)
+
+    minute_indexes = np.repeat(np.arange(steps_run, dtype=int), simulator.grid_num)
+    seconds = simulator.t_initial + minute_indexes * simulator.delta_t
+    frame.insert(0, "test_date", date)
+    frame.insert(1, "seed", int(seed))
+    frame.insert(2, "minute_index", minute_indexes)
+    frame.insert(
+        3,
+        "clock_time",
+        [
+            f"{int(second // 3600):02d}:{int(second % 3600 // 60):02d}:"
+            f"{int(second % 60):02d}"
+            for second in seconds
+        ],
+    )
+
+    supply = pd.concat(
+        [snapshot.assign(minute_index=index) for index, snapshot in enumerate(supply_snapshots)],
+        ignore_index=True,
+    )
+    return frame.merge(supply, on=["minute_index", "grid_id"], how="left", validate="one_to_one")
+
+
 def collect_metrics(
     simulator: Simulator,
     orders: pd.DataFrame,
@@ -263,7 +370,7 @@ def collect_metrics(
             "Per-date matched-order record is inconsistent with the simulator counter: "
             f"record={len(orders)}, counter={matched_num}, date={date}"
         )
-    total_requests = float(simulator.total_request_num)
+    total_requests = int(round(float(simulator.total_request_num)))
 
     if matched_num:
         average_order_revenue = float(orders["designed_reward"].mean())
@@ -284,6 +391,13 @@ def collect_metrics(
         average_service_minutes = 0.0
         cross_grid_ratio = 0.0
 
+    long_num = int(round(float(simulator.long_requests_num)))
+    medium_num = int(round(float(simulator.medium_requests_num)))
+    short_num = int(round(float(simulator.short_requests_num)))
+    matched_long_num = int(round(float(simulator.matched_long_requests_num)))
+    matched_medium_num = int(round(float(simulator.matched_medium_requests_num)))
+    matched_short_num = int(round(float(simulator.matched_short_requests_num)))
+
     return {
         "test_date": date,
         "seed": seed,
@@ -299,21 +413,15 @@ def collect_metrics(
         "cross_grid_ratio": cross_grid_ratio,
         "occupancy_rate": float(simulator.occupancy_rate),
         "occupancy_rate_no_pickup": float(simulator.occupancy_rate_no_pickup),
-        "long_request_num": float(simulator.long_requests_num),
-        "medium_request_num": float(simulator.medium_requests_num),
-        "short_request_num": float(simulator.short_requests_num),
-        "matched_long_request_num": float(simulator.matched_long_requests_num),
-        "matched_medium_request_num": float(simulator.matched_medium_requests_num),
-        "matched_short_request_num": float(simulator.matched_short_requests_num),
-        "matched_long_request_ratio": safe_ratio(
-            simulator.matched_long_requests_num, simulator.long_requests_num
-        ),
-        "matched_medium_request_ratio": safe_ratio(
-            simulator.matched_medium_requests_num, simulator.medium_requests_num
-        ),
-        "matched_short_request_ratio": safe_ratio(
-            simulator.matched_short_requests_num, simulator.short_requests_num
-        ),
+        "long_request_num": long_num,
+        "medium_request_num": medium_num,
+        "short_request_num": short_num,
+        "matched_long_request_num": matched_long_num,
+        "matched_medium_request_num": matched_medium_num,
+        "matched_short_request_num": matched_short_num,
+        "matched_long_request_ratio": safe_ratio(matched_long_num, long_num),
+        "matched_medium_request_ratio": safe_ratio(matched_medium_num, medium_num),
+        "matched_short_request_ratio": safe_ratio(matched_short_num, short_num),
     }
 
 
@@ -330,6 +438,45 @@ def summarize_metrics(daily_metrics: pd.DataFrame) -> pd.DataFrame:
         row.update(values.to_dict())
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+def aggregate_metrics(daily_metrics: pd.DataFrame) -> pd.DataFrame:
+    """Return pooled count-based match ratios across all evaluation dates."""
+    totals = {
+        column: int(daily_metrics[column].sum())
+        for column in (
+            "total_request_num",
+            "matched_request_num",
+            "long_request_num",
+            "medium_request_num",
+            "short_request_num",
+            "matched_long_request_num",
+            "matched_medium_request_num",
+            "matched_short_request_num",
+        )
+    }
+    return pd.DataFrame(
+        [
+            {
+                "evaluation_day_num": int(len(daily_metrics)),
+                "total_reward_sum": float(daily_metrics["total_reward"].sum()),
+                "total_reward_mean": float(daily_metrics["total_reward"].mean()),
+                **totals,
+                "matched_request_ratio_pooled": safe_ratio(
+                    totals["matched_request_num"], totals["total_request_num"]
+                ),
+                "matched_long_request_ratio_pooled": safe_ratio(
+                    totals["matched_long_request_num"], totals["long_request_num"]
+                ),
+                "matched_medium_request_ratio_pooled": safe_ratio(
+                    totals["matched_medium_request_num"], totals["medium_request_num"]
+                ),
+                "matched_short_request_ratio_pooled": safe_ratio(
+                    totals["matched_short_request_num"], totals["short_request_num"]
+                ),
+            }
+        ]
+    )
 
 
 def evaluate_task(
@@ -357,6 +504,7 @@ def evaluate_task(
         "method": "rl",
         "driver_num": driver_num,
         "order_sample_ratio": order_sample_ratio,
+        "dynamic_edge_weight_mode": "conflict_only_rank",
         "load_path": str(qtable_path),
     }
     score_agent = SarsaAgent(**config)
@@ -378,9 +526,13 @@ def evaluate_task(
     if simulator.dynamic_matching_agent is not None:
         raise AssertionError("Dynamic matching agent must be disabled for Q-table evaluation")
 
+    ablation_code = ABLATION_CODES.get(
+        task["ablation_name"], str(task["ablation_name"])[:8]
+    )
+    checkpoint_code = "b" if task["checkpoint_kind"] == "best" else "f"
     task_name = (
-        f"grid_{grid_num}_freq_{config['decision_freq']}_"
-        f"{task['ablation_name']}_{task['checkpoint_kind']}_epoch_{task['checkpoint_epoch']}"
+        f"g{grid_num}_f{config['decision_freq']}_{ablation_code}_"
+        f"{checkpoint_code}_e{task['checkpoint_epoch']}"
     )
     task_output = output_root / task_name
     task_output.mkdir(parents=True, exist_ok=True)
@@ -393,6 +545,7 @@ def evaluate_task(
     daily_rows = []
     evaluate_sum = None
     reward_by_grid_rows = []
+    minute_grid_frames = []
     for index, date in enumerate(test_dates):
         seed = int(seeds[index % len(seeds)])
         np.random.seed(seed)
@@ -407,7 +560,9 @@ def evaluate_task(
         steps_to_run = simulator.finish_run_step
         if max_steps is not None:
             steps_to_run = min(steps_to_run, max_steps)
+        supply_snapshots = []
         for _ in range(steps_to_run):
+            supply_snapshots.append(driver_supply_by_grid(simulator))
             simulator.rl_step()
 
         orders = matched_orders(simulator)
@@ -432,19 +587,30 @@ def evaluate_task(
             {f"grid_{grid_id}": float(value) for grid_id, value in simulator.total_reward_by_grid.items()}
         )
         reward_by_grid_rows.append(reward_row)
+        minute_grid_frames.append(
+            minute_grid_metrics(
+                simulator, date, seed, steps_to_run, supply_snapshots
+            )
+        )
 
         if save_orders:
-            orders.to_csv(task_output / f"matched_orders_{date}_seed_{seed}.csv", index=False)
+            date_code = date.replace("-", "")
+            orders.to_csv(task_output / f"ord_{date_code}_s{seed}.csv", index=False)
 
     if not np.array_equal(original_qtable, np.asarray(score_agent.q_value_table)):
         raise AssertionError(f"Q-table changed during frozen evaluation: {qtable_path}")
 
     daily_metrics = pd.DataFrame(daily_rows)
     summary_metrics = summarize_metrics(daily_metrics)
+    pooled_metrics = aggregate_metrics(daily_metrics)
     daily_metrics.to_csv(task_output / "daily_metrics.csv", index=False)
     summary_metrics.to_csv(task_output / "summary_metrics.csv", index=False)
+    pooled_metrics.to_csv(task_output / "aggregate_metrics.csv", index=False)
     pd.DataFrame(reward_by_grid_rows).to_csv(
         task_output / "daily_reward_by_grid.csv", index=False
+    )
+    pd.concat(minute_grid_frames, ignore_index=True).to_csv(
+        task_output / "minute_grid_metrics.csv", index=False
     )
     np.save(task_output / "mean_evaluate_table.npy", evaluate_sum / len(test_dates))
 
@@ -475,6 +641,7 @@ def evaluate_task(
 
     mean_values = summary_metrics.loc[summary_metrics["statistic"] == "mean"].iloc[0]
     std_values = summary_metrics.loc[summary_metrics["statistic"] == "std"].iloc[0]
+    pooled_values = pooled_metrics.iloc[0]
     return {
         "task_name": task_name,
         "grid_num": grid_num,
@@ -486,6 +653,10 @@ def evaluate_task(
         "test_gmv_mean": float(mean_values["total_reward"]),
         "test_gmv_std": float(std_values["total_reward"]),
         "test_match_rate_mean": float(mean_values["matched_request_ratio"]),
+        "test_match_rate_pooled": float(pooled_values["matched_request_ratio_pooled"]),
+        "test_long_match_rate_mean": float(mean_values["matched_long_request_ratio"]),
+        "test_medium_match_rate_mean": float(mean_values["matched_medium_request_ratio"]),
+        "test_short_match_rate_mean": float(mean_values["matched_short_request_ratio"]),
         "test_average_order_revenue_mean": float(mean_values["average_order_revenue"]),
         "test_average_service_minutes_mean": float(mean_values["average_service_minutes"]),
         "qtable_path": str(qtable_path),
@@ -506,7 +677,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--qtable-root",
-        default="dynamic_matching/qtable_state_6to21_sample030_stratified",
+        default="dynamic_matching/qtable_state_6to21_driver0621_sample030_stratified",
         help="Directory containing experiment folders with hyper_parameters.json.",
     )
     parser.add_argument(
@@ -516,10 +687,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--output-dir",
-        default="dynamic_matching/qtable_test_results_6to21_sample030_stratified",
+        default="dynamic_matching/qtable_test_results_6to21_driver0621_sample030_stratified",
         help="Directory for CSV/NPY evaluation results.",
     )
     parser.add_argument("--grids", default="8,35,63", help="Comma-separated grid numbers.")
+    parser.add_argument(
+        "--frequencies",
+        default="5,10,20,30",
+        help="Comma-separated Q-table decision frequencies.",
+    )
+    parser.add_argument(
+        "--exclude-grid-frequencies",
+        default="",
+        help=(
+            "Comma-separated grid:frequency pairs to omit, for example "
+            "8:10,8:30 when those results already exist."
+        ),
+    )
     parser.add_argument(
         "--ablations",
         default=",".join(DEFAULT_ABLATIONS),
@@ -587,6 +771,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Debug only: stop each date early. Omit for valid full-day evaluation.",
     )
+    parser.add_argument(
+        "--merge-existing",
+        action="store_true",
+        help=(
+            "Merge newly evaluated task rows into an existing non-sharded "
+            "qtable_test_summary.csv instead of replacing its rows. The existing "
+            "evaluation manifest must use the same data, dates, seeds, checkpoints, "
+            "and driver hash."
+        ),
+    )
     return parser
 
 
@@ -596,6 +790,10 @@ def main() -> None:
     data_root = resolve_path(args.data_root)
     output_root = resolve_path(args.output_dir)
     grids = parse_csv_ints(args.grids)
+    frequencies = parse_csv_ints(args.frequencies)
+    excluded_grid_frequencies = parse_grid_frequency_pairs(
+        args.exclude_grid_frequencies
+    )
     ablations = parse_csv_strings(args.ablations)
     checkpoints = parse_csv_strings(args.checkpoints)
     test_dates = parse_csv_strings(args.test_dates)
@@ -608,6 +806,20 @@ def main() -> None:
         raise ValueError("At least one test date is required")
     if not seeds:
         raise ValueError("At least one seed is required")
+    if not frequencies or any(value not in (5, 10, 20, 30) for value in frequencies):
+        raise ValueError("frequencies must be a non-empty subset of 5,10,20,30")
+    invalid_exclusions = excluded_grid_frequencies - {
+        (grid_num, decision_freq)
+        for grid_num in grids
+        for decision_freq in frequencies
+    }
+    if invalid_exclusions:
+        raise ValueError(
+            "Excluded grid/frequency pairs must belong to the requested matrix; "
+            f"invalid={sorted(invalid_exclusions)}"
+        )
+    if args.merge_existing and args.num_shards != 1:
+        raise ValueError("--merge-existing cannot be combined with sharding")
     if args.driver_num <= 0:
         raise ValueError("driver-num must be positive")
     scenario_sample_ratio = None if args.full_sample else args.scenario_sample_ratio
@@ -624,7 +836,14 @@ def main() -> None:
     if args.max_steps is not None and args.max_steps <= 0:
         raise ValueError("max-steps must be positive when provided")
 
-    tasks = discover_tasks(qtable_root, grids, ablations, checkpoints)
+    tasks = discover_tasks(
+        qtable_root,
+        grids,
+        ablations,
+        checkpoints,
+        frequencies=frequencies,
+        excluded_grid_frequencies=excluded_grid_frequencies,
+    )
     tasks = tasks[args.shard_index::args.num_shards]
     if not tasks:
         raise RuntimeError(
@@ -643,6 +862,16 @@ def main() -> None:
     request_dict, driver_info_by_grid, mapping_dict, road_network = load_test_data(
         data_root, test_dates, grids, args.driver_num, scenario_sample_ratio
     )
+    driver_path = data_root / "drivers_grid35_1000.pickle"
+    driver_metadata = service_window_metadata(pd.read_pickle(driver_path), driver_path)
+    for task in tasks:
+        trained_hash = task["hyper_parameters"].get("driver_data_sha256")
+        if trained_hash != driver_metadata["driver_data_sha256"]:
+            raise ValueError(
+                "Q-table driver-data hash does not match evaluation data: "
+                f"checkpoint={task['qtable_path']}, trained={trained_hash}, "
+                f"evaluation={driver_metadata['driver_data_sha256']}."
+            )
     output_root.mkdir(parents=True, exist_ok=True)
 
     worker_kwargs = {
@@ -686,6 +915,54 @@ def main() -> None:
         summary_filename = (
             f"qtable_test_summary_shard_{args.shard_index}_of_{args.num_shards}.csv"
         )
+    existing_manifest = None
+    if args.merge_existing:
+        existing_summary_path = output_root / summary_filename
+        existing_manifest_path = output_root / "evaluation_manifest.json"
+        if not existing_summary_path.exists() or not existing_manifest_path.exists():
+            raise FileNotFoundError(
+                "--merge-existing requires both qtable_test_summary.csv and "
+                f"evaluation_manifest.json under {output_root}."
+            )
+        existing_results = pd.read_csv(existing_summary_path)
+        missing_columns = set(master_results.columns) - set(existing_results.columns)
+        if missing_columns:
+            raise ValueError(
+                "Existing Q-table summary uses an incompatible schema; "
+                f"missing columns={sorted(missing_columns)}"
+            )
+        with existing_manifest_path.open("r", encoding="utf-8") as file:
+            existing_manifest = json.load(file)
+        expected_existing = {
+            "sample_scope": (
+                "full_original_orders"
+                if scenario_sample_ratio is None
+                else f"fixed_stratified_{int(round(100 * scenario_sample_ratio))}pct"
+            ),
+            "scenario_sample_ratio": scenario_sample_ratio,
+            "test_dates": test_dates,
+            "seeds": [
+                int(seeds[index % len(seeds)]) for index in range(len(test_dates))
+            ],
+            "checkpoint_kinds": checkpoints,
+            "driver_data_sha256": driver_metadata["driver_data_sha256"],
+        }
+        for key, expected_value in expected_existing.items():
+            if existing_manifest.get(key) != expected_value:
+                raise ValueError(
+                    "Existing evaluation manifest is incompatible with this "
+                    f"incremental run for {key}: existing={existing_manifest.get(key)!r}, "
+                    f"requested={expected_value!r}."
+                )
+        master_results = (
+            pd.concat([existing_results[master_results.columns], master_results])
+            .drop_duplicates(subset=["task_name"], keep="last")
+            .sort_values(
+                ["grid_num", "decision_freq", "checkpoint_kind"],
+                ascending=[True, True, True],
+            )
+            .reset_index(drop=True)
+        )
     master_results.to_csv(output_root / summary_filename, index=False)
     evaluation_manifest = {
         "experiment": "frozen_best_qtable_evaluation",
@@ -701,10 +978,43 @@ def main() -> None:
         "seeds": [int(seeds[index % len(seeds)]) for index in range(len(test_dates))],
         "checkpoint_kinds": checkpoints,
         "grids": grids,
+        "frequencies": frequencies,
+        "excluded_grid_frequencies": [
+            f"{grid_num}:{decision_freq}"
+            for grid_num, decision_freq in sorted(excluded_grid_frequencies)
+        ],
         "workers": min(args.workers, len(tasks)),
         "task_count": len(tasks),
         "complete_day_required": args.max_steps is None,
+        **driver_metadata,
     }
+    if args.merge_existing:
+        evaluation_manifest.update(
+            {
+                "grids": sorted(
+                    set(existing_manifest.get("grids", []))
+                    | set(int(value) for value in grids)
+                ),
+                "frequencies": sorted(
+                    set(existing_manifest.get("frequencies", []))
+                    | set(int(value) for value in frequencies)
+                ),
+                "excluded_grid_frequencies": [],
+                "task_count": int(len(master_results)),
+                "merged_existing": True,
+                "latest_incremental_run": {
+                    "grids": grids,
+                    "frequencies": frequencies,
+                    "excluded_grid_frequencies": [
+                        f"{grid_num}:{decision_freq}"
+                        for grid_num, decision_freq in sorted(
+                            excluded_grid_frequencies
+                        )
+                    ],
+                    "task_count": len(tasks),
+                },
+            }
+        )
     manifest_filename = "evaluation_manifest.json"
     if args.num_shards > 1:
         manifest_filename = (

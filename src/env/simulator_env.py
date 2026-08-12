@@ -139,6 +139,18 @@ class Simulator:
         self.experiment_mode = kwargs.get('experiment_mode', 'train_value')
         self.pickup_mode = kwargs.get('pickup_mode', 'ma')
         self.method = kwargs.get('method', 'd')
+        self.dynamic_edge_weight_mode = kwargs.get(
+            'dynamic_edge_weight_mode', 'raw'
+        )
+        if self.dynamic_edge_weight_mode not in {
+            'raw', 'rank', 'rank_only', 'conflict_only_rank',
+            'raw_cardinality'
+        }:
+            raise ValueError(
+                'dynamic_edge_weight_mode must be raw, rank, rank_only, '
+                'conflict_only_rank, or raw_cardinality; '
+                f'got {self.dynamic_edge_weight_mode!r}.'
+            )
         # dispatch method
         self.dispatch_method = 'LD'
 
@@ -935,8 +947,6 @@ class Simulator:
                     wait_info['order_id'] = wait_info['order_id'].astype(float)
                     wait_info = pd.merge(wait_info, self.mapping_dict[self.experiment_date], how='left', on='order_id')
 
-                dynamic_matching_array = np.zeros(len(sampled_requests)) + 0.01
-
                 self.temp_total_request_record = pd.concat([self.temp_total_request_record, wait_info], axis=0,
                                                            ignore_index=True)
 
@@ -1008,42 +1018,20 @@ class Simulator:
                                 pass
 
                 elif self.rl_mode in ['dynamic_matching', 'heuristic_matching']:
-
-                    for i, (travel_time, reward, dest_grid_id, origin_grid_id) in enumerate(zip(
-                            wait_info['trip_time'].values.tolist(),
-                            wait_info['designed_reward'].values.tolist(),
-                            wait_info['dest_grid_id'].values.tolist(),
-                            wait_info['origin_grid_id'])):
-                        if self.rl_mode == 'dynamic_matching':
-                            matching_method = self.held_action_tuple[0][int(origin_grid_id)]
-                        elif self.rl_mode == 'heuristic_matching':
-                            matching_method = self.strategy_vector[int(origin_grid_id)]
-
-                        if matching_method == 0:  # instant reward
-                            weight_array[i] = reward
-                            dynamic_matching_array[i] = 0
-
-                        elif matching_method == 1:  # pickup distance
-                            # 如果在这里计算distance 会比较麻烦 所以还是放到order dynamic dispatch中去计算
-                            # 所以采用distanc的order 此时权重为1
-                            # 需要在order dynamic dispatch中找到这些order 并将权重替换为相应的distance
-                            dynamic_matching_array[i] = 1
-                            pass
-                        else:  # Q-table
-                            # Action 2 is evaluated for every feasible
-                            # order-driver edge inside ``order_dispatch``. The
-                            # actual pickup distance is unavailable while an
-                            # order is entering the queue, so any Q-table score
-                            # computed here would be approximate and stale.
-                            weight_array[i] = reward
-                            dynamic_matching_array[i] = 2
+                    # Dynamic actions are intentionally not persisted on an
+                    # order.  At every dispatch scan the current per-grid
+                    # action is resolved from the order's origin grid, so a
+                    # decision-boundary switch applies immediately to the
+                    # complete waiting backlog.  ``designed_reward`` remains
+                    # the neutral stored score used by action 0; actions 1/2
+                    # replace it with candidate-level scores in order_dispatch.
+                    weight_array = wait_info['designed_reward'].to_numpy(dtype=float)
 
                 elif self.rl_mode == 'reposition':
                     pass
                     # 权重在order matching中计算
                     # 统一使用distance
 
-                wait_info['dynamic_matching_array'] = dynamic_matching_array
                 wait_info['weight'] = weight_array
                 wait_info['wait_time'] = 0
                 wait_info['status'] = 0
@@ -1295,7 +1283,9 @@ class Simulator:
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
                                                                         self.dispatch_method, self.method,
-                                                                        advantage_context=self._matching_value_context())
+                                                                        advantage_context=self._matching_value_context(),
+                                                                        dynamic_actions=self._current_dynamic_matching_actions(),
+                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode)
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -1318,12 +1308,13 @@ class Simulator:
         self.matched_requests_num += len(df_new_matched_requests)
 
         # 在这里对完成匹配的数据进行聚合分析
-        if len(df_new_matched_requests) > 0:
-            self.evaluate_df = calculate_evaluate_table(self.grid_num, wait_requests, df_new_matched_requests)
-            self.evaluate_table[self.current_step] = self.evaluate_df.values
-        else:
-            # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
-            self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
+        # Record demand even in minutes with no successful match.  Writing an
+        # all-zero row here used to erase the waiting-order denominator and
+        # made minute/grid demand and match-rate exports incorrect.
+        self.evaluate_df = calculate_evaluate_table(
+            self.grid_num, wait_requests, df_new_matched_requests
+        )
+        self.evaluate_table[self.current_step] = self.evaluate_df.values
 
         self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
         self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 2].shape[0]
@@ -1378,7 +1369,9 @@ class Simulator:
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
                                                                         self.dispatch_method, self.method,
-                                                                        advantage_context=self._matching_value_context())
+                                                                        advantage_context=self._matching_value_context(),
+                                                                        dynamic_actions=self._current_dynamic_matching_actions(),
+                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode)
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -1398,12 +1391,10 @@ class Simulator:
         self.matched_requests_num += len(df_new_matched_requests)
 
         # 在这里对完成匹配的数据进行聚合分析
-        if len(df_new_matched_requests) > 0:
-            self.evaluate_df = calculate_evaluate_table(self.grid_num, wait_requests, df_new_matched_requests)
-            self.evaluate_table[self.current_step] = self.evaluate_df.values
-        else:
-            # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
-            self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
+        self.evaluate_df = calculate_evaluate_table(
+            self.grid_num, wait_requests, df_new_matched_requests
+        )
+        self.evaluate_table[self.current_step] = self.evaluate_df.values
 
         self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
         self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 2].shape[0]
@@ -1475,6 +1466,19 @@ class Simulator:
             'reward_mode': self.reward_discount_mode,
             'idle_comparison_interval_seconds': self.idle_comparison_interval_seconds,
         }
+
+    def _current_dynamic_matching_actions(self):
+        """Return the action vector that applies to the current dispatch scan."""
+        if self.method != 'dynamic_matching':
+            return None
+        if self.rl_mode == 'heuristic_matching':
+            return self.strategy_vector
+        if self.rl_mode == 'dynamic_matching':
+            return self.held_action_tuple[0]
+        raise RuntimeError(
+            "method='dynamic_matching' requires rl_mode='dynamic_matching' "
+            "or rl_mode='heuristic_matching'."
+        )
 
     def _record_matching_value_diagnostics(self, context):
         if (context is None or self.matching_score_mode not in {
@@ -2414,6 +2418,8 @@ class Simulator:
             self.dispatch_method,
             self.method,
             advantage_context=value_context,
+            dynamic_actions=self._current_dynamic_matching_actions(),
+            dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
         )
         self._record_matching_value_diagnostics(value_context)
 
@@ -2442,12 +2448,10 @@ class Simulator:
             self.reward_by_grid_df += matched_requests_li
 
         # 在这里对完成匹配的数据进行聚合分析
-        if len(df_new_matched_requests) > 0:
-            self.evaluate_df = calculate_evaluate_table(self.grid_num, wait_requests, df_new_matched_requests)
-            self.evaluate_table[self.current_step] = self.evaluate_df.values
-        else:
-            # self.evaluate_df = calculate_evaluate_table_no_matched(wait_requests)
-            self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
+        self.evaluate_df = calculate_evaluate_table(
+            self.grid_num, wait_requests, df_new_matched_requests
+        )
+        self.evaluate_table[self.current_step] = self.evaluate_df.values
 
         # Andrew: Update on-trip driver count and occupancy rate
         self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
@@ -2597,7 +2601,9 @@ class Simulator:
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(wait_requests, driver_table,
                                                                         self.maximal_pickup_distance,
                                                                         self.dispatch_method, self.method,
-                                                                        advantage_context=self._matching_value_context())
+                                                                        advantage_context=self._matching_value_context(),
+                                                                        dynamic_actions=self._current_dynamic_matching_actions(),
+                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode)
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -2623,6 +2629,14 @@ class Simulator:
         self.reward_by_grid_df += matched_requests_li
 
         self.matched_requests_num += len(df_new_matched_requests)
+
+        # Keep the minute-by-grid diagnostic table complete for externally
+        # controlled COMA evaluation.  ``wait_requests`` is the dispatch-time
+        # backlog, so zero-match minutes retain their demand denominators.
+        self.evaluate_df = calculate_evaluate_table(
+            self.grid_num, wait_requests, df_new_matched_requests
+        )
+        self.evaluate_table[self.current_step] = self.evaluate_df.values
 
         if self.end_of_episode == 0:
             self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0)
@@ -2751,7 +2765,9 @@ class Simulator:
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(
             wait_requests, driver_table,
             self.maximal_pickup_distance,
-            self.dispatch_method, self.method
+            self.dispatch_method, self.method,
+            dynamic_actions=self._current_dynamic_matching_actions(),
+            dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
         )
 
         # Step 2: driver/passenger reaction
@@ -2818,7 +2834,9 @@ class Simulator:
         matched_pair_actual_indexes, matched_itinerary = order_dispatch(
             wait_requests, driver_table,
             self.maximal_pickup_distance,
-            self.dispatch_method, self.method
+            self.dispatch_method, self.method,
+            dynamic_actions=self._current_dynamic_matching_actions(),
+            dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
         )
 
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
@@ -2834,11 +2852,10 @@ class Simulator:
 
         self.matched_requests_num += len(df_new_matched_requests)
 
-        if len(df_new_matched_requests) > 0:
-            self.evaluate_df = calculate_evaluate_table(self.grid_num, wait_requests, df_new_matched_requests)
-            self.evaluate_table[self.current_step] = self.evaluate_df.values
-        else:
-            self.evaluate_table[self.current_step] = np.zeros_like(self.evaluate_df.values)
+        self.evaluate_df = calculate_evaluate_table(
+            self.grid_num, wait_requests, df_new_matched_requests
+        )
+        self.evaluate_table[self.current_step] = self.evaluate_df.values
 
         self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 1].shape[0]
         self.cumulative_on_trip_driver_num += self.driver_table[self.driver_table['status'] == 2].shape[0]

@@ -491,8 +491,14 @@ def sample_all_drivers(driver_info, t_initial, t_end, driver_sample_ratio=1, dri
     else:
         sampled_driver_info = new_driver_info
     sampled_driver_info['status'] = 3
-    loc_con = (sampled_driver_info['start_time'] >= t_initial) & (sampled_driver_info['start_time'] <= t_end)
-    sampled_driver_info.loc[loc_con, 'status'] = 0
+    # A driver is online at reset when its shift already started and has not
+    # ended.  The historical condition used ``start_time >= t_initial`` and
+    # incorrectly hid drivers whose shifts began before the experiment.
+    online_at_reset = (
+        (sampled_driver_info['start_time'] <= t_initial)
+        & (sampled_driver_info['end_time'] > t_initial)
+    )
+    sampled_driver_info.loc[online_at_reset, 'status'] = 0
     sampled_driver_info['target_loc_lng'] = sampled_driver_info['lng']
     sampled_driver_info['target_loc_lat'] = sampled_driver_info['lat']
     sampled_driver_info['target_grid_id'] = sampled_driver_info['grid_id']
@@ -558,9 +564,221 @@ def discounted_reward_uniform(reward, elapsed_seconds, gamma, time_unit_seconds)
     return result
 
 
+def _rank_dynamic_edge_weights(raw_weights, order_origin_grids, dynamic_methods,
+                               order_ids, driver_ids):
+    """Map heterogeneous dynamic scores to within-strategy percentiles.
+
+    Each action keeps its own edge ordering inside an origin grid.  A common
+    cardinality base removes the arbitrary cross-action numerical scale while
+    making an additional feasible match more valuable than all percentile
+    tie-breaks in a solution combined.
+    """
+    raw_weights = np.asarray(raw_weights, dtype=float)
+    order_origin_grids = np.asarray(order_origin_grids, dtype=np.int64)
+    dynamic_methods = np.asarray(dynamic_methods, dtype=np.int64)
+    if not (
+        raw_weights.shape == order_origin_grids.shape == dynamic_methods.shape
+    ):
+        raise ValueError('Dynamic rank inputs must have identical shapes.')
+    if raw_weights.ndim != 1:
+        raise ValueError('Dynamic rank inputs must be one-dimensional.')
+    if raw_weights.size == 0:
+        return raw_weights.copy(), 1.0
+
+    frame = pd.DataFrame({
+        'raw_weight': raw_weights,
+        'order_grid': order_origin_grids,
+        'action': dynamic_methods,
+    })
+    percentiles = frame.groupby(
+        ['order_grid', 'action'], sort=False
+    )['raw_weight'].rank(method='average', pct=True).to_numpy(dtype=float)
+    cardinality_base = float(
+        min(len(np.unique(order_ids)), len(np.unique(driver_ids))) + 1
+    )
+    return cardinality_base + percentiles, cardinality_base
+
+
+def _candidate_bipartite_component_ids(order_ids, driver_ids):
+    """Return one connected-component id for every candidate edge.
+
+    Order and driver identifiers occupy separate node namespaces even when
+    their numeric values happen to coincide.  Components are computed on the
+    exact feasible bipartite graph sent to the matching solver.
+    """
+    order_ids = np.asarray(order_ids)
+    driver_ids = np.asarray(driver_ids)
+    if order_ids.shape != driver_ids.shape:
+        raise ValueError('Candidate order and driver ids must have identical shapes.')
+    if order_ids.ndim != 1:
+        raise ValueError('Candidate order and driver ids must be one-dimensional.')
+    if order_ids.size == 0:
+        return np.asarray([], dtype=np.int64)
+
+    _, order_nodes = np.unique(order_ids, return_inverse=True)
+    _, driver_nodes = np.unique(driver_ids, return_inverse=True)
+    order_count = int(order_nodes.max()) + 1
+    driver_nodes = driver_nodes + order_count
+    node_count = order_count + int(driver_nodes.max() - order_count) + 1
+    parent = np.arange(node_count, dtype=np.int64)
+    sizes = np.ones(node_count, dtype=np.int64)
+
+    def find(node):
+        node = int(node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = int(parent[node])
+        return node
+
+    for order_node, driver_node in zip(order_nodes, driver_nodes):
+        order_root = find(order_node)
+        driver_root = find(driver_node)
+        if order_root == driver_root:
+            continue
+        if sizes[order_root] < sizes[driver_root]:
+            order_root, driver_root = driver_root, order_root
+        parent[driver_root] = order_root
+        sizes[order_root] += sizes[driver_root]
+
+    roots = np.fromiter(
+        (find(order_node) for order_node in order_nodes),
+        dtype=np.int64,
+        count=order_ids.size,
+    )
+    _, component_ids = np.unique(roots, return_inverse=True)
+    return component_ids.astype(np.int64, copy=False)
+
+
+def _conflict_only_rank_dynamic_edge_weights(
+        raw_weights, order_origin_grids, dynamic_methods, order_ids, driver_ids):
+    """Rank only components in which two or more actions truly compete.
+
+    Pure-action components retain their raw scores exactly.  In a mixed
+    component, each ``origin-grid x action`` group is mapped monotonically to
+    average-tie percentiles within that component.  This preserves all-action
+    policies (especially direct Q-table action 2) while neutralizing arbitrary
+    score scales only where shared graph nodes create cross-action conflict.
+    """
+    raw_weights = np.asarray(raw_weights, dtype=float)
+    order_origin_grids = np.asarray(order_origin_grids, dtype=np.int64)
+    dynamic_methods = np.asarray(dynamic_methods, dtype=np.int64)
+    order_ids = np.asarray(order_ids)
+    driver_ids = np.asarray(driver_ids)
+    if not (
+        raw_weights.shape
+        == order_origin_grids.shape
+        == dynamic_methods.shape
+        == order_ids.shape
+        == driver_ids.shape
+    ):
+        raise ValueError('Conflict-only rank inputs must have identical shapes.')
+    if raw_weights.ndim != 1:
+        raise ValueError('Conflict-only rank inputs must be one-dimensional.')
+    if raw_weights.size == 0:
+        empty = np.asarray([], dtype=np.int64)
+        return raw_weights.copy(), empty, np.asarray([], dtype=bool)
+    component_ids = _candidate_bipartite_component_ids(order_ids, driver_ids)
+    frame = pd.DataFrame({
+        'component': component_ids,
+        'raw_weight': raw_weights,
+        'order_grid': order_origin_grids,
+        'action': dynamic_methods,
+    })
+    action_counts = frame.groupby(
+        'component', sort=False
+    )['action'].nunique()
+    mixed_component_ids = action_counts.index[
+        action_counts.to_numpy(dtype=np.int64) > 1
+    ].to_numpy(dtype=np.int64)
+    mixed_edge_mask = np.isin(component_ids, mixed_component_ids)
+
+    transformed = raw_weights.copy()
+    if np.any(mixed_edge_mask):
+        mixed = frame.loc[mixed_edge_mask]
+        transformed[mixed_edge_mask] = mixed.groupby(
+            ['component', 'order_grid', 'action'], sort=False
+        )['raw_weight'].rank(method='average', pct=True).to_numpy(dtype=float)
+    return transformed, component_ids, mixed_edge_mask
+
+
+def _dynamic_edge_arbitration_weights(raw_weights, order_origin_grids,
+                                      dynamic_methods, order_ids, driver_ids,
+                                      mode, diagnostics=None):
+    """Apply one pre-registered cross-action arbitration ablation."""
+    raw_weights = np.asarray(raw_weights, dtype=float)
+    if mode == 'raw':
+        return raw_weights.copy(), None
+    if mode == 'rank':
+        return _rank_dynamic_edge_weights(
+            raw_weights,
+            order_origin_grids,
+            dynamic_methods,
+            order_ids,
+            driver_ids,
+        )
+
+    cardinality_base = float(
+        min(len(np.unique(order_ids)), len(np.unique(driver_ids))) + 1
+    )
+    if mode == 'rank_only':
+        ranked_with_base, _ = _rank_dynamic_edge_weights(
+            raw_weights,
+            order_origin_grids,
+            dynamic_methods,
+            order_ids,
+            driver_ids,
+        )
+        return ranked_with_base - cardinality_base, None
+    if mode == 'conflict_only_rank':
+        if np.unique(np.asarray(dynamic_methods, dtype=np.int64)).size == 1 \
+                and diagnostics is None:
+            # Every component is necessarily action-pure.  This zero-copy-in-
+            # semantics fast path keeps all-action-2 runtime near raw while
+            # returning an independent array to the caller.
+            return raw_weights.copy(), None
+        transformed, component_ids, mixed_edge_mask = (
+            _conflict_only_rank_dynamic_edge_weights(
+                raw_weights,
+                order_origin_grids,
+                dynamic_methods,
+                order_ids,
+                driver_ids,
+            )
+        )
+        if diagnostics is not None:
+            diagnostics.update({
+                'component_ids': component_ids.copy(),
+                'mixed_component_edge_mask': mixed_edge_mask.copy(),
+                'component_count': int(len(np.unique(component_ids))),
+                'mixed_component_count': int(len(np.unique(
+                    component_ids[mixed_edge_mask]
+                ))),
+                'mixed_component_edge_count': int(np.sum(mixed_edge_mask)),
+            })
+        return transformed, None
+    if mode == 'raw_cardinality':
+        # A global positive affine transform preserves the historical raw
+        # objective among equal-cardinality matchings, including its
+        # cross-action dominance.  The common base makes cardinality
+        # lexicographically primary, isolating that factor from rank scaling.
+        minimum = float(np.min(raw_weights))
+        maximum = float(np.max(raw_weights))
+        if maximum > minimum:
+            scaled = (raw_weights - minimum) / (maximum - minimum)
+        else:
+            scaled = np.ones_like(raw_weights)
+        return cardinality_base + scaled, cardinality_base
+    raise ValueError(
+        'dynamic_edge_weight_mode must be raw, rank, rank_only, '
+        f'conflict_only_rank, or raw_cardinality; got {mode!r}.'
+    )
+
+
 def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, dispatch_method='LD',
                    method='pickup_distance', reject_nonpositive=False,
-                   advantage_context=None):
+                   advantage_context=None, dynamic_actions=None,
+                   candidate_graph_diagnostics=None,
+                   dynamic_edge_weight_mode='raw'):
     """
     :param wait_requests: the requests of orders
     :type wait_requests: pandas.DataFrame
@@ -574,9 +792,41 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
     :param dispatch_method: the method of order dispatch
     :type dispatch_method: string
 
+    :param candidate_graph_diagnostics: optional mutable mapping populated
+        with the exact feasible edges and scores sent to the matching solver.
+        Intended for offline audits; it does not change dispatch behavior.
+    :type candidate_graph_diagnostics: dict or None
+
+    :param dynamic_edge_weight_mode: cross-action arbitration for dynamic
+        matching. ``raw`` preserves the historical heterogeneous scores;
+        ``rank`` maps scores to per-origin-grid/action percentiles and adds a
+        common cardinality base. ``rank_only`` and ``raw_cardinality`` are
+        mechanism ablations that isolate percentile scaling and cardinality
+        priority. ``conflict_only_rank`` applies percentile scaling only in
+        candidate-graph components containing multiple actions, leaving every
+        pure-action component raw. The three actions and their within-group
+        preferences remain distinct in every mode.
+    :type dynamic_edge_weight_mode: str
+
     :return: matched_pair_actual_indexs: order and driver pair, matched_itinerary: the itinerary of matched driver
     :rtype: tuple
     """
+    method = {
+        'instant_reward': 'ir',
+        'pickup_distance': 'd',
+    }.get(method, method)
+
+    # Orders beyond their maximum waiting time must not receive one final
+    # matching opportunity merely because expiry was historically checked
+    # after dispatch.  Keep the caller's table untouched; the simulator's
+    # post-dispatch update removes the same expired rows from its live queue.
+    if {'wait_time', 'maximum_wait_time'}.issubset(wait_requests.columns):
+        eligible = (
+            wait_requests['wait_time'].to_numpy(dtype=float)
+            <= wait_requests['maximum_wait_time'].to_numpy(dtype=float)
+        )
+        wait_requests = wait_requests.loc[eligible].copy()
+
     # idle_driver_table = driver_table[(driver_table['status'] == 0) | (driver_table['status'] == 4)]
     # repo的司机不允许接单
     idle_driver_table = driver_table[driver_table['status'] == 0]
@@ -667,14 +917,33 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
             final_driver_ids = driver_data[final_n_indices, 2]
             dynamic_methods = None
             if method == 'dynamic_matching':
-                if 'dynamic_matching_array' not in wait_requests.columns:
+                if dynamic_actions is None:
                     raise ValueError(
-                        "dynamic_matching dispatch requires a "
-                        "'dynamic_matching_array' order column."
+                        'dynamic_matching dispatch requires the current '
+                        'per-grid dynamic_actions.'
                     )
-                dynamic_methods = wait_requests.iloc[final_m_indices][
-                    'dynamic_matching_array'
+                dynamic_actions = np.asarray(dynamic_actions, dtype=int)
+                if dynamic_actions.ndim != 1 or dynamic_actions.size == 0:
+                    raise ValueError(
+                        'dynamic_actions must be a non-empty one-dimensional '
+                        'per-grid action vector.'
+                    )
+                order_origin_grids = wait_requests.iloc[final_m_indices][
+                    'origin_grid_id'
                 ].to_numpy(dtype=int)
+                invalid_grids = (
+                    (order_origin_grids < 0)
+                    | (order_origin_grids >= dynamic_actions.size)
+                )
+                if np.any(invalid_grids):
+                    raise ValueError(
+                        'Order origin_grid_id falls outside dynamic_actions: '
+                        f'{np.unique(order_origin_grids[invalid_grids]).tolist()}.'
+                    )
+                # Resolve the method at dispatch time.  Waiting orders no
+                # longer retain the action that happened to be active when
+                # they entered the queue.
+                dynamic_methods = dynamic_actions[order_origin_grids]
                 invalid_methods = ~np.isin(dynamic_methods, [0, 1, 2])
                 if np.any(invalid_methods):
                     raise ValueError(
@@ -796,15 +1065,61 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
             order_driver_pair_list = []
 
             if method == 'dynamic_matching':
+                raw_dynamic_edge_weights = np.asarray(
+                    final_order_weights, dtype=float
+                ).copy()
+                pickup_mask = dynamic_methods == 1
+                raw_dynamic_edge_weights[pickup_mask] = (
+                    5000.0 - final_dis_array[pickup_mask]
+                )
+                arbitration_diagnostics = (
+                    {} if candidate_graph_diagnostics is not None else None
+                )
+                dynamic_edge_weights, cardinality_base = (
+                    _dynamic_edge_arbitration_weights(
+                        raw_dynamic_edge_weights,
+                        order_origin_grids,
+                        dynamic_methods,
+                        final_order_ids,
+                        final_driver_ids,
+                        dynamic_edge_weight_mode,
+                        diagnostics=arbitration_diagnostics,
+                    )
+                )
+                if candidate_graph_diagnostics is not None:
+                    candidate_graph_diagnostics.clear()
+                    candidate_graph_diagnostics.update({
+                        'method': method,
+                        'dynamic_edge_weight_mode': dynamic_edge_weight_mode,
+                        'cardinality_base': cardinality_base,
+                        'eligible_order_count': int(len(wait_requests)),
+                        'idle_driver_count': int(len(idle_driver_table)),
+                        'order_ids': np.asarray(final_order_ids, dtype=np.int64).copy(),
+                        'driver_ids': np.asarray(final_driver_ids, dtype=np.int64).copy(),
+                        'pickup_distances': np.asarray(
+                            final_dis_array, dtype=float
+                        ).copy(),
+                        'edge_weights': dynamic_edge_weights.copy(),
+                        'raw_edge_weights': raw_dynamic_edge_weights.copy(),
+                        'edge_actions': np.asarray(
+                            dynamic_methods, dtype=np.int64
+                        ).copy(),
+                        'order_origin_grids': wait_requests.iloc[final_m_indices][
+                            'origin_grid_id'
+                        ].to_numpy(dtype=np.int64),
+                        'driver_grids': idle_driver_table.iloc[final_n_indices][
+                            'grid_id'
+                        ].to_numpy(dtype=np.int64),
+                        'designed_rewards': wait_requests.iloc[final_m_indices][
+                            'designed_reward'
+                        ].to_numpy(dtype=float),
+                        **(arbitration_diagnostics or {}),
+                    })
                 for i in range(len(final_order_ids)):
-                    if dynamic_methods[i] == 1:
-                        reward_unit = 5000 - final_dis_array[i]
-                    else:
-                        reward_unit = final_order_weights[i]
                     order_driver_pair_list.append([
                         final_order_ids[i],
                         final_driver_ids[i],
-                        reward_unit,
+                        dynamic_edge_weights[i],
                         final_dis_array[i]
                     ])
 
@@ -1059,7 +1374,14 @@ def calculate_evaluate_table(grid_num,wait_requests,df_new_matched_requests):
             return 'medium_req'
 
     for df in [df_new_matched_requests, wait_requests]:
-        df['req_type'] = df.apply(classify_request, axis=1)
+        # Pandas versions disagree on the shape returned by ``DataFrame.apply``
+        # for an empty frame.  Some return an empty DataFrame rather than an
+        # empty Series, which cannot be assigned to one column and makes a
+        # zero-demand simulation minute fail before any orders arrive.
+        if df.empty:
+            df['req_type'] = pd.Series(index=df.index, dtype='object')
+        else:
+            df['req_type'] = df.apply(classify_request, axis=1)
 
     # -------------------
     # Step 2: matched requests 聚合

@@ -61,3 +61,7 @@ dynamic_matching/qtable_state_6to21_sample050_stratified/
 evaluate_results/
 
 result_server/
+
+dynamic_matching/out.tar.gz
+dynamic_matching/out/
+dynamic_matching/qtable_state_6to21_driver0621_sample050_stratified/
