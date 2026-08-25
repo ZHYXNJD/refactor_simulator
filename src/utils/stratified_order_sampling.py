@@ -14,6 +14,7 @@ import numpy as np
 
 SAMPLE_SCHEMA_VERSION = 1
 ORIGIN_GRID_INDEX = 9
+DEFAULT_SAMPLE_BASE_SEED = 20260720
 
 
 def sampled_order_path(
@@ -21,12 +22,20 @@ def sampled_order_path(
     date: str,
     sample_ratio: float,
     window_seconds: int = 300,
+    *,
+    base_seed: int = DEFAULT_SAMPLE_BASE_SEED,
 ) -> Path:
     percent = int(round(sample_ratio * 100))
+    seed_suffix = (
+        "" if int(base_seed) == DEFAULT_SAMPLE_BASE_SEED else f"_seed{int(base_seed)}"
+    )
     return (
         data_root
         / "cleaned_orders_pickle"
-        / f"sampled_6to21_{percent:02d}pct_stratified_{window_seconds}s_origin"
+        / (
+            f"sampled_6to21_{percent:02d}pct_stratified_"
+            f"{window_seconds}s_origin{seed_suffix}"
+        )
         / f"orders_grid35_{date}.pkl"
     )
 
@@ -44,7 +53,7 @@ def stratified_sample_requests(
     t_initial: int = 6 * 3600,
     t_end: int = 21 * 3600,
     window_seconds: int = 300,
-    base_seed: int = 20260720,
+    base_seed: int = DEFAULT_SAMPLE_BASE_SEED,
 ) -> tuple[dict[int, list[Any]], dict[str, Any]]:
     """Sample orders in each ``5-minute x origin-grid`` stratum.
 
@@ -106,13 +115,19 @@ def create_samples(
     t_initial: int = 6 * 3600,
     t_end: int = 21 * 3600,
     window_seconds: int = 300,
-    base_seed: int = 20260720,
+    base_seed: int = DEFAULT_SAMPLE_BASE_SEED,
 ) -> list[Path]:
     """Materialize samples once; later runs only load the exact same files."""
     outputs = []
     source_dir = data_root / "cleaned_orders_pickle"
     for date in dates:
-        output_path = sampled_order_path(data_root, date, sample_ratio, window_seconds)
+        output_path = sampled_order_path(
+            data_root,
+            date,
+            sample_ratio,
+            window_seconds,
+            base_seed=base_seed,
+        )
         metadata_path = output_path.with_suffix(".json")
         if output_path.exists() and metadata_path.exists() and not overwrite:
             outputs.append(output_path)
@@ -136,4 +151,3 @@ def create_samples(
             json.dump(metadata, file, ensure_ascii=False, indent=2)
         outputs.append(output_path)
     return outputs
-

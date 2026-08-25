@@ -12,6 +12,7 @@ from src.utils.utilities import (
     _rank_dynamic_edge_weights,
     order_dispatch,
 )
+from src.utils.dispatch_alg import LD
 
 
 def _request(action: int, *, stored_weight: float) -> pd.DataFrame:
@@ -160,6 +161,72 @@ def test_dynamic_actions_0_and_1_keep_their_existing_scores():
     assert float(distance_matches[0][2]) == pytest.approx(
         5000.0 - pickup_distance
     )
+
+
+def test_legacy_dynamic_action1_matches_direct_pickup_score():
+    direct_matches, direct_itinerary = order_dispatch(
+        _request(1, stored_weight=1.0),
+        _driver(),
+        maximal_pickup_distance=1.25,
+        dispatch_method="LD",
+        method="pickup_distance",
+    )
+    dynamic_matches, dynamic_itinerary = order_dispatch(
+        _request(1, stored_weight=999.0),
+        _driver(),
+        maximal_pickup_distance=1.25,
+        dispatch_method="LD",
+        method="dynamic_matching",
+        advantage_context=_context(),
+        dynamic_actions=[1, 2],
+        dynamic_action1_score_mode="legacy_pickup",
+    )
+
+    assert np.asarray(dynamic_matches, dtype=float) == pytest.approx(
+        np.asarray(direct_matches, dtype=float), rel=0.0, abs=1e-12
+    )
+    assert np.asarray(dynamic_itinerary[2], dtype=float) == pytest.approx(
+        np.asarray(direct_itinerary[2], dtype=float), rel=0.0, abs=1e-12
+    )
+
+
+def test_legacy_pickup_preserves_direct_solution_when_cardinality_can_change():
+    # Both score modes rank the zero-distance edge first.  The direct/legacy
+    # objective nevertheless chooses one short edge, whereas the historical
+    # 5000-distance objective chooses two long edges because it adds a large
+    # reward for every selected match.
+    edges = ((1, 10, 0.0), (1, 20, 1.25), (2, 10, 1.25))
+    direct = [
+        [order, driver, 1.25 - distance + 1.0, distance]
+        for order, driver, distance in edges
+    ]
+    legacy_dynamic = [row.copy() for row in direct]
+    cardinality_dynamic = [
+        [order, driver, 5000.0 - distance, distance]
+        for order, driver, distance in edges
+    ]
+
+    direct_matches = LD(direct, "d")
+    legacy_matches = LD(legacy_dynamic, "dynamic_matching")
+    cardinality_matches = LD(cardinality_dynamic, "dynamic_matching")
+
+    assert legacy_matches == direct_matches
+    assert len(direct_matches) == 1
+    assert len(cardinality_matches) == 2
+
+
+def test_dynamic_action1_rejects_unknown_score_mode():
+    with pytest.raises(ValueError, match="dynamic_action1_score_mode"):
+        order_dispatch(
+            _request(1, stored_weight=1.0),
+            _driver(),
+            maximal_pickup_distance=1.25,
+            dispatch_method="LD",
+            method="dynamic_matching",
+            advantage_context=_context(),
+            dynamic_actions=[1, 2],
+            dynamic_action1_score_mode="unknown",
+        )
 
 
 def test_dynamic_action_2_rejects_missing_qtable_context():

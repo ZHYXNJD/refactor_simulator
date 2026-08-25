@@ -6,6 +6,12 @@ from math import acos
 import pandas as pd
 from math import sin, cos, radians
 
+
+DYNAMIC_ACTION1_SCORE_CONTRACT_VERSION = 1
+DYNAMIC_ACTION1_SCORE_MODES = frozenset({
+    'legacy_pickup', 'cardinality_pickup'
+})
+
 """
 Here, we load the information of graph network from graphml file.
 """
@@ -778,7 +784,8 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
                    method='pickup_distance', reject_nonpositive=False,
                    advantage_context=None, dynamic_actions=None,
                    candidate_graph_diagnostics=None,
-                   dynamic_edge_weight_mode='raw'):
+                   dynamic_edge_weight_mode='raw',
+                   dynamic_action1_score_mode='cardinality_pickup'):
     """
     :param wait_requests: the requests of orders
     :type wait_requests: pandas.DataFrame
@@ -808,6 +815,12 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
         preferences remain distinct in every mode.
     :type dynamic_edge_weight_mode: str
 
+    :param dynamic_action1_score_mode: scoring semantics for action 1 when
+        ``method='dynamic_matching'``. ``legacy_pickup`` exactly matches the
+        direct pickup-distance baseline, while ``cardinality_pickup``
+        preserves the historical dynamic/COMA ``5000 - distance`` objective.
+    :type dynamic_action1_score_mode: str
+
     :return: matched_pair_actual_indexs: order and driver pair, matched_itinerary: the itinerary of matched driver
     :rtype: tuple
     """
@@ -815,6 +828,10 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
         'instant_reward': 'ir',
         'pickup_distance': 'd',
     }.get(method, method)
+    if dynamic_action1_score_mode not in DYNAMIC_ACTION1_SCORE_MODES:
+        raise ValueError(
+            'dynamic_action1_score_mode must be legacy_pickup or '
+            f'cardinality_pickup; got {dynamic_action1_score_mode!r}.')
 
     # Orders beyond their maximum waiting time must not receive one final
     # matching opportunity merely because expiry was historically checked
@@ -1069,9 +1086,16 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
                     final_order_weights, dtype=float
                 ).copy()
                 pickup_mask = dynamic_methods == 1
-                raw_dynamic_edge_weights[pickup_mask] = (
-                    5000.0 - final_dis_array[pickup_mask]
-                )
+                if dynamic_action1_score_mode == 'legacy_pickup':
+                    raw_dynamic_edge_weights[pickup_mask] = (
+                        maximal_pickup_distance
+                        - final_dis_array[pickup_mask]
+                        + 1.0
+                    )
+                else:
+                    raw_dynamic_edge_weights[pickup_mask] = (
+                        5000.0 - final_dis_array[pickup_mask]
+                    )
                 arbitration_diagnostics = (
                     {} if candidate_graph_diagnostics is not None else None
                 )
@@ -1091,6 +1115,7 @@ def order_dispatch(wait_requests, driver_table, maximal_pickup_distance=0.95, di
                     candidate_graph_diagnostics.update({
                         'method': method,
                         'dynamic_edge_weight_mode': dynamic_edge_weight_mode,
+                        'dynamic_action1_score_mode': dynamic_action1_score_mode,
                         'cardinality_base': cardinality_base,
                         'eligible_order_count': int(len(wait_requests)),
                         'idle_driver_count': int(len(idle_driver_table)),

@@ -80,6 +80,27 @@ class Actor(nn.Module):
         return logits
 
 
+class SharedActor(nn.Module):
+    """One policy trunk shared by every grid, with a learned grid embedding."""
+
+    def __init__(self, local_obs_dim, embedding_dim, hidden_sizes, n_actions, num_agents):
+        super().__init__()
+        self.embedding = nn.Embedding(num_agents, embedding_dim)
+        layers = []
+        last = local_obs_dim + embedding_dim
+        for hidden in hidden_sizes:
+            layers.extend([nn.Linear(last, hidden), nn.LayerNorm(hidden), nn.SiLU()])
+            last = hidden
+        layers.append(nn.Linear(last, n_actions))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, local_obs, agent_index):
+        indices = torch.as_tensor(agent_index, dtype=torch.long, device=local_obs.device)
+        if indices.ndim == 0:
+            indices = indices.expand(local_obs.shape[0])
+        return self.net(torch.cat([local_obs, self.embedding(indices)], dim=-1))
+
+
 class Critic(nn.Module):
     """集中式 critic：输入所有 obs 拼接 + 所有 actions(one-hot) 拼接，输出标量 Q"""
     def __init__(self, total_obs_dim, total_act_dim, hidden_sizes):
@@ -174,6 +195,24 @@ class MADDPG:
         self.coma_advantage_normalization_epsilon = float(
             HYPERPARAMS.get('coma_advantage_normalization_epsilon', 1e-6)
         )
+        # Optional standard-COMA ablation: keep the *raw* actor policy above
+        # a time-decayed, non-zero entropy floor.  This is deliberately not
+        # an entropy bonus: only entropy below the target is penalised.
+        self.entropy_floor_regularization = bool(
+            HYPERPARAMS.get('entropy_floor_regularization', False)
+        )
+        self.entropy_floor_start = float(
+            HYPERPARAMS.get('entropy_floor_start', 0.8 * math.log(3.0))
+        )
+        self.entropy_floor_min = float(
+            HYPERPARAMS.get('entropy_floor_min', 0.35)
+        )
+        self.entropy_floor_anneal_updates = int(
+            HYPERPARAMS.get('entropy_floor_anneal_updates', 200)
+        )
+        self.entropy_floor_penalty = float(
+            HYPERPARAMS.get('entropy_floor_penalty', 1.0)
+        )
         self.use_replay_buffer = bool(HYPERPARAMS.get('use_replay_buffer', True))
         self.normalize_states = bool(HYPERPARAMS.get('normalize_states', True))
         self.state_normalizer_warmup_episodes = int(
@@ -183,8 +222,25 @@ class MADDPG:
             raise ValueError('state_normalizer_warmup_episodes must be positive.')
         self.state_normalizer_warmup_episodes_seen = 0
         self.state_normalizer_calibration_states = []
+        self.state_normalizer_min_scale = float(
+            HYPERPARAMS.get('state_normalizer_min_scale', 1e-6)
+        )
+        self.state_normalizer_clip_value = float(
+            HYPERPARAMS.get('state_normalizer_clip_value', 0.0)
+        )
+        if not np.isfinite(self.state_normalizer_min_scale) or self.state_normalizer_min_scale <= 0.0:
+            raise ValueError('state_normalizer_min_scale must be finite and positive.')
+        if not np.isfinite(self.state_normalizer_clip_value) or self.state_normalizer_clip_value < 0.0:
+            raise ValueError('state_normalizer_clip_value must be finite and nonnegative.')
+        self.state_normalizer_raw_min_scale = float('nan')
+        self.state_normalizer_floored_feature_count = 0
+        self.state_normalizer_last_max_abs = float('nan')
+        self.state_normalizer_last_clipped_fraction = 0.0
         self.decentralized_actor = bool(HYPERPARAMS.get('decentralized_actor', False))
         self.global_state_dim = int(HYPERPARAMS.get('global_state_dim', obs_dims[0] - HYPERPARAMS.get('grid_num', 35)))
+        self.global_time_dim = int(HYPERPARAMS.get('global_time_dim', 2))
+        self.shared_actor_enabled = bool(HYPERPARAMS.get('shared_actor', False))
+        self.grid_embedding_dim = int(HYPERPARAMS.get('grid_embedding_dim', 0))
         self.td_lambda = float(HYPERPARAMS.get('td_lambda', 0.8))
         self.coma_epsilon_start = float(HYPERPARAMS.get('coma_epsilon_start', 0.5))
         self.coma_epsilon_end = float(HYPERPARAMS.get('coma_epsilon_end', 0.02))
@@ -194,12 +250,60 @@ class MADDPG:
         self.initial_action2_logit_bias = float(
             HYPERPARAMS.get('initial_action2_logit_bias', 0.0)
         )
+        # ``residual_action2_anchor`` reinterprets the three actor outputs as
+        # [override gate, action-0 score, action-1 score].  Action 2 remains
+        # the default Q-table action, so the policy learns only when to
+        # override it.  This is intentionally a separate experiment mode:
+        # old checkpoints retain their original three-action logits.
+        self.residual_action2_anchor = bool(
+            HYPERPARAMS.get('residual_action2_anchor', False)
+        )
+        self.residual_initial_override_prob = float(
+            HYPERPARAMS.get('residual_initial_override_prob', 0.05)
+        )
+        self.residual_exploration_start = float(
+            HYPERPARAMS.get('residual_exploration_start', 0.10)
+        )
+        self.residual_exploration_end = float(
+            HYPERPARAMS.get('residual_exploration_end', 0.02)
+        )
+        self.residual_override_budget = float(
+            HYPERPARAMS.get('residual_override_budget', 0.10)
+        )
+        self.residual_override_penalty = float(
+            HYPERPARAMS.get('residual_override_penalty', 0.0)
+        )
+        self.residual_deterministic_margin = float(
+            HYPERPARAMS.get('residual_deterministic_margin', 0.0)
+        )
         if not 0.0 <= self.td_lambda <= 1.0:
             raise ValueError('td_lambda must lie in [0, 1].')
         if not (0.0 <= self.coma_epsilon_end <= self.coma_epsilon_start < 1.0):
             raise ValueError('COMA epsilon values must satisfy 0 <= end <= start < 1.')
         if self.coma_epsilon_anneal_episodes <= 0:
             raise ValueError('coma_epsilon_anneal_episodes must be positive.')
+        if self.residual_action2_anchor:
+            if not self.standard_coma or self.actor_loss_mode != 'coma':
+                raise ValueError(
+                    'residual_action2_anchor requires standard COMA actor_loss_mode="coma".'
+                )
+            if not 0.0 < self.residual_initial_override_prob < 1.0:
+                raise ValueError('residual_initial_override_prob must lie in (0, 1).')
+            if not (
+                0.0 <= self.residual_exploration_end
+                <= self.residual_exploration_start < 1.0
+            ):
+                raise ValueError(
+                    'residual exploration must satisfy 0 <= end <= start < 1.'
+                )
+            if not 0.0 <= self.residual_override_budget <= 1.0:
+                raise ValueError('residual_override_budget must lie in [0, 1].')
+            if self.residual_override_penalty < 0.0:
+                raise ValueError('residual_override_penalty must be non-negative.')
+            if self.initial_action2_logit_bias != 0.0:
+                raise ValueError(
+                    'residual_action2_anchor is incompatible with initial_action2_logit_bias.'
+                )
         self.critic_updates_per_episode = int(
             HYPERPARAMS.get(
                 'critic_updates_per_episode',
@@ -309,6 +413,42 @@ class MADDPG:
         # self.n = len(obs_dims)
         self.n = HYPERPARAMS.get('grid_num',35)
         self.n_actions = n_actions
+        if self.global_time_dim <= 0:
+            raise ValueError('global_time_dim must be positive.')
+        self.local_feature_count = (self.global_state_dim - self.global_time_dim) // self.n
+        if self.local_feature_count * self.n + self.global_time_dim != self.global_state_dim:
+            raise ValueError('global_state_dim must equal grid_num * local_feature_count + global_time_dim.')
+        self.actor_local_obs_dim = self.local_feature_count + self.global_time_dim
+        if self.decentralized_actor and obs_dims[0] != self.actor_local_obs_dim:
+            raise ValueError(
+                f'obs_dims[0]={obs_dims[0]} does not match decoded local actor dimension '
+                f'{self.actor_local_obs_dim}.'
+            )
+        if self.shared_actor_enabled and (not self.decentralized_actor or self.grid_embedding_dim <= 0):
+            raise ValueError('shared_actor requires decentralized_actor=True and grid_embedding_dim > 0.')
+        if self.shared_actor_enabled and (not self.standard_coma or self.actor_update_mode != 'on_policy'):
+            raise ValueError(
+                'shared_actor is implemented only for standard COMA with on-policy actor updates.'
+            )
+        if self.entropy_floor_regularization:
+            if self.residual_action2_anchor:
+                raise ValueError(
+                    'entropy_floor_regularization is a standard three-action '
+                    'COMA ablation and cannot be combined with residual_action2_anchor.'
+                )
+            max_entropy = math.log(self.n_actions[0])
+            if not (
+                0.0 <= self.entropy_floor_min
+                <= self.entropy_floor_start <= max_entropy
+            ):
+                raise ValueError(
+                    'entropy floor values must satisfy '
+                    '0 <= min <= start <= log(num_actions).'
+                )
+            if self.entropy_floor_anneal_updates <= 0:
+                raise ValueError('entropy_floor_anneal_updates must be positive.')
+            if self.entropy_floor_penalty <= 0.0:
+                raise ValueError('entropy_floor_penalty must be positive.')
 
         # Replay
         self.buffer = ReplayBuffer(self.buffer_size, self.device)
@@ -319,6 +459,7 @@ class MADDPG:
                 self.buffer.push(*t)
 
             self.state_scaler = state_scaler
+            self._stabilize_state_normalizer()
             self.is_scaler_fitted = True  # <-- 关键：标记为已拟合
             self.warmup_states = []  # 不需要再收集了
 
@@ -343,6 +484,7 @@ class MADDPG:
 
                     # 2. 加载拟合好的 Scaler
                     self.state_scaler = joblib.load(scaler_file)
+                    self._stabilize_state_normalizer()
                     self.is_scaler_fitted = True  # <-- 关键：标记为已拟合
                     self.warmup_states = []  # 不需要再收集了
 
@@ -371,23 +513,57 @@ class MADDPG:
         self.actors = []
         self.target_actors = []
         self.actor_optims = []
-        for i in range(self.n):
-            actor_input_dim = obs_dims[i]  # global state + grid ID one-hot
-            a = Actor(actor_input_dim, self.actor_hidden, self.n_actions[i]).to(self.device)
-            if self.initial_action2_logit_bias != 0.0:
-                if self.n_actions[i] <= 2:
-                    raise ValueError(
-                        'initial_action2_logit_bias requires action index 2.'
-                    )
+        self.shared_actor = None
+        self.target_shared_actor = None
+        if self.shared_actor_enabled:
+            a = SharedActor(
+                self.actor_local_obs_dim,
+                self.grid_embedding_dim,
+                self.actor_hidden,
+                self.n_actions[0],
+                self.n,
+            ).to(self.device)
+            if self.residual_action2_anchor:
+                if self.n_actions[0] != 3:
+                    raise ValueError('residual_action2_anchor requires exactly three actions.')
                 with torch.no_grad():
-                    a.net[-1].bias[2].add_(self.initial_action2_logit_bias)
+                    a.net[-1].bias[0].fill_(
+                        math.log(self.residual_initial_override_prob)
+                        - math.log1p(-self.residual_initial_override_prob)
+                    )
+                    a.net[-1].bias[1:].zero_()
             ta = copy.deepcopy(a).to(self.device)
-            # Strict COMA uses RMSProp; legacy replay experiments retain Adam.
             optimizer_class = optim.RMSprop if self.standard_coma else optim.Adam
             opt = optimizer_class(a.parameters(), lr=self.lr_actor)
-            self.actors.append(a)
-            self.target_actors.append(ta)
+            self.shared_actor, self.target_shared_actor = a, ta
+            self.actors, self.target_actors = [a], [ta]
             self.actor_optims.append(opt)
+        else:
+            for i in range(self.n):
+                actor_input_dim = obs_dims[i]
+                a = Actor(actor_input_dim, self.actor_hidden, self.n_actions[i]).to(self.device)
+                if self.residual_action2_anchor:
+                    if self.n_actions[i] != 3:
+                        raise ValueError('residual_action2_anchor requires exactly three actions.')
+                    with torch.no_grad():
+                        a.net[-1].bias[0].fill_(
+                            math.log(self.residual_initial_override_prob)
+                            - math.log1p(-self.residual_initial_override_prob)
+                        )
+                        a.net[-1].bias[1:].zero_()
+                elif self.initial_action2_logit_bias != 0.0:
+                    if self.n_actions[i] <= 2:
+                        raise ValueError(
+                            'initial_action2_logit_bias requires action index 2.'
+                        )
+                    with torch.no_grad():
+                        a.net[-1].bias[2].add_(self.initial_action2_logit_bias)
+                ta = copy.deepcopy(a).to(self.device)
+                optimizer_class = optim.RMSprop if self.standard_coma else optim.Adam
+                opt = optimizer_class(a.parameters(), lr=self.lr_actor)
+                self.actors.append(a)
+                self.target_actors.append(ta)
+                self.actor_optims.append(opt)
 
         # Critics and target (one centralized critic)
         total_obs = self.global_state_dim if self.decentralized_actor else obs_dims[0] - self.n
@@ -408,7 +584,9 @@ class MADDPG:
         self.target_coma_critic = None
         self.coma_critic_optim = None
         if self.standard_coma:
-            local_obs_dim = obs_dims[0]
+            local_obs_dim = obs_dims[0] + (
+                self.grid_embedding_dim if self.shared_actor_enabled else 0
+            )
             self.coma_critic = COMACritic(
                 self.global_state_dim,
                 local_obs_dim,
@@ -428,6 +606,11 @@ class MADDPG:
 
         self.q_pi_history = []
         self.entropy_history = [[] for _ in range(self.n)]
+        self.raw_policy_entropy_history = [[] for _ in range(self.n)]
+        self.entropy_floor_deficit_history = [[] for _ in range(self.n)]
+        self.entropy_floor_loss_history = [[] for _ in range(self.n)]
+        self.residual_override_probability_history = [[] for _ in range(self.n)]
+        self.residual_delta_taken_history = [[] for _ in range(self.n)]
         self.reset_coma_diagnostic_histories()
 
         # per-episode accumulators
@@ -472,6 +655,22 @@ class MADDPG:
         entropy_coef = self.entropy_end + (self.entropy_start - self.entropy_end) * (1 - progress)
         return float(entropy_coef)
 
+    def _validate_global_state_shape(self, global_state, context):
+        """Reject a stale environment/schema before it can fill a rollout.
+
+        Structured warm-up previously returned template actions before the
+        actor inspected the state.  A legacy 107-d simulator state could
+        therefore survive all 25 normalizer episodes and fail only at the
+        first 1122-d COMA critic update.
+        """
+        shape = tuple(np.asarray(global_state).shape)
+        if not shape or int(shape[-1]) != self.global_state_dim:
+            raise ValueError(
+                f'{context}: expected global state width {self.global_state_dim}, '
+                f'got shape {shape}. Check dynamic_matching_state_schema and '
+                'deploy the matching Simulator/compact-state files together.'
+            )
+
     def _actor_input(self, global_state, agent_index):
         """Build a decentralized actor observation from the global state."""
         if not self.decentralized_actor:
@@ -480,14 +679,30 @@ class MADDPG:
                 return torch.cat([global_state, onehot], dim=-1)
             return torch.cat([global_state, onehot.unsqueeze(0).repeat(global_state.shape[0], 1)], dim=-1)
 
-        feature_count = (self.global_state_dim - 2) // self.n
-        if feature_count * self.n + 2 != self.global_state_dim:
-            raise ValueError('global_state_dim must be grid_num * local_feature_count + 2')
-        begin = agent_index * feature_count
-        end = begin + feature_count
+        begin = agent_index * self.local_feature_count
+        end = begin + self.local_feature_count
         if global_state.dim() == 1:
-            return torch.cat([global_state[begin:end], global_state[-2:]], dim=-1)
-        return torch.cat([global_state[:, begin:end], global_state[:, -2:]], dim=-1)
+            return torch.cat([global_state[begin:end], global_state[-self.global_time_dim:]], dim=-1)
+        return torch.cat([global_state[:, begin:end], global_state[:, -self.global_time_dim:]], dim=-1)
+
+    def _actor_logits(self, global_state, agent_index):
+        local_obs = self._actor_input(global_state, agent_index)
+        if self.shared_actor_enabled:
+            if local_obs.dim() == 1:
+                local_obs = local_obs.unsqueeze(0)
+            return self.shared_actor(local_obs, agent_index)
+        return self.actors[agent_index](local_obs)
+
+    def _critic_local_obs(self, global_state, agent_index):
+        local_obs = self._actor_input(global_state, agent_index)
+        if not self.shared_actor_enabled:
+            return local_obs
+        if local_obs.dim() == 1:
+            local_obs = local_obs.unsqueeze(0)
+        indices = torch.full(
+            (local_obs.shape[0],), agent_index, dtype=torch.long, device=self.device
+        )
+        return torch.cat([local_obs, self.shared_actor.embedding(indices)], dim=-1)
 
     def _coma_epsilon(self):
         """Original COMA's linearly annealed epsilon-soft behaviour policy."""
@@ -501,6 +716,27 @@ class MADDPG:
             self.coma_epsilon_end - self.coma_epsilon_start
         )
 
+    def entropy_floor_target(self):
+        """Cosine-annealed raw-policy entropy target for the current update."""
+        if not self.entropy_floor_regularization:
+            return 0.0
+        progress = min(
+            self.actor_update_count / self.entropy_floor_anneal_updates,
+            1.0,
+        )
+        return self.entropy_floor_min + (
+            self.entropy_floor_start - self.entropy_floor_min
+        ) * (1.0 + math.cos(math.pi * progress)) / 2.0
+
+    def _entropy_floor_loss(self, raw_entropy):
+        """Return one-sided raw-policy entropy penalty and diagnostics."""
+        target = self.entropy_floor_target()
+        if not self.entropy_floor_regularization:
+            zero = raw_entropy.new_zeros(())
+            return zero, zero, target
+        deficit = F.relu(raw_entropy.new_tensor(target) - raw_entropy.mean())
+        return self.entropy_floor_penalty * deficit.square(), deficit, target
+
     def begin_training_episode(self):
         """Reset the per-day warm-up action template state.
 
@@ -510,7 +746,10 @@ class MADDPG:
         update.
         """
         self._episode_decision_index = 0
-        self.last_behaviour_epsilon = self._coma_epsilon()
+        self.last_behaviour_epsilon = (
+            self._residual_exploration()
+            if self.residual_action2_anchor else self._coma_epsilon()
+        )
         self.structured_warmup_temporal_switches = 0
         self._episode_is_actor_warmup = not self.actor_update_ready()
         if (
@@ -570,7 +809,24 @@ class MADDPG:
         template_index = self.current_episode // 4
         family = self.structured_warmup_family
 
-        if family == 1:
+        if self.residual_action2_anchor:
+            # The residual critic should spend its capacity on local deltas
+            # around the Q-table policy, not on all-action0/1 states that the
+            # deployed policy is explicitly forbidden to use by default.
+            actions = [2] * self.n
+            if family == 2:
+                actions[template_index % self.n] = temporal_segment % 2
+            elif family in (3, 4):
+                if self.n > 8:
+                    agent_index = (2 * template_index + (family - 3)) % self.n
+                else:
+                    agent_index = template_index % self.n
+                actions[agent_index] = template_index % 2
+                if family == 4:
+                    # A second, deterministic nearby probe exposes limited
+                    # local interaction without global departures.
+                    actions[(agent_index + 1) % self.n] = (template_index + 1) % 2
+        elif family == 1:
             actions = [template_index % 3] * self.n
         elif family == 2:
             permutations = (
@@ -611,11 +867,50 @@ class MADDPG:
 
     def _policy_probs(self, logits):
         """Return the policy used for both sampling and the COMA baseline."""
+        if self.residual_action2_anchor:
+            return self._residual_policy_probs(logits)
         probs = F.softmax(logits, dim=-1)
         if not self.standard_coma:
             return probs
         epsilon = self._coma_epsilon()
         return (1.0 - epsilon) * probs + epsilon / probs.shape[-1]
+
+    def _residual_exploration(self):
+        """Exploration rate for action-2-centred residual policies."""
+        schedule_step = (
+            self.actor_update_count
+            if self.epsilon_anneal_after_actor_start
+            else self.current_episode
+        )
+        progress = min(schedule_step / self.coma_epsilon_anneal_episodes, 1.0)
+        return self.residual_exploration_start + progress * (
+            self.residual_exploration_end - self.residual_exploration_start
+        )
+
+    def _residual_policy_probs(self, logits):
+        """Map actor outputs to [action0, action1, default action2].
+
+        ``logits[:, 0]`` is an override gate and ``logits[:, 1:3]`` is a
+        conditional distribution over override actions.  Exploration samples
+        only override actions; it never converts the baseline into uniform
+        three-action exploration.
+        """
+        gate = torch.sigmoid(logits[..., 0])
+        override_actions = F.softmax(logits[..., 1:3], dim=-1)
+        probs = torch.cat(
+            [gate.unsqueeze(-1) * override_actions, (1.0 - gate).unsqueeze(-1)],
+            dim=-1,
+        )
+        explore = self._residual_exploration()
+        if explore:
+            exploration = torch.zeros_like(probs)
+            exploration[..., :2] = 0.5
+            probs = (1.0 - explore) * probs + explore * exploration
+        return probs
+
+    def _residual_override_gate(self, logits):
+        """Return the learned override probability before exploration."""
+        return torch.sigmoid(logits[..., 0])
 
     def _coma_q_values(self, global_state, actions, critic=None):
         """Evaluate Q_i(s, u_-i, .) for every batch item and evaluated agent.
@@ -650,7 +945,7 @@ class MADDPG:
         other_actions[:, agent_indices, agent_indices, :] = 0.0
 
         local_obs = torch.stack(
-            [self._actor_input(global_state, agent_index) for agent_index in range(self.n)],
+            [self._critic_local_obs(global_state, agent_index) for agent_index in range(self.n)],
             dim=1,
         )
         agent_ids = F.one_hot(agent_indices, num_classes=self.n).float()
@@ -679,6 +974,10 @@ class MADDPG:
         actions = []
         log_probs = []
 
+        # Validate before the structured-warm-up fast path so schema drift is
+        # reported on episode one rather than at the first critic update.
+        self._validate_global_state_shape(global_state, 'select_actions')
+
         if (
             not deterministic
             and self.structured_coma_warmup
@@ -692,22 +991,32 @@ class MADDPG:
         else:
             global_state = global_state.to(device)
 
-        # Normalize state using the fitted scaler (BUG 3 fix)
+        # Normalize state using the fitted, safeguarded scaler.
         if self.normalize_states and self.is_scaler_fitted:
             global_state_np = global_state.cpu().numpy().reshape(1, -1)
             global_state = torch.tensor(
-                self.state_scaler.transform(global_state_np),
+                self._normalize_state_array(global_state_np),
                 dtype=torch.float32, device=device
             ).squeeze(0)
+
+        if deterministic and self.residual_action2_anchor:
+            for i in range(self.n):
+                logits = self._actor_logits(global_state, i).squeeze(0)
+                gate = float(self._residual_override_gate(logits).item())
+                candidate = int(torch.argmax(logits[1:3]).item())
+                act = candidate if gate >= 0.5 else 2
+                self.actor_counts[i][act] += 1
+                actions.append(act)
+                log_probs.append(0.0)
+            self.strategy_tracker.update(actions)
+            return actions, log_probs
 
         for i in range(self.n):
             # One-hot encode grid ID
             grid_onehot = F.one_hot(torch.tensor(i, device=device), num_classes=self.n).float()
 
             # 拼接 global_state + grid_onehot
-            agent_input = self._actor_input(global_state, i).unsqueeze(0)
-
-            logits = self.actors[i](agent_input)  # [1, n_actions]
+            logits = self._actor_logits(global_state, i)  # [1, n_actions]
             logits = logits.squeeze(0)
 
             if deterministic:
@@ -749,6 +1058,10 @@ class MADDPG:
         """Keep only freshly collected policy data for the COMA actor."""
         if self.actor_update_mode != 'on_policy':
             return
+        self._validate_global_state_shape(obs, 'record_on_policy_transition(obs)')
+        self._validate_global_state_shape(
+            next_obs, 'record_on_policy_transition(next_obs)'
+        )
         self.on_policy_rollout.append(Transition(
             np.asarray(obs, dtype=np.float32).copy(),
             tuple(int(action) for action in actions),
@@ -775,6 +1088,57 @@ class MADDPG:
         critic_input = torch.cat([global_state_batch, acts_concat], dim=-1)  # [batch, state_dim + total_action_dim]
         return critic_input
 
+    def _stabilize_state_normalizer(self):
+        """Apply a documented variance floor after fitting StandardScaler.
+
+        Compact state features include sparse ratios and destination entropy.
+        A finite calibration set may observe an otherwise valid feature only as
+        floating-point zero; using its numerical residual as a divisor creates
+        arbitrarily large later observations.  The floor preserves normal
+        StandardScaler behaviour for informative dimensions and makes sparse
+        dimensions conservative rather than explosive.
+        """
+        raw_scale = np.asarray(self.state_scaler.scale_, dtype=np.float64)
+        self.state_normalizer_raw_min_scale = float(np.min(raw_scale))
+        floored = (~np.isfinite(raw_scale)) | (raw_scale < self.state_normalizer_min_scale)
+        safe_scale = raw_scale.copy()
+        safe_scale[floored] = self.state_normalizer_min_scale
+        self.state_scaler.scale_ = safe_scale
+        self.state_normalizer_floored_feature_count = int(np.count_nonzero(floored))
+
+    def _normalize_state_array(self, state_array):
+        transformed = self.state_scaler.transform(np.asarray(state_array, dtype=np.float64))
+        if not np.isfinite(transformed).all():
+            raise RuntimeError('State normalizer produced non-finite values.')
+        max_abs = float(np.max(np.abs(transformed))) if transformed.size else 0.0
+        if self.state_normalizer_clip_value > 0.0:
+            clipped = np.clip(
+                transformed,
+                -self.state_normalizer_clip_value,
+                self.state_normalizer_clip_value,
+            )
+            self.state_normalizer_last_clipped_fraction = float(
+                np.mean(clipped != transformed)
+            )
+            transformed = clipped
+        else:
+            self.state_normalizer_last_clipped_fraction = 0.0
+        self.state_normalizer_last_max_abs = float(
+            np.max(np.abs(transformed)) if transformed.size else 0.0
+        )
+        # Retain the pre-clip magnitude in a separate field for diagnostics.
+        self.state_normalizer_last_preclip_max_abs = max_abs
+        return transformed
+
+    def state_normalizer_diagnostics(self):
+        return {
+            'raw_min_scale': self.state_normalizer_raw_min_scale,
+            'floored_feature_count': self.state_normalizer_floored_feature_count,
+            'last_max_abs': self.state_normalizer_last_max_abs,
+            'last_preclip_max_abs': getattr(self, 'state_normalizer_last_preclip_max_abs', float('nan')),
+            'last_clipped_fraction': self.state_normalizer_last_clipped_fraction,
+        }
+
     def _normalize_states(self, states):
         if not self.normalize_states:
             return states.to(dtype=torch.float32, device=self.device)
@@ -783,7 +1147,7 @@ class MADDPG:
                 'State normalization was requested before the scaler was fitted.'
             )
         return torch.tensor(
-            self.state_scaler.transform(states.cpu().numpy()),
+            self._normalize_state_array(states.cpu().numpy()),
             dtype=torch.float32, device=self.device,
         )
 
@@ -827,6 +1191,7 @@ class MADDPG:
         self.state_scaler.fit(
             np.stack(self.state_normalizer_calibration_states, axis=0)
         )
+        self._stabilize_state_normalizer()
         self.is_scaler_fitted = True
         self.state_normalizer_calibration_states = []
         return False
@@ -860,6 +1225,7 @@ class MADDPG:
             samples_seen.item() if samples_seen.ndim == 0 else samples_seen
         )
         self.state_scaler = scaler
+        self._stabilize_state_normalizer()
         self.is_scaler_fitted = True
         self.state_normalizer_calibration_states = []
 
@@ -871,6 +1237,7 @@ class MADDPG:
             if not self.warmup_states:
                 return
             self.state_scaler.fit(np.asarray(self.warmup_states))
+            self._stabilize_state_normalizer()
             self.is_scaler_fitted = True
             self.warmup_states = []
 
@@ -991,6 +1358,11 @@ class MADDPG:
         self.critic_explained_variance_history = []
         self.critic_grad_norm_history = []
         self.critic_grad_clipped_history = []
+        self.residual_override_probability_history = [[] for _ in range(self.n)]
+        self.residual_delta_taken_history = [[] for _ in range(self.n)]
+        self.raw_policy_entropy_history = [[] for _ in range(self.n)]
+        self.entropy_floor_deficit_history = [[] for _ in range(self.n)]
+        self.entropy_floor_loss_history = [[] for _ in range(self.n)]
 
     def _record_coma_advantage_diagnostics(self, agent_index, advantage):
         values = advantage.detach()
@@ -1047,19 +1419,49 @@ class MADDPG:
                 with torch.no_grad():
                     standard_q_values = self._coma_q_values(global_state, acts_b)
             q_monitors = []
+            if self.shared_actor_enabled:
+                self.actor_optims[0].zero_grad()
             for i in range(self.n):
-                actor_input = self._actor_input(global_state, i)
-                logits = self.actors[i](actor_input)
+                logits = self._actor_logits(global_state, i)
                 policy_probs = self._policy_probs(logits)
                 dist = torch.distributions.Categorical(probs=policy_probs)
                 logp = dist.log_prob(acts_b[i])
                 entropy = dist.entropy()
+                # Episode_Entropy historically records entropy of the
+                # epsilon-soft behaviour policy above.  Keep a distinct
+                # raw-policy measurement for diagnostics and entropy-floor
+                # regularisation so epsilon cannot mask actor collapse.
+                raw_policy_probs = F.softmax(logits, dim=-1)
+                raw_entropy = torch.distributions.Categorical(
+                    probs=raw_policy_probs
+                ).entropy()
+                self.raw_policy_entropy_history[i].append(
+                    raw_entropy.mean().detach().item()
+                )
 
                 if self.standard_coma and self.actor_loss_mode == 'coma':
                     q_by_action = standard_q_values[:, i, :]
-                    baseline = (policy_probs.detach() * q_by_action).sum(dim=-1)
                     q_taken = q_by_action.gather(1, acts_b[i].unsqueeze(-1)).squeeze(-1)
-                    advantage = (q_taken - baseline).detach()
+                    if self.residual_action2_anchor:
+                        # Anchor credit assignment to the frozen Q-table
+                        # default.  Q(action2) is action-independent, hence
+                        # valid as a policy-gradient baseline.
+                        baseline = q_by_action[:, 2]
+                        advantage = (q_taken - baseline).detach()
+                        override_probability = self._residual_override_gate(logits)
+                        override_rate = override_probability.mean()
+                        budget_excess = F.relu(
+                            override_rate - self.residual_override_budget
+                        )
+                        self.residual_override_probability_history[i].append(
+                            override_rate.detach().item()
+                        )
+                        self.residual_delta_taken_history[i].append(
+                            advantage.mean().item()
+                        )
+                    else:
+                        baseline = (policy_probs.detach() * q_by_action).sum(dim=-1)
+                        advantage = (q_taken - baseline).detach()
                     q_monitors.append(q_taken)
                 elif self.actor_loss_mode == 'coma':
                     q_by_action = []
@@ -1086,17 +1488,49 @@ class MADDPG:
                 actor_loss = self.compute_refined_actor_loss(
                     i, logp, entropy, advantage, mode=self.actor_loss_mode, episode=self.current_episode
                 )
-                self.actor_optims[i].zero_grad()
-                actor_loss.backward()
-                actor_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    self.actors[i].parameters(), 0.5
+                entropy_floor_loss, entropy_floor_deficit, _ = (
+                    self._entropy_floor_loss(raw_entropy)
                 )
-                actor_grad_norm = float(actor_grad_norm)
-                self.actor_grad_norm_history[i].append(actor_grad_norm)
-                self.actor_grad_clipped_history[i].append(
-                    float(actor_grad_norm > 0.5)
-                )
-                self.actor_optims[i].step()
+                if self.entropy_floor_regularization:
+                    actor_loss = actor_loss + entropy_floor_loss
+                    self.entropy_floor_deficit_history[i].append(
+                        entropy_floor_deficit.detach().item()
+                    )
+                    self.entropy_floor_loss_history[i].append(
+                        entropy_floor_loss.detach().item()
+                    )
+                if self.residual_action2_anchor:
+                    # Soft budget, applied to the policy loss only.  The
+                    # environment reward and critic target remain unchanged.
+                    actor_loss = actor_loss + (
+                        self.residual_override_penalty * budget_excess.square()
+                    )
+                if self.shared_actor_enabled:
+                    # Sum the policy gradients from all grid decisions, then
+                    # perform exactly one optimizer step on the shared trunk.
+                    (actor_loss / self.n).backward()
+                    if i == self.n - 1:
+                        actor_grad_norm = float(torch.nn.utils.clip_grad_norm_(
+                            self.shared_actor.parameters(), 0.5
+                        ))
+                        self.actor_optims[0].step()
+                        for grid_index in range(self.n):
+                            self.actor_grad_norm_history[grid_index].append(actor_grad_norm)
+                            self.actor_grad_clipped_history[grid_index].append(
+                                float(actor_grad_norm > 0.5)
+                            )
+                else:
+                    self.actor_optims[i].zero_grad()
+                    actor_loss.backward()
+                    actor_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        self.actors[i].parameters(), 0.5
+                    )
+                    actor_grad_norm = float(actor_grad_norm)
+                    self.actor_grad_norm_history[i].append(actor_grad_norm)
+                    self.actor_grad_clipped_history[i].append(
+                        float(actor_grad_norm > 0.5)
+                    )
+                    self.actor_optims[i].step()
 
             if q_monitors:
                 self.q_pi_history.append(torch.stack(q_monitors, dim=1).mean().item())
@@ -1244,6 +1678,7 @@ class MADDPG:
             print("--- Fitting StandardScaler on warmup data ---")
             # 使用收集到的所有热启动数据进行拟合
             self.state_scaler.fit(np.array(self.warmup_states))
+            self._stabilize_state_normalizer()
             self.is_scaler_fitted = True
             self.warmup_states = []  # 释放内存
             print("--- Scaler fitted. Starting training. ---")
@@ -1252,12 +1687,8 @@ class MADDPG:
         global_state, acts_b, acts_b_log, rews_b, next_global_state, dones_b = self.buffer.sample(self.batch_size)
         batch_size = global_state.shape[0]
 
-        global_state = torch.tensor(
-            self.state_scaler.transform(global_state.cpu().numpy()),
-            dtype=torch.float32, device=self.device)
-        next_global_state = torch.tensor(
-            self.state_scaler.transform(next_global_state.cpu().numpy()),
-            dtype=torch.float32, device=self.device)
+        global_state = self._normalize_states(global_state)
+        next_global_state = self._normalize_states(next_global_state)
 
         # --- 开始多次更新循环 ---
         for _ in range(self.update_num):
@@ -1391,11 +1822,14 @@ class MADDPG:
 
     def save(self, path):
         state = {
-            'actors': [a.state_dict() for a in self.actors],
             'crit1': self.critic1.state_dict(),
             'crit2': self.critic2.state_dict(),
             'state_normalizer': self._state_normalizer_state(),
         }
+        if self.shared_actor_enabled:
+            state['shared_actor'] = self.shared_actor.state_dict()
+        else:
+            state['actors'] = [a.state_dict() for a in self.actors]
         if self.coma_critic is not None:
             state['coma_critic'] = self.coma_critic.state_dict()
         torch.save(state, path)
@@ -1461,13 +1895,21 @@ class MADDPG:
         if self.load_path:
             print(f"Loading saved model, test dynamic matching model: grid_{grid_num}_freq_{decision_freq}")
             state = torch.load(self.load_path, map_location=self.device)
-            for a, st in zip(self.actors, state['actors']):
-                a.load_state_dict(st)
+            if self.shared_actor_enabled:
+                if 'shared_actor' not in state:
+                    raise ValueError('Checkpoint does not contain a shared actor.')
+                self.shared_actor.load_state_dict(state['shared_actor'])
+            else:
+                for a, st in zip(self.actors, state['actors']):
+                    a.load_state_dict(st)
             self.critic1.load_state_dict(state['crit1'])
             self.critic2.load_state_dict(state['crit2'])
             # update targets
-            for i in range(self.n):
-                self.target_actors[i].load_state_dict(self.actors[i].state_dict())
+            if self.shared_actor_enabled:
+                self.target_shared_actor.load_state_dict(self.shared_actor.state_dict())
+            else:
+                for i in range(self.n):
+                    self.target_actors[i].load_state_dict(self.actors[i].state_dict())
             self.target_critic1.load_state_dict(self.critic1.state_dict())
             self.target_critic2.load_state_dict(self.critic2.state_dict())
             if self.coma_critic is not None:

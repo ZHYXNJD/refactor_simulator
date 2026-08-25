@@ -249,6 +249,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seeds", default=",".join(str(seed) for seed in DEFAULT_SEEDS))
     parser.add_argument("--driver-num", type=int, default=1000)
     parser.add_argument(
+        "--driver-path",
+        default=None,
+        help=(
+            "Supply-specific driver pickle. Defaults to "
+            "<data-root>/drivers_grid35_1000.pickle. The file must contain "
+            "exactly --driver-num rows."
+        ),
+    )
+    parser.add_argument(
         "--save-orders",
         action="store_true",
         help="Also save every matched-order table (large output).",
@@ -299,15 +308,29 @@ def main() -> None:
 
     data_root = resolve_path(args.data_root)
     output_root = resolve_path(args.output_dir)
+    driver_path = (
+        resolve_path(args.driver_path)
+        if args.driver_path is not None
+        else data_root / "drivers_grid35_1000.pickle"
+    )
+    if not driver_path.is_file():
+        raise FileNotFoundError(f"Missing driver data: {driver_path}")
+    driver_info = pd.read_pickle(driver_path)
+    if len(driver_info) != args.driver_num:
+        raise ValueError(
+            "Supply-specific baseline evaluation requires the driver file to "
+            f"contain exactly --driver-num rows; requested={args.driver_num}, "
+            f"actual={len(driver_info)}, path={driver_path}."
+        )
+    driver_metadata = service_window_metadata(driver_info, driver_path)
     request_dict, driver_info_by_grid, mapping_dict, road_network = load_test_data(
         data_root,
         test_dates,
         grids,
         args.driver_num,
         scenario_sample_ratio,
+        driver_path=driver_path,
     )
-    driver_path = data_root / "drivers_grid35_1000.pickle"
-    driver_metadata = service_window_metadata(pd.read_pickle(driver_path), driver_path)
     output_root.mkdir(parents=True, exist_ok=True)
     tasks = [
         {"grid_num": grid_num, "method": method}

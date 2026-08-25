@@ -23,6 +23,10 @@ from src.agents.value_estimator import ValueNetwork
 from src.utils.utilities import *
 import warnings
 import pandas as pd
+from dynamic_matching.compact_matching_state import (
+    COMPACT_STATE_SCHEMA,
+    CompactMatchingStateExtractor,
+)
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 # Keep online transition rewards on the same scale as the offline warmup data.
@@ -47,6 +51,13 @@ GRID_REWARD_NORMALIZER = 100.0
 # =============================================================================
 
 class Simulator:
+    # Evaluators use this marker to fail before a long rollout when the
+    # launcher and Simulator files were not deployed together.
+    DYNAMIC_ACTION1_SCORE_CONTRACT_VERSION = (
+        DYNAMIC_ACTION1_SCORE_CONTRACT_VERSION
+    )
+    DYNAMIC_ACTION1_SCORE_MODES = DYNAMIC_ACTION1_SCORE_MODES
+
     # =========================================================================
     # 初始化 (Initialization)
     # =========================================================================
@@ -136,6 +147,14 @@ class Simulator:
 
         self.grid_num = kwargs.get('grid_num', 35)
         self.decision_freq = kwargs.get('decision_freq', 10)  # 单位：min
+        self.dynamic_matching_state_schema = kwargs.get(
+            'dynamic_matching_state_schema', 'legacy_v1'
+        )
+        if self.dynamic_matching_state_schema not in {'legacy_v1', COMPACT_STATE_SCHEMA}:
+            raise ValueError(
+                'Unknown dynamic_matching_state_schema='
+                f'{self.dynamic_matching_state_schema!r}.'
+            )
         self.experiment_mode = kwargs.get('experiment_mode', 'train_value')
         self.pickup_mode = kwargs.get('pickup_mode', 'ma')
         self.method = kwargs.get('method', 'd')
@@ -151,12 +170,25 @@ class Simulator:
                 'conflict_only_rank, or raw_cardinality; '
                 f'got {self.dynamic_edge_weight_mode!r}.'
             )
+        self.dynamic_action1_score_mode = kwargs.get(
+            'dynamic_action1_score_mode', 'cardinality_pickup'
+        )
+        if self.dynamic_action1_score_mode not in self.DYNAMIC_ACTION1_SCORE_MODES:
+            raise ValueError(
+                'dynamic_action1_score_mode must be legacy_pickup or '
+                f'cardinality_pickup; got {self.dynamic_action1_score_mode!r}.'
+            )
         # dispatch method
         self.dispatch_method = 'LD'
 
         self.RN = RoadNetwork(self.grid_num)
         self.RN.load_data(result=road_network)
         self.zone_id_array = np.array([i for i in range(self.grid_num)])
+        self.compact_state_extractor = (
+            CompactMatchingStateExtractor(self)
+            if self.dynamic_matching_state_schema == COMPACT_STATE_SCHEMA
+            else None
+        )
 
         # cruise and reposition related parameters
         self.cruise_flag = False
@@ -488,6 +520,7 @@ class Simulator:
 
         self.wait_requests = pd.DataFrame(columns=self.request_columns)
         self.matched_requests = pd.DataFrame(columns=self.request_columns)
+        self.compact_expiry_history = []
         # A record belongs to one simulation episode/date.  Keeping the old
         # DataFrame across reset() makes test-day counts and averages cumulative.
         self.record = ""
@@ -880,6 +913,17 @@ class Simulator:
 
                 self.match_and_cancel_track[self.time] = [len(df_matched), len(new_matched_requests)]
 
+        expired = self.wait_requests[~con_matched & ~con_keep_wait]
+        expiry_vector = np.zeros(self.grid_num, dtype=float)
+        if not expired.empty:
+            expired_grids = expired['origin_grid_id'].to_numpy(dtype=int)
+            valid_grids = expired_grids[(expired_grids >= 0) & (expired_grids < self.grid_num)]
+            expiry_vector = np.bincount(valid_grids, minlength=self.grid_num).astype(float)
+        self.compact_expiry_history.append((int(self.time), expiry_vector))
+        earliest_compact_history = int(self.time) - 30 * 60
+        self.compact_expiry_history = [
+            item for item in self.compact_expiry_history if item[0] >= earliest_compact_history
+        ]
         update_wait_requests = pd.concat([update_wait_requests, self.wait_requests[~con_matched & con_keep_wait]],
                                          axis=0)
         self.waiting_time += np.sum(new_matched_requests['wait_time'].values)
@@ -1285,7 +1329,8 @@ class Simulator:
                                                                         self.dispatch_method, self.method,
                                                                         advantage_context=self._matching_value_context(),
                                                                         dynamic_actions=self._current_dynamic_matching_actions(),
-                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode)
+                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
+                                                                        dynamic_action1_score_mode=self.dynamic_action1_score_mode)
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -1371,7 +1416,8 @@ class Simulator:
                                                                         self.dispatch_method, self.method,
                                                                         advantage_context=self._matching_value_context(),
                                                                         dynamic_actions=self._current_dynamic_matching_actions(),
-                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode)
+                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
+                                                                        dynamic_action1_score_mode=self.dynamic_action1_score_mode)
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -2420,6 +2466,7 @@ class Simulator:
             advantage_context=value_context,
             dynamic_actions=self._current_dynamic_matching_actions(),
             dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
+            dynamic_action1_score_mode=self.dynamic_action1_score_mode,
         )
         self._record_matching_value_diagnostics(value_context)
 
@@ -2603,7 +2650,8 @@ class Simulator:
                                                                         self.dispatch_method, self.method,
                                                                         advantage_context=self._matching_value_context(),
                                                                         dynamic_actions=self._current_dynamic_matching_actions(),
-                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode)
+                                                                        dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
+                                                                        dynamic_action1_score_mode=self.dynamic_action1_score_mode)
         # Step 2: driver/passenger reaction after dispatching
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
             matched_pair_actual_indexes, matched_itinerary)
@@ -2637,6 +2685,20 @@ class Simulator:
             self.grid_num, wait_requests, df_new_matched_requests
         )
         self.evaluate_table[self.current_step] = self.evaluate_df.values
+
+        # Keep evaluation accounting aligned with ``rl_step``.  The dynamic
+        # matching loop previously omitted this bookkeeping, which made its
+        # exported occupancy_rate stay at zero even though driver state and
+        # matching behaviour were otherwise correct.
+        self.cumulative_on_trip_driver_num += self.driver_table[
+            self.driver_table['status'] == 1
+        ].shape[0]
+        self.cumulative_on_trip_driver_num += self.driver_table[
+            self.driver_table['status'] == 2
+        ].shape[0]
+        self.occupancy_rate = self.cumulative_on_trip_driver_num / (
+            (1 + self.current_step) * self.driver_table.shape[0]
+        )
 
         if self.end_of_episode == 0:
             self.matched_requests = pd.concat([self.matched_requests, df_new_matched_requests], axis=0)
@@ -2768,6 +2830,7 @@ class Simulator:
             self.dispatch_method, self.method,
             dynamic_actions=self._current_dynamic_matching_actions(),
             dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
+            dynamic_action1_score_mode=self.dynamic_action1_score_mode,
         )
 
         # Step 2: driver/passenger reaction
@@ -2837,6 +2900,7 @@ class Simulator:
             self.dispatch_method, self.method,
             dynamic_actions=self._current_dynamic_matching_actions(),
             dynamic_edge_weight_mode=self.dynamic_edge_weight_mode,
+            dynamic_action1_score_mode=self.dynamic_action1_score_mode,
         )
 
         df_new_matched_requests, df_update_wait_requests = self.update_info_after_matching_multi_process(
@@ -2891,6 +2955,18 @@ class Simulator:
         Returns:
             np.ndarray: 全局状态向量，shape 为 (state_dim,)
         """
+
+        if self.dynamic_matching_state_schema == COMPACT_STATE_SCHEMA:
+            state = self.compact_state_extractor.extract()
+            expected_width = getattr(
+                self.dynamic_matching_agent, 'global_state_dim', state.shape[0]
+            )
+            if state.shape != (expected_width,):
+                raise RuntimeError(
+                    'Compact dynamic-matching state width mismatch: '
+                    f'got {state.shape}, expected ({expected_width},).'
+                )
+            return state
 
         grid_num = self.grid_num
         grid_ids = list(range(grid_num))

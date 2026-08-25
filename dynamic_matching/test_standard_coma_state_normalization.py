@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import random
 import numpy as np
 import pytest
@@ -99,6 +100,109 @@ def test_on_policy_scaler_calibration_discards_raw_rollouts():
     assert all(agent.actor_grad_norm_history)
     assert agent.critic1_losses_history
     assert not agent.on_policy_rollout
+
+
+def test_fixed_five_episode_calibration_updates_both_networks_on_episode_six():
+    """Regression gate for the H1 compact-COMA training schedule."""
+    agent = _agent(
+        state_normalizer_warmup_episodes=5,
+        actor_warmup_episodes=5,
+        adaptive_actor_warmup=False,
+        structured_coma_warmup=False,
+        shared_actor=True,
+        grid_embedding_dim=2,
+    )
+
+    for episode in range(5):
+        agent.begin_training_episode()
+        _record_episode(agent, float(episode * 10))
+        assert not agent.prepare_on_policy_state_normalizer()
+        assert not agent.critic1_losses_history
+        assert not agent.update_on_policy_actor()
+        agent.current_episode += 1
+
+    assert agent.is_scaler_fitted
+    assert agent.actor_update_ready()
+
+    agent.begin_training_episode()
+    _record_episode(agent, 50.0)
+    assert agent.prepare_on_policy_state_normalizer()
+    agent.update_standard_coma_critic()
+    assert agent.critic1_losses_history
+    assert agent.update_on_policy_actor()
+    assert agent.actor_update_count == 1
+
+
+def test_state_normalizer_floors_near_constant_features_and_clips_later_outliers():
+    """Sparse H1 features must not turn a near-zero calibration scale into a blow-up."""
+    agent = _agent(
+        state_normalizer_min_scale=0.1,
+        state_normalizer_clip_value=10.0,
+    )
+
+    for episode in range(2):
+        for step in range(3):
+            # This reproduces the measured H1 failure: the feature is not
+            # exactly constant (sklearn would then use scale=1), but varies
+            # only at floating-point residue scale during calibration.
+            state = np.arange(8, dtype=np.float32) + episode * 10 + step
+            state[0] = np.float32((episode * 3 + step) * 1e-13)
+            agent.record_on_policy_transition(
+                state,
+                actions=[step % 3, (step + 1) % 3],
+                log_probs=[0.0, 0.0],
+                rewards=[1.0, 1.0],
+                next_obs=state,
+                dones=[float(step == 2)] * 2,
+            )
+        assert not agent.prepare_on_policy_state_normalizer()
+
+    assert agent.is_scaler_fitted
+    assert agent.state_normalizer_floored_feature_count >= 1
+    assert np.min(agent.state_scaler.scale_) >= 0.1
+
+    later_state = np.arange(8, dtype=np.float32)
+    later_state[0] = 1_000_000.0
+    normalized = agent._normalize_state_array(later_state.reshape(1, -1))
+    assert np.isfinite(normalized).all()
+    assert np.max(np.abs(normalized)) <= 10.0
+    assert agent.state_normalizer_last_clipped_fraction > 0.0
+
+
+def test_action2_anchored_residual_policy_defaults_to_action2_and_uses_delta_baseline():
+    agent = _agent(
+        normalize_states=False,
+        residual_action2_anchor=True,
+        residual_initial_override_prob=0.05,
+        residual_exploration_start=0.0,
+        residual_exploration_end=0.0,
+        residual_override_budget=0.10,
+        residual_override_penalty=1.0,
+    )
+    logits = torch.zeros(4, 3)
+    probabilities = agent._policy_probs(logits)
+    assert probabilities.shape == (4, 3)
+    assert probabilities[:, 2] == pytest.approx(np.full(4, 0.5))
+    assert probabilities[:, :2] == pytest.approx(np.full((4, 2), 0.25))
+
+    # An untrained critic gives equal action values.  The deterministic safety
+    # rule must therefore keep the frozen action-2 baseline even if the gate
+    # itself is configured to prefer an override.
+    for actor in agent.actors:
+        with torch.no_grad():
+            actor.net[-1].bias[0].fill_(10.0)
+    for parameter in agent.coma_critic.parameters():
+        with torch.no_grad():
+            parameter.zero_()
+    actions, _ = agent.select_actions(np.zeros(8, dtype=np.float32), deterministic=True)
+    assert actions == [2, 2]
+
+    # On-policy updates report the exact action-2-relative delta signal.
+    _record_episode(agent, 0.0)
+    agent.update_standard_coma_critic()
+    assert agent.update_on_policy_actor()
+    assert all(agent.residual_override_probability_history)
+    assert all(agent.residual_delta_taken_history)
 
 
 def test_state_normalizer_round_trips_through_checkpoint(tmp_path):
@@ -347,6 +451,57 @@ def test_standard_coma_advantage_normalization_is_opt_in():
     assert normalized_agent.advantage_std_history[0] == pytest.approx(
         [float(advantage.std(unbiased=False))]
     )
+
+
+def test_entropy_floor_is_one_sided_and_anneals_by_actor_updates():
+    agent = _agent(
+        normalize_states=False,
+        entropy_floor_regularization=True,
+        entropy_floor_start=0.9,
+        entropy_floor_min=0.3,
+        entropy_floor_anneal_updates=10,
+        entropy_floor_penalty=2.0,
+    )
+    assert agent.entropy_floor_target() == pytest.approx(0.9)
+
+    low_entropy = torch.tensor([0.2, 0.2])
+    loss, deficit, target = agent._entropy_floor_loss(low_entropy)
+    assert target == pytest.approx(0.9)
+    assert deficit.item() == pytest.approx(0.7)
+    assert loss.item() == pytest.approx(2.0 * 0.7 ** 2)
+
+    uniform_entropy = torch.full((2,), math.log(3.0))
+    loss, deficit, _ = agent._entropy_floor_loss(uniform_entropy)
+    assert deficit.item() == pytest.approx(0.0)
+    assert loss.item() == pytest.approx(0.0)
+
+    agent.actor_update_count = 5
+    assert agent.entropy_floor_target() == pytest.approx(0.6)
+    agent.actor_update_count = 10
+    assert agent.entropy_floor_target() == pytest.approx(0.3)
+
+
+def test_entropy_floor_is_added_to_standard_actor_update_and_logs_raw_entropy():
+    agent = _agent(
+        normalize_states=False,
+        entropy_floor_regularization=True,
+        entropy_floor_start=0.9,
+        entropy_floor_min=0.3,
+        entropy_floor_anneal_updates=10,
+        entropy_floor_penalty=2.0,
+    )
+    for actor in agent.actors:
+        with torch.no_grad():
+            actor.net[-1].bias.copy_(torch.tensor([8.0, -8.0, -8.0]))
+
+    _record_episode(agent, 0.0)
+    assert agent.prepare_on_policy_state_normalizer()
+    agent.update_standard_coma_critic()
+    assert agent.update_on_policy_actor()
+    assert all(agent.raw_policy_entropy_history)
+    assert all(agent.entropy_floor_deficit_history)
+    assert all(agent.entropy_floor_loss_history)
+    assert all(values[0] > 0.0 for values in agent.entropy_floor_loss_history)
 
 
 def test_standard_coma_learns_known_additive_cooperative_game():

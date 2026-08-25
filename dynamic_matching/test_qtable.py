@@ -224,6 +224,7 @@ def load_test_data(
     grids: Iterable[int],
     driver_num: int,
     scenario_sample_ratio: float | None,
+    driver_path: Path | None = None,
 ):
     request_dict = {}
     for date in test_dates:
@@ -238,7 +239,11 @@ def load_test_data(
         print(f"Loading requests: {request_path}")
         request_dict[date] = pd.read_pickle(request_path)
 
-    driver_path = data_root / "drivers_grid35_1000.pickle"
+    driver_path = (
+        data_root / "drivers_grid35_1000.pickle"
+        if driver_path is None
+        else Path(driver_path)
+    )
     mapping_path = data_root / "node_to_grid.pkl"
     if not driver_path.exists():
         raise FileNotFoundError(f"Missing driver data: {driver_path}")

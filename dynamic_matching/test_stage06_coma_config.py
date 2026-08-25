@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -87,7 +88,9 @@ def test_800_episode_extension_preserves_raw_coma_objective(tmp_path: Path):
         ]
     )
     _, environment_seeds, output_path, configs, manifest = build_experiment(args)
-    assert "stage06_grid8_sample030_freq10_800ep_random_coma_" in output_path.name
+    assert output_path.name == "s06_g8_s30_f10_e800_rnd_raw_n3"
+    assert manifest["output_directory_name"] == output_path.name
+    assert manifest["default_output_directory_name"] == output_path.name
     assert len(environment_seeds) == 800
     assert manifest["training_episodes_per_seed"] == 800
     assert manifest["num_macro_epochs"] == 160
@@ -109,7 +112,7 @@ def test_advantage_normalized_variant_is_explicit_in_manifest(tmp_path: Path):
         ]
     )
     _, _, output_path, configs, manifest = build_experiment(args)
-    assert "stage07_grid8_full_freq10_400ep_random_coma_advnorm_" in output_path.name
+    assert output_path.name == "s07_g8_full_f10_e400_advn_raw_n3"
     assert manifest["normalize_coma_advantages"] is True
     assert manifest["coma_advantage_normalization_scope"] == (
         "per_agent_on_policy_rollout"
@@ -138,7 +141,7 @@ def test_conflict_only_rank_is_explicit_and_reuses_frozen_qtable(tmp_path: Path)
     )
     _, _, output_path, configs, manifest = build_experiment(args)
 
-    assert "edgeconflict_only_rank" in output_path.name
+    assert output_path.name == "s06_g8_s50_f30_e400_rnd_co_n3"
     assert manifest["dynamic_edge_weight_mode"] == "conflict_only_rank"
     assert manifest["qtable_sha256"]
     assert all(
@@ -178,9 +181,7 @@ def test_stage08_spatiotemporal_warmup_manifest_is_explicit(tmp_path: Path):
         ]
     )
     _, environment_seeds, output_path, configs, manifest = build_experiment(args)
-    assert output_path.name.startswith(
-        "stage08_grid8_sample030_freq30_800ep_"
-    )
+    assert output_path.name == "s08_g8_s30_f30_e800_warm_raw_n6"
     assert len(environment_seeds) == 800
     assert len(configs) == 6
     assert manifest["adaptive_actor_warmup"] is True
@@ -286,3 +287,139 @@ def test_grid35_rejects_warmup_that_cannot_visit_every_agent():
                 "--dry-run",
             ]
         )
+
+
+def test_grid35_action2_anchored_residual_manifest_is_explicit(tmp_path: Path):
+    args = parse_args(
+        [
+            "--sample-scope", "sample050",
+            "--grid-num", "35",
+            "--decision-freq", "10",
+            "--training-episodes", "200",
+            "--model-seeds", "20264234,20264235,20264236",
+            "--adaptive-actor-warmup",
+            "--actor-warmup-episodes", "75",
+            "--actor-warmup-max-episodes", "120",
+            "--structured-spatiotemporal-warmup",
+            "--epsilon-anneal-after-actor-start",
+            "--epsilon-anneal-episodes", "200",
+            "--residual-action2-anchor",
+            "--residual-initial-override-prob", "0.05",
+            "--residual-exploration-start", "0.10",
+            "--residual-exploration-end", "0.02",
+            "--residual-override-budget", "0.10",
+            "--residual-override-penalty", "1.0",
+            "--dynamic-edge-weight-mode", "conflict_only_rank",
+            "--output-root", str(tmp_path),
+            "--run-id", "residual_gate",
+            "--dry-run",
+        ]
+    )
+    _, environment_seeds, output_path, configs, manifest = build_experiment(args)
+    assert output_path.name == "residual_gate"
+    assert manifest["default_output_directory_name"] == "s09_g35_s50_f10_e200_res_co_n3"
+    assert len(environment_seeds) == 200
+    assert manifest["comparison_name"].startswith(
+        "stage09_grid35_sample050_freq10_200ep_action2_anchored_residual_coma_"
+    )
+    assert manifest["initialization_variant"] == "action2_anchored_residual"
+    assert manifest["residual_policy"] == {
+        "default_action": 2,
+        "initial_override_probability": 0.05,
+        "exploration_start": 0.10,
+        "exploration_end": 0.02,
+        "override_budget": 0.10,
+        "override_penalty": 1.0,
+        "deterministic_delta_margin": 0.0,
+        "actor_advantage_baseline": "Q_i(s,u_-i,action2)",
+    }
+    assert all(config["residual_action2_anchor"] for config in configs)
+    assert all(
+        config["initialization_variant"] == "action2_anchored_residual"
+        for config in configs
+    )
+
+
+def test_grid35_standard_entropy_floor_ablation_is_explicit(tmp_path: Path):
+    args = parse_args(
+        [
+            "--sample-scope", "sample050",
+            "--grid-num", "35",
+            "--decision-freq", "10",
+            "--training-episodes", "800",
+            "--model-seeds", "20264234,20264235,20264236",
+            "--adaptive-actor-warmup",
+            "--actor-warmup-episodes", "75",
+            "--actor-warmup-max-episodes", "120",
+            "--structured-spatiotemporal-warmup",
+            "--epsilon-anneal-after-actor-start",
+            "--epsilon-anneal-episodes", "400",
+            "--entropy-floor-regularization",
+            "--entropy-floor-start", "0.8788898309",
+            "--entropy-floor-min", "0.35",
+            "--entropy-floor-anneal-updates", "400",
+            "--entropy-floor-penalty", "1.0",
+            "--dynamic-edge-weight-mode", "conflict_only_rank",
+            "--output-root", str(tmp_path),
+            "--run-id", "entropy_floor",
+            "--dry-run",
+        ]
+    )
+    _, environment_seeds, output_path, configs, manifest = build_experiment(args)
+
+    assert output_path.name == "entropy_floor"
+    assert len(environment_seeds) == 800
+    assert manifest["comparison_name"].startswith(
+        "stage10_grid35_sample050_freq10_800ep_random_coma_entropy_floor_"
+    )
+    assert manifest["entropy_floor_regularization"] == {
+        "raw_policy_only": True,
+        "start": pytest.approx(0.8 * math.log(3.0)),
+        "minimum": 0.35,
+        "anneal_updates": 400,
+        "penalty": 1.0,
+        "loss": "penalty * relu(target - mean_raw_policy_entropy)^2",
+    }
+    assert all(config["entropy_floor_regularization"] for config in configs)
+    assert all(config["entropy_floor_anneal_updates"] == 400 for config in configs)
+    assert all(not config["residual_action2_anchor"] for config in configs)
+
+
+def test_grid35_final_qtable_composite_ablation_is_explicit(tmp_path: Path):
+    args = parse_args(
+        [
+            "--sample-scope", "sample050",
+            "--grid-num", "35",
+            "--decision-freq", "10",
+            "--qtable-checkpoint", "final",
+            "--training-episodes", "800",
+            "--model-seeds", "20264234,20264235,20264236",
+            "--adaptive-actor-warmup",
+            "--actor-warmup-episodes", "75",
+            "--actor-warmup-max-episodes", "120",
+            "--epsilon-anneal-after-actor-start",
+            "--epsilon-anneal-episodes", "400",
+            "--normalize-coma-advantages",
+            "--entropy-floor-regularization",
+            "--entropy-floor-start", "0.8788898309",
+            "--entropy-floor-min", "0.35",
+            "--entropy-floor-anneal-updates", "400",
+            "--entropy-floor-penalty", "1.0",
+            "--dynamic-edge-weight-mode", "conflict_only_rank",
+            "--output-root", str(tmp_path),
+            "--run-id", "final_combo",
+            "--dry-run",
+        ]
+    )
+    _, _, output_path, configs, manifest = build_experiment(args)
+
+    assert output_path.name == "final_combo"
+    assert manifest["qtable_checkpoint"] == "final"
+    assert Path(manifest["qtable_path"]).name.startswith("final_")
+    assert manifest["normalize_coma_advantages"] is True
+    assert manifest["entropy_floor_regularization"] is not None
+    assert manifest["structured_spatiotemporal_warmup"] is False
+    assert all(config["qtable_checkpoint"] == "final" for config in configs)
+    assert all(config["normalize_coma_advantages"] for config in configs)
+    assert all(config["entropy_floor_regularization"] for config in configs)
+    assert all(not config["structured_coma_warmup"] for config in configs)

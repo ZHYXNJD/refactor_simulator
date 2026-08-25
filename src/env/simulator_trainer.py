@@ -130,6 +130,33 @@ class MetricsLogger:
             int(agent.normalize_coma_advantages),
             episode,
         )
+        self.writer.add_scalar(
+            'COMA/EntropyFloor/Enabled',
+            int(getattr(agent, 'entropy_floor_regularization', False)),
+            episode,
+        )
+        if getattr(agent, 'entropy_floor_regularization', False):
+            self.writer.add_scalar(
+                'COMA/EntropyFloor/TargetRawPolicyEntropy',
+                agent.entropy_floor_target(),
+                episode,
+            )
+            self.writer.add_scalar(
+                'COMA/EntropyFloor/PenaltyCoefficient',
+                agent.entropy_floor_penalty,
+                episode,
+            )
+        self.writer.add_scalar(
+            'COMA/ResidualAction2Anchor',
+            int(getattr(agent, 'residual_action2_anchor', False)),
+            episode,
+        )
+        if getattr(agent, 'residual_action2_anchor', False):
+            self.writer.add_scalar(
+                'COMA/Residual/OverrideBudget',
+                agent.residual_override_budget,
+                episode,
+            )
 
         critic_metrics = {
             'COMA/Critic/TargetMean': agent.critic_target_mean_history,
@@ -190,8 +217,20 @@ class MetricsLogger:
             agent.structured_warmup_temporal_switches,
             episode,
         )
+        normalizer_metrics = agent.state_normalizer_diagnostics()
+        for name, value in normalizer_metrics.items():
+            if np.isfinite(value):
+                self.writer.add_scalar(
+                    f'Training/StateNormalizer/{name}', value, episode
+                )
 
         per_agent_metrics = {
+            # Legacy Episode_Entropy is entropy of epsilon-soft behaviour.
+            # These tags expose both it and the actor's unperturbed softmax.
+            'BehaviourPolicyEntropy': agent.entropy_history,
+            'RawPolicyEntropy': agent.raw_policy_entropy_history,
+            'EntropyFloorDeficit': agent.entropy_floor_deficit_history,
+            'EntropyFloorLoss': agent.entropy_floor_loss_history,
             'AdvantageMean': agent.advantage_mean_history,
             'AdvantageStd': agent.advantage_std_history,
             'AdvantageAbsMean': agent.advantage_abs_mean_history,
@@ -212,6 +251,24 @@ class MetricsLogger:
                     )
                     pooled.extend(values)
             log_mean(f'COMA/ActorAggregate/{metric_name}', pooled)
+
+        if getattr(agent, 'residual_action2_anchor', False):
+            residual_metrics = {
+                'OverrideProbability': agent.residual_override_probability_history,
+                'DeltaTakenVsAction2': agent.residual_delta_taken_history,
+            }
+            for metric_name, histories in residual_metrics.items():
+                pooled = []
+                for agent_index, values in enumerate(histories):
+                    if values:
+                        mean_value = float(np.mean(values))
+                        self.writer.add_scalar(
+                            f'COMA/Residual/Actor_{agent_index}/{metric_name}',
+                            mean_value,
+                            episode,
+                        )
+                        pooled.extend(values)
+                log_mean(f'COMA/Residual/ActorAggregate/{metric_name}', pooled)
 
     def close(self):
         """Close the logger"""
@@ -272,15 +329,58 @@ class SimulatorTrainer:
             epoch: Current epoch number.
             train_config: Training configuration dictionary.
         """
-        seed_list = [0, 42, 3407, 1024, 215]
-        seed = seed_list[epoch % len(seed_list)]
-        # Set up simulator for this epoch
-        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        seed_list = train_config.get(
+            'environment_seed_sequence',
+            [0, 42, 3407, 1024, 215],
+        )
+        required_episodes = int(train_config.get(
+            'total_training_episodes',
+            int(train_config['num_epochs']) * int(
+                train_config.get('days_per_macro_epoch', 1)
+            ),
+        ))
+        if 'environment_seed_sequence' in train_config:
+            if len(seed_list) < required_episodes:
+                raise ValueError(
+                    'environment_seed_sequence must cover every Q-table training episode.'
+                )
+            seed = int(seed_list[epoch])
+        else:
+            seed = seed_list[epoch % len(seed_list)]
+        # A compact-COMA scenario sequence may independently control the date
+        # label and immutable request artifact for every daily rollout.
+        scenario_sequence = train_config.get('SCENARIO_SEQUENCE')
+        scenario = None
+        if scenario_sequence is not None:
+            if len(scenario_sequence) < int(train_config['num_epochs']):
+                raise ValueError('SCENARIO_SEQUENCE must cover every training episode.')
+            scenario = scenario_sequence[epoch]
+            self.simulator.experiment_date = str(scenario['label'])
+        else:
+            self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
         if not train_config['parallel']:
             self.simulator.reset(seed)
         else:
+            request_sequence = train_config.get('REQUEST_SEQUENCE')
+            if request_sequence is not None:
+                if len(request_sequence) < required_episodes:
+                    raise ValueError(
+                        'REQUEST_SEQUENCE must cover every Q-table training episode.'
+                    )
+                request_entry = request_sequence[epoch]
+                if isinstance(request_entry, (str, os.PathLike)):
+                    # Multi-scenario Q-table training deliberately avoids
+                    # retaining all 25 large request databases in memory.
+                    with open(request_entry, 'rb') as request_file:
+                        request_database = pickle.load(request_file)
+                else:
+                    request_database = request_entry
+            else:
+                request_database = train_config['REQUEST_DICT'][
+                    self.simulator.experiment_date
+                ]
             self.simulator.reset(seed, given_data=True,
-                                 request_databases=train_config['REQUEST_DICT'][self.simulator.experiment_date],
+                                 request_databases=request_database,
                                  driver_info=train_config['DRIVER_INFO'])
 
         # Run the simulation
@@ -326,14 +426,30 @@ class SimulatorTrainer:
             seed = seed_list[epoch % len(seed_list)]
         else:
             seed = int(seed_list[epoch])
-        # Set up simulator for this epoch
-        self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
+        # A compact-COMA scenario sequence pins every daily rollout to one
+        # immutable H1 request artifact.  Without it retain the legacy date
+        # rotation used by earlier dynamic-matching experiments.
+        scenario_sequence = train_config.get('SCENARIO_SEQUENCE')
+        scenario = None
+        if scenario_sequence is not None:
+            if len(scenario_sequence) < int(train_config['num_epochs']):
+                raise ValueError('SCENARIO_SEQUENCE must cover every training episode.')
+            scenario = scenario_sequence[epoch]
+            self.simulator.experiment_date = str(scenario['label'])
+        else:
+            self.simulator.experiment_date = train_config['train_dates'][epoch % len(train_config['train_dates'])]
         if not train_config['parallel']:
             # self.simulator.experiment_date = train_config['train_dates']
             self.simulator.reset(seed)
         else:
+            if scenario is not None:
+                request_entry = scenario['request_path']
+                with open(request_entry, 'rb') as request_file:
+                    request_database = pickle.load(request_file)
+            else:
+                request_database = train_config['REQUEST_DICT'][self.simulator.experiment_date]
             self.simulator.reset(seed, given_data=True,
-                                 request_databases=train_config['REQUEST_DICT'][self.simulator.experiment_date],
+                                 request_databases=request_database,
                                  driver_info=train_config['DRIVER_INFO'])
         grid_num = self.simulator.grid_num
         # Run the simulation
@@ -354,8 +470,22 @@ class SimulatorTrainer:
         if isinstance(self.simulator.dynamic_matching_agent, MADDPG):
             self.simulator.dynamic_matching_agent.begin_training_episode()
 
-        for step in range(self.simulator.finish_run_step + 1):
+        # ``finish_run_step`` is the number of valid one-minute simulation
+        # slots, hence valid table indices are 0..finish_run_step-1.  The
+        # former ``+ 1`` executed a nonexistent 901st step for a 15-hour
+        # episode and wrote index 900 into a table of length 900.
+        for step in range(self.simulator.finish_run_step):
             self.simulator.rl_step_train_matching_method()
+
+        if (
+            train_config.get('require_on_policy_rollout', False)
+            and self.simulator.dynamic_matching_agent.actor_update_mode == 'on_policy'
+            and not self.simulator.dynamic_matching_agent.on_policy_rollout
+        ):
+            raise RuntimeError(
+                'No on-policy dynamic-matching transitions were recorded for this episode. '
+                'Check external_dynamic_matching_actions and the decision loop before training.'
+            )
 
         normalizer_ready = False
         actor_update_performed = False
@@ -375,6 +505,77 @@ class SimulatorTrainer:
                 actor_update_performed = bool(
                     self.simulator.dynamic_matching_agent.update_on_policy_actor()
                 )
+
+        # H1 compact COMA has a deliberately strict positive learning gate:
+        # the first five daily rollouts are calibration-only, then episode 6
+        # must update both the critic and actor.  This turns a previously
+        # silent "ran but never learned" failure into an immediate traceback.
+        first_learning_episode = train_config.get('expected_first_learning_episode')
+        if first_learning_episode is not None:
+            first_learning_episode = int(first_learning_episode)
+            calibration_episodes = int(
+                train_config.get('normalizer_calibration_episodes', first_learning_episode)
+            )
+            agent = self.simulator.dynamic_matching_agent
+            critic_updated = bool(getattr(agent, 'critic1_losses_history', []))
+            if epoch < first_learning_episode:
+                if normalizer_ready or actor_update_performed or critic_updated:
+                    raise RuntimeError(
+                        'Learning started during the H1 normalizer-calibration pass: '
+                        f'episode_index={epoch}, expected_first_learning_episode='
+                        f'{first_learning_episode}.'
+                    )
+                if epoch == calibration_episodes - 1 and not bool(
+                    getattr(agent, 'is_scaler_fitted', False)
+                ):
+                    raise RuntimeError(
+                        'H1 normalizer was not fitted after its required '
+                        f'{calibration_episodes} calibration episodes.'
+                    )
+            elif epoch == first_learning_episode:
+                if not normalizer_ready:
+                    raise RuntimeError(
+                        'H1 episode 6 did not enter normalized learning; '
+                        'the state normalizer is not ready.'
+                    )
+                if not critic_updated:
+                    raise RuntimeError(
+                        'H1 episode 6 produced no critic update; refusing to '
+                        'continue a non-learning run.'
+                    )
+                if not actor_update_performed:
+                    raise RuntimeError(
+                        'H1 episode 6 produced no actor update; refusing to '
+                        'continue a critic-only run.'
+                    )
+
+            if train_config.get('require_finite_learning_diagnostics', False) and normalizer_ready:
+                diagnostics = agent.state_normalizer_diagnostics()
+                expected_clip = float(getattr(agent, 'state_normalizer_clip_value', 0.0))
+                normalized_max_abs = diagnostics['last_max_abs']
+                if (
+                    not np.isfinite(normalized_max_abs)
+                    or (expected_clip > 0.0 and normalized_max_abs > expected_clip + 1e-6)
+                ):
+                    raise RuntimeError(
+                        'H1 normalized state is non-finite or exceeds its configured clip: '
+                        f'{normalized_max_abs}.'
+                    )
+                critic_targets = agent.critic_target_max_history + agent.critic_target_min_history
+                critic_q_values = agent.critic_q_taken_mean_history + agent.critic_q_taken_std_history
+                critic_losses = agent.critic1_losses_history
+                h1_hyper = train_config.get('hyper_parameters', {})
+                limits = (
+                    ('critic target', critic_targets, float(h1_hyper.get('h1_max_critic_target_abs', 1e6))),
+                    ('critic Q', critic_q_values, float(h1_hyper.get('h1_max_critic_q_abs', 1e6))),
+                    ('critic loss', critic_losses, float(h1_hyper.get('h1_max_critic_loss', 1e12))),
+                )
+                for metric_name, values, limit in limits:
+                    if not values or not np.isfinite(values).all() or np.max(np.abs(values)) > limit:
+                        raise RuntimeError(
+                            f'H1 {metric_name} diagnostics are non-finite or exceed {limit}; '
+                            'refusing to continue an unstable run.'
+                        )
 
         self.simulator.dynamic_matching_agent.current_episode += 1
 
@@ -486,6 +687,9 @@ class SimulatorTrainer:
                 'advantage_discounted_reward': 'ad',
                 'idle_relative_raw_reward': 'irr',
                 'idle_relative_discounted_reward': 'ird',
+                'idle_relative_matched_only': 'irmo',
+                'idle_relative_idle_transitions': 'irid',
+                'matched_only': 'mo',
             }.get(ablation_name, str(ablation_name)[:8])
             writer_filename = os.path.join(write_path,
                                            f'grid_{grid_num}_freq_{decision_freq}_{ablation_code}_' +
@@ -502,6 +706,9 @@ class SimulatorTrainer:
                 'advantage_discounted_reward': 'ad',
                 'idle_relative_raw_reward': 'irr',
                 'idle_relative_discounted_reward': 'ird',
+                'idle_relative_matched_only': 'irmo',
+                'idle_relative_idle_transitions': 'irid',
+                'matched_only': 'mo',
             }.get(ablation_name, str(ablation_name)[:8])
             writer_filename = os.path.join(write_path,
                                            f'grid_{grid_num}_freq_{decision_freq}_{ablation_code}_' +
@@ -514,6 +721,8 @@ class SimulatorTrainer:
 
         best_checkpoint = None
         final_checkpoint = None
+        macro_checkpoints = []
+        save_every_macro = bool(train_config.get('save_every_macro', False))
         days_per_macro_epoch = int(train_config.get('days_per_macro_epoch', 1))
         train_dates = train_config['train_dates']
         if days_per_macro_epoch <= 0 or days_per_macro_epoch > len(train_dates):
@@ -582,7 +791,24 @@ class SimulatorTrainer:
                         )
             writer.flush()
 
-            if best_checkpoint is None or score > best_checkpoint['score']:
+            if save_every_macro:
+                macro_path = os.path.join(
+                    writer_filename,
+                    f'macro_{epoch:02d}_episodes_{(epoch + 1) * days_per_macro_epoch:03d}.pkl',
+                )
+                self.simulator.score_agent.save_parameters(macro_path)
+                macro_checkpoints.append({
+                    'macro_epoch': epoch,
+                    'completed_daily_episodes': (epoch + 1) * days_per_macro_epoch,
+                    'score': score,
+                    'path': os.path.basename(macro_path),
+                    'visits_path': os.path.basename(os.path.splitext(macro_path)[0] + '.visits.npy'),
+                })
+                if best_checkpoint is None or score > best_checkpoint['score']:
+                    best_checkpoint = {'score': score, 'epoch': epoch, 'path': macro_path}
+                if epoch == train_config['num_epochs'] - 1:
+                    final_checkpoint = {'score': score, 'epoch': epoch, 'path': macro_path}
+            elif best_checkpoint is None or score > best_checkpoint['score']:
                 previous_best_path = best_checkpoint['path'] if best_checkpoint is not None else None
                 best_path = os.path.join(
                     writer_filename,
@@ -594,8 +820,11 @@ class SimulatorTrainer:
                 if (previous_best_path is not None and previous_best_path != best_path and
                         os.path.exists(previous_best_path)):
                     os.remove(previous_best_path)
+                    previous_visits_path = os.path.splitext(previous_best_path)[0] + '.visits.npy'
+                    if os.path.exists(previous_visits_path):
+                        os.remove(previous_visits_path)
 
-            if epoch == train_config['num_epochs'] - 1:
+            if not save_every_macro and epoch == train_config['num_epochs'] - 1:
                 if best_checkpoint['epoch'] == epoch:
                     final_checkpoint = dict(best_checkpoint)
                 else:
@@ -607,6 +836,20 @@ class SimulatorTrainer:
                     final_checkpoint = {'score': score, 'epoch': epoch, 'path': final_path}
 
         writer.close()
+        if save_every_macro:
+            expected_count = int(train_config['num_epochs'])
+            if len(macro_checkpoints) != expected_count:
+                raise AssertionError(
+                    f'Expected {expected_count} macro checkpoints, got {len(macro_checkpoints)}.'
+                )
+            missing_archives = [
+                record['path'] for record in macro_checkpoints
+                if not os.path.isfile(os.path.join(writer_filename, record['path']))
+            ]
+            if missing_archives:
+                raise FileNotFoundError(
+                    f'Missing archived macro Q-tables: {missing_archives}'
+                )
         checkpoint_summary = {
             'best': {
                 **best_checkpoint,
@@ -616,6 +859,9 @@ class SimulatorTrainer:
                 **final_checkpoint,
                 'path': os.path.basename(final_checkpoint['path']),
             },
+            'save_every_macro': save_every_macro,
+            'macro_checkpoint_count': len(macro_checkpoints),
+            'macro_checkpoints': macro_checkpoints,
         }
         with open(os.path.join(writer_filename, 'checkpoint_summary.json'), 'w', encoding='utf-8') as file:
             json.dump(checkpoint_summary, file, ensure_ascii=False, indent=4)
@@ -729,10 +975,12 @@ class SimulatorTrainer:
         days_per_macro_epoch = int(train_config.get('days_per_macro_epoch', len(train_dates)))
         num_macro_epochs = int(train_config.get('num_macro_epochs', train_config['num_epochs']))
         checkpoint_interval = int(train_config.get('checkpoint_interval_macro_epochs', 5))
+        checkpoint_cycle_macros = int(train_config.get('checkpoint_cycle_macros', checkpoint_interval))
+        first_checkpoint_macro = int(train_config.get('first_checkpoint_macro', 0))
         if days_per_macro_epoch != len(train_dates):
             raise ValueError('Dynamic-matching macro epochs must cover every training date.')
-        if num_macro_epochs <= 0 or checkpoint_interval <= 0:
-            raise ValueError('num_macro_epochs and checkpoint_interval_macro_epochs must be positive.')
+        if num_macro_epochs <= 0 or checkpoint_interval <= 0 or checkpoint_cycle_macros <= 0:
+            raise ValueError('macro/checkpoint intervals must be positive.')
         total_training_episodes = num_macro_epochs * days_per_macro_epoch
         if total_training_episodes != int(train_config['num_epochs']):
             raise ValueError(
@@ -746,35 +994,44 @@ class SimulatorTrainer:
         num_actions = int(self.simulator.dynamic_matching_agent.n_actions[0])
         logger = MetricsLogger(log_dir=writer_filename, num_agents=self.simulator.grid_num, num_actions=num_actions)
         checkpoint_records = []
+        cycle_rewards = []
+        cycle_labels = []
         for macro_epoch in range(num_macro_epochs):
             daily_rewards = []
+            scenario_labels = []
             for day_offset in range(days_per_macro_epoch):
                 episode_index = macro_epoch * days_per_macro_epoch + day_offset
                 self.run_training_epoch_match_method(episode_index, train_config, logger)
                 daily_rewards.append(float(self.simulator.total_reward))
+                scenario_labels.append(str(self.simulator.experiment_date))
 
             train_score = float(np.mean(daily_rewards))
             logger.writer.add_scalar('Macro/MeanReward', train_score, macro_epoch)
             logger.writer.add_scalar('Macro/StdReward', float(np.std(daily_rewards)), macro_epoch)
             logger.writer.add_scalar('Macro/MinReward', float(np.min(daily_rewards)), macro_epoch)
             logger.writer.add_scalar('Macro/MaxReward', float(np.max(daily_rewards)), macro_epoch)
-            for date, reward in zip(train_dates, daily_rewards):
+            for date, reward in zip(scenario_labels, daily_rewards):
                 logger.writer.add_scalar(f'MacroByDate/{date}', reward, macro_epoch)
 
-            is_checkpoint = ((macro_epoch + 1) % checkpoint_interval == 0 or
-                             macro_epoch == num_macro_epochs - 1)
+            cycle_rewards.extend(daily_rewards)
+            cycle_labels.extend(scenario_labels)
+            cycle_complete = ((macro_epoch + 1) % checkpoint_cycle_macros == 0 or
+                              macro_epoch == num_macro_epochs - 1)
+            is_checkpoint = cycle_complete and macro_epoch >= first_checkpoint_macro
             logger.writer.add_scalar('Checkpoint/IsSaved', int(is_checkpoint), macro_epoch)
             if is_checkpoint:
+                cycle_score = float(np.mean(cycle_rewards))
                 model_path = os.path.join(
                     writer_filename,
-                    f'model_macro{macro_epoch:03d}_train{int(train_score)}.pt',
+                    f'model_macro{macro_epoch:03d}_cycle{int(cycle_score)}.pt',
                 )
                 self.simulator.dynamic_matching_agent.save(model_path)
                 record = {
                     'macro_epoch': macro_epoch,
                     'training_episode': (macro_epoch + 1) * days_per_macro_epoch,
-                    'train_reward_mean': train_score,
-                    'train_reward_by_date': dict(zip(train_dates, daily_rewards)),
+                    'train_reward_mean': cycle_score,
+                    'train_reward_by_date': dict(zip(cycle_labels, cycle_rewards)),
+                    'cycle_episode_count': len(cycle_rewards),
                     'model_seed': train_config['hyper_parameters']['model_seed'],
                     'pair_id': train_config['hyper_parameters'].get('pair_id'),
                     'initialization_variant': train_config['hyper_parameters'].get(
@@ -783,15 +1040,23 @@ class SimulatorTrainer:
                     'path': os.path.basename(model_path),
                 }
                 checkpoint_records.append(record)
-                logger.writer.add_scalar('Checkpoint/TrainingMeanReward', train_score, macro_epoch)
+                logger.writer.add_scalar('Checkpoint/TrainingMeanReward', cycle_score, macro_epoch)
                 logger.writer.add_scalar('Checkpoint/TrainingEpisode', record['training_episode'], macro_epoch)
+            if cycle_complete:
+                cycle_rewards = []
+                cycle_labels = []
             logger.writer.flush()
 
         logger.close()
-        best_checkpoint = max(checkpoint_records, key=lambda record: record['train_reward_mean'])
+        best_checkpoint = (
+            max(checkpoint_records, key=lambda record: record['train_reward_mean'])
+            if checkpoint_records else None
+        )
         summary = {
-            'selection_metric': 'mean_reward_across_five_training_dates',
+            'selection_metric': 'training_only_cycle_checkpoint_diagnostic',
             'checkpoint_interval_macro_epochs': checkpoint_interval,
+            'checkpoint_cycle_macros': checkpoint_cycle_macros,
+            'first_checkpoint_macro': first_checkpoint_macro,
             'num_macro_epochs': num_macro_epochs,
             'days_per_macro_epoch': days_per_macro_epoch,
             'total_training_episodes': total_training_episodes,
@@ -1031,6 +1296,7 @@ class SimulatorTrainer:
                     advantage_context=simulator._matching_value_context(),
                     dynamic_actions=simulator._current_dynamic_matching_actions(),
                     dynamic_edge_weight_mode=simulator.dynamic_edge_weight_mode,
+                    dynamic_action1_score_mode=simulator.dynamic_action1_score_mode,
                 )
                 df_new_matched_requests, df_update_wait_requests = simulator.update_info_after_matching_multi_process(
                     matched_pair_actual_indexes, matched_itinerary)
@@ -1305,6 +1571,7 @@ class SimulatorTrainer:
                     advantage_context=simulator._matching_value_context(),
                     dynamic_actions=simulator._current_dynamic_matching_actions(),
                     dynamic_edge_weight_mode=simulator.dynamic_edge_weight_mode,
+                    dynamic_action1_score_mode=simulator.dynamic_action1_score_mode,
                 )
                 # Step 2: driver/passenger reaction after dispatching
                 df_new_matched_requests, df_update_wait_requests = simulator.update_info_after_matching_multi_process(

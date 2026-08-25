@@ -331,7 +331,7 @@ nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-sco
 The expected output directory is:
 
 ```text
-dynamic_matching/all_output/coma_driver0621_stage08/stage08_grid8_sample030_freq30_800ep_random_coma_spatiotemporal_warmup_epsanneal400_epsafteractor_actorwarm50to120_seed6
+dynamic_matching/all_output/coma_driver0621_stage08/s08_g8_s30_f30_e800_warm_raw_n6
 ```
 
 TensorBoard must contain the previous reward/action/critic/advantage tags plus
@@ -361,6 +361,58 @@ nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-sco
 ```
 
 ## 6. Conflict-only rank COMA candidate (50% only)
+
+## 6.1 Stage-09 action-2 anchored residual COMA (35-grid, 10min gate)
+
+This is a new algorithm branch, not a continuation of any Stage-08 checkpoint.
+It fixes action 2 as the Q-table default and learns only action-0/1 overrides.
+The centralized critic remains the three-action COMA critic, but the actor
+advantage is `Q_i(s,u_-i,u_i) - Q_i(s,u_-i,action2)`.  The configured
+override-rate budget is a policy-loss regularizer only: it does not alter the
+business reward or the frozen Q-table.  Deterministic evaluation retains
+action 2 unless both the learned override gate is at least 0.5 and its critic
+delta clears the configured margin.
+
+Upload this runtime overlay together; do not mix it with an older Stage-08
+agent/launcher pair:
+
+- `dynamic_matching/dynamic_matching_agent/maddpd_discreate.py`
+- `dynamic_matching/train_stage06_grid8_coma_warmup.py`
+- `src/env/simulator_trainer.py`
+- `dynamic_matching/test_standard_coma_state_normalization.py`
+- `dynamic_matching/test_stage06_coma_config.py`
+
+Compile and run the two inexpensive local gates before a server run:
+
+```bash
+conda activate trans_simu
+python -m py_compile dynamic_matching/dynamic_matching_agent/maddpd_discreate.py dynamic_matching/train_stage06_grid8_coma_warmup.py src/env/simulator_trainer.py dynamic_matching/test_standard_coma_state_normalization.py dynamic_matching/test_stage06_coma_config.py
+python -c "from dynamic_matching.test_standard_coma_state_normalization import test_action2_anchored_residual_policy_defaults_to_action2_and_uses_delta_baseline as t; t(); print('residual policy gate passed')"
+python -c "from pathlib import Path; import tempfile; from dynamic_matching.test_stage06_coma_config import test_grid35_action2_anchored_residual_manifest_is_explicit as t; d=tempfile.TemporaryDirectory(); t(Path(d.name)); print('residual launcher gate passed')"
+```
+
+First run the exact 3-seed, 200-episode manifest in the foreground.  This is
+a learning-signal gate, not a final comparison: inspect critic readiness,
+`COMA/Residual/ActorAggregate/OverrideProbability`,
+`COMA/Residual/ActorAggregate/DeltaTakenVsAction2`, and macro mean reward.
+
+```bash
+python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-scope sample050 --grid-num 35 --decision-freq 10 --gpu-id 0 --num-workers 3 --training-episodes 200 --model-seeds 20264234,20264235,20264236 --adaptive-actor-warmup --actor-warmup-episodes 75 --actor-warmup-max-episodes 120 --critic-readiness-window 5 --critic-readiness-max-normalized-mse 0.2 --critic-readiness-min-explained-variance 0.8 --structured-spatiotemporal-warmup --epsilon-anneal-after-actor-start --epsilon-anneal-episodes 200 --residual-action2-anchor --residual-initial-override-prob 0.05 --residual-exploration-start 0.10 --residual-exploration-end 0.02 --residual-override-budget 0.10 --residual-override-penalty 1.0 --residual-deterministic-margin 0.0 --dynamic-edge-weight-mode conflict_only_rank --output-root dynamic_matching/all_output/coma_driver0621_stage09 --dry-run
+```
+
+After the manifest confirms `stage09`, `action2_anchored_residual`, default
+action 2, and the intended Q-table SHA, launch the same job:
+
+```bash
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-scope sample050 --grid-num 35 --decision-freq 10 --gpu-id 0 --num-workers 3 --training-episodes 200 --model-seeds 20264234,20264235,20264236 --adaptive-actor-warmup --actor-warmup-episodes 75 --actor-warmup-max-episodes 120 --critic-readiness-window 5 --critic-readiness-max-normalized-mse 0.2 --critic-readiness-min-explained-variance 0.8 --structured-spatiotemporal-warmup --epsilon-anneal-after-actor-start --epsilon-anneal-episodes 200 --residual-action2-anchor --residual-initial-override-prob 0.05 --residual-exploration-start 0.10 --residual-exploration-end 0.02 --residual-override-budget 0.10 --residual-override-penalty 1.0 --residual-deterministic-margin 0.0 --dynamic-edge-weight-mode conflict_only_rank --output-root dynamic_matching/all_output/coma_driver0621_stage09 > dynamic_matching/logs_driver0621/c09_g35_f10_res_200_s3.log 2>&1 < /dev/null &
+echo $! > dynamic_matching/logs_driver0621/c09_g35_f10_res_200_s3.pid
+```
+
+Do not promote this gate result from training reward.  If the residual
+metrics show nonzero, bounded overrides and credible positive delta signals,
+run a separate paired validation/final-held-out evaluation with action2 as the
+strict baseline.  Do not use the final held-out dates to choose the override
+margin or budget.
 
 `conflict_only_rank` preserves raw edge scores in every action-pure candidate
 graph component and applies within-component `origin-grid x action`
@@ -822,3 +874,71 @@ tail -n 60 dynamic_matching/logs_driver0621/c35_f30.log
 free -h
 nvidia-smi
 ```
+
+## 10. Grid-35 / 10-min standard-COMA ablations (three paired seeds)
+
+The standard core is the control.  These three jobs use the same 50% fixed
+sample, 800 episodes, `conflict_only_rank`, adaptive 75--120 critic warm-up,
+epsilon `0.5 -> 0.02` over 400 actor updates, model seeds
+`20264234,20264235,20264236`, and the default shared environment-seed
+sequence.  They differ from the standard core in exactly one item:
+
+1. no structured warm-up;
+2. per-actor on-policy COMA advantage normalization;
+3. a raw-policy entropy-floor loss, with target `0.8788898309 -> 0.35` over
+   400 actor updates and penalty coefficient 1.0.
+
+First add `--dry-run` to each command and check that their manifests agree on
+all shared fields, including Q-table SHA, driver SHA, training dates, model
+seeds and environment-seed range.  Run no more than the available GPU/RAM
+budget permits; replace the example GPU IDs below with idle devices if the
+Stage-09 job is still using them.
+
+```bash
+mkdir -p dynamic_matching/logs_driver0621 dynamic_matching/all_output/c35_ablations
+
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-scope sample050 --grid-num 35 --decision-freq 10 --gpu-id 0 --num-workers 3 --training-episodes 800 --model-seeds 20264234,20264235,20264236 --adaptive-actor-warmup --actor-warmup-episodes 75 --actor-warmup-max-episodes 120 --critic-readiness-window 5 --critic-readiness-max-normalized-mse 0.2 --critic-readiness-min-explained-variance 0.8 --epsilon-anneal-after-actor-start --epsilon-anneal-episodes 400 --dynamic-edge-weight-mode conflict_only_rank --output-root dynamic_matching/all_output/c35_ablations --run-id g35f10_nostruct > dynamic_matching/logs_driver0621/g35f10_nostruct.log 2>&1 < /dev/null &
+echo $! > dynamic_matching/logs_driver0621/g35f10_nostruct.pid
+
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-scope sample050 --grid-num 35 --decision-freq 10 --gpu-id 1 --num-workers 3 --training-episodes 800 --model-seeds 20264234,20264235,20264236 --adaptive-actor-warmup --actor-warmup-episodes 75 --actor-warmup-max-episodes 120 --critic-readiness-window 5 --critic-readiness-max-normalized-mse 0.2 --critic-readiness-min-explained-variance 0.8 --structured-spatiotemporal-warmup --epsilon-anneal-after-actor-start --epsilon-anneal-episodes 400 --normalize-coma-advantages --dynamic-edge-weight-mode conflict_only_rank --output-root dynamic_matching/all_output/c35_ablations --run-id g35f10_advnorm > dynamic_matching/logs_driver0621/g35f10_advnorm.log 2>&1 < /dev/null &
+echo $! > dynamic_matching/logs_driver0621/g35f10_advnorm.pid
+
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-scope sample050 --grid-num 35 --decision-freq 10 --gpu-id 1 --num-workers 3 --training-episodes 800 --model-seeds 20264234,20264235,20264236 --adaptive-actor-warmup --actor-warmup-episodes 75 --actor-warmup-max-episodes 120 --critic-readiness-window 5 --critic-readiness-max-normalized-mse 0.2 --critic-readiness-min-explained-variance 0.8 --structured-spatiotemporal-warmup --epsilon-anneal-after-actor-start --epsilon-anneal-episodes 400 --entropy-floor-regularization --entropy-floor-start 0.8788898309 --entropy-floor-min 0.35 --entropy-floor-anneal-updates 400 --entropy-floor-penalty 1.0 --dynamic-edge-weight-mode conflict_only_rank --output-root dynamic_matching/all_output/c35_ablations --run-id g35f10_entfloor > dynamic_matching/logs_driver0621/g35f10_entfloor.log 2>&1 < /dev/null &
+echo $! > dynamic_matching/logs_driver0621/g35f10_entfloor.pid
+```
+
+For the entropy run, TensorBoard must contain legacy
+`Actor_i/Episode_Entropy` plus the disambiguating
+`COMA/Actor_i/BehaviourPolicyEntropy`, `COMA/Actor_i/RawPolicyEntropy`,
+`COMA/EntropyFloor/TargetRawPolicyEntropy`,
+`COMA/Actor_i/EntropyFloorDeficit` and
+`COMA/Actor_i/EntropyFloorLoss` tags.  Do not use final held-out dates to
+change the entropy target or penalty; compare the final checkpoints under the
+same frozen held-out protocol as the standard core.
+
+## 11. Grid-35 / 10-min final-Q-table composite ablation (three seeds)
+
+This is an explicitly named **combined ablation**, not a replacement for the
+best-Q-table standard core and not a single-variable causal comparison.  It
+uses the `final` checkpoint from the same 35-grid/10-min 50% Q-table training
+run, enables per-agent on-policy advantage normalization and the one-sided
+raw-policy entropy-floor penalty, and disables the structured spatiotemporal
+warm-up.  The adaptive critic-readiness warm-up remains active.  The manifest
+records `qtable_checkpoint=final`, exact path/SHA, and all three enabled or
+disabled learning settings so it cannot be mistaken for the standard core.
+
+First run the command with `--dry-run`; it must resolve
+`final_e19_s658457.pkl`, not the best checkpoint.  Then remove only
+`--dry-run` to start it.  Choose an idle GPU; the example below uses GPU 2.
+
+```bash
+mkdir -p dynamic_matching/logs_driver0621 dynamic_matching/all_output/c35_final_combo
+nohup python -u dynamic_matching/train_stage06_grid8_coma_warmup.py --sample-scope sample050 --grid-num 35 --decision-freq 10 --qtable-checkpoint final --gpu-id 2 --num-workers 3 --training-episodes 800 --model-seeds 20264234,20264235,20264236 --adaptive-actor-warmup --actor-warmup-episodes 75 --actor-warmup-max-episodes 120 --critic-readiness-window 5 --critic-readiness-max-normalized-mse 0.2 --critic-readiness-min-explained-variance 0.8 --epsilon-anneal-after-actor-start --epsilon-anneal-episodes 400 --normalize-coma-advantages --entropy-floor-regularization --entropy-floor-start 0.8788898309 --entropy-floor-min 0.35 --entropy-floor-anneal-updates 400 --entropy-floor-penalty 1.0 --dynamic-edge-weight-mode conflict_only_rank --output-root dynamic_matching/all_output/c35_final_combo --run-id g35f10_fq > dynamic_matching/logs_driver0621/g35f10_fq.log 2>&1 < /dev/null &
+echo $! > dynamic_matching/logs_driver0621/g35f10_fq.pid
+```
+
+For an auditable report, evaluate the three checkpoints against both the
+matching final-Q all-action2 baseline and the production best-Q all-action2
+baseline on the same fixed date/seed pairs.  The first is the direct
+within-ablation comparator; the second prevents presenting a weaker Q-table
+as if it were the production baseline.

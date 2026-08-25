@@ -197,8 +197,18 @@ def _validate_qtable_scope(qtable_path, sample_ratio, grid_num, decision_freq):
         )
 
 
-def qtable_path_for_sample_ratio(grid_num, decision_freq, sample_ratio=SAMPLE_RATIO):
-    """Resolve the training-selected best Q-table for one exact data scope."""
+def qtable_path_for_sample_ratio(
+    grid_num,
+    decision_freq,
+    sample_ratio=SAMPLE_RATIO,
+    checkpoint="best",
+):
+    """Resolve one named frozen Q-table checkpoint for an exact scenario."""
+    checkpoint = str(checkpoint).lower()
+    if checkpoint not in {"best", "final"}:
+        raise ValueError(
+            f"Unsupported Q-table checkpoint {checkpoint!r}; expected 'best' or 'final'."
+        )
     ratio = normalize_sample_ratio(sample_ratio)
     key = (int(grid_num), int(decision_freq))
     qtable_root = QTABLE_ROOTS[ratio]
@@ -215,7 +225,12 @@ def qtable_path_for_sample_ratio(grid_num, decision_freq, sample_ratio=SAMPLE_RA
         )
     with summaries[0].open(encoding="utf-8") as file:
         checkpoint_summary = json.load(file)
-    qtable_path = summaries[0].parent / checkpoint_summary["best"]["path"]
+    checkpoint_info = checkpoint_summary.get(checkpoint)
+    if not isinstance(checkpoint_info, dict) or not checkpoint_info.get("path"):
+        raise ValueError(
+            f"Missing {checkpoint!r} checkpoint metadata in {summaries[0]}."
+        )
+    qtable_path = summaries[0].parent / checkpoint_info["path"]
     if not qtable_path.exists():
         raise FileNotFoundError(f"Missing scenario Q-table: {qtable_path}")
     _validate_qtable_scope(qtable_path, ratio, key[0], key[1])
@@ -306,10 +321,14 @@ def stage2_task(
     decision_freq,
     experiment_mode,
     sample_ratio=SAMPLE_RATIO,
+    qtable_checkpoint="best",
 ):
     ratio = normalize_sample_ratio(sample_ratio)
     qtable_path = qtable_path_for_sample_ratio(
-        grid_num, decision_freq, sample_ratio=ratio
+        grid_num,
+        decision_freq,
+        sample_ratio=ratio,
+        checkpoint=qtable_checkpoint,
     )
     return {
         "grid_num": grid_num,
@@ -329,6 +348,7 @@ def stage2_task(
         "pickup_mode": "ma",
         "method": "dynamic_matching",
         "load_path": str(qtable_path),
+        "qtable_checkpoint": str(qtable_checkpoint).lower(),
         "agent_type": "maddpg",
         "actor_loss_mode": "coma",
         # Strict on-policy COMA.  The historical replay-based implementation

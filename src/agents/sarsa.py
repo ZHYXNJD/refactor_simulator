@@ -92,6 +92,12 @@ class SarsaAgent(object):
 
         # initialization of Q value table
         self.q_value_table = np.zeros((self.max_time_slice,self.grid_num))  # each state a two dimension vector
+        # Number of TD samples aggregated into each state.  This is saved as
+        # a sidecar for Q-table ensemble calibration and never affects policy
+        # behaviour or checkpoint compatibility.
+        self.q_visit_count = np.zeros(
+            (self.max_time_slice, self.grid_num), dtype=np.int64
+        )
         for time_slice in self.time_slices:
             for grid_id in self.grid_ids:
                 self.q_value_table[time_slice,grid_id] = 0
@@ -174,6 +180,8 @@ class SarsaAgent(object):
         with open(save_path, 'wb') as file:
             # pickle.dump(v, file, protocol=pickle.HIGHEST_PROTOCOL)
             pickle.dump(self.q_value_table, file)
+        visit_path = os.path.splitext(save_path)[0] + '.visits.npy'
+        np.save(visit_path, self.q_visit_count)
 
     # SARSA algorithm
     def perceive(self, sarsa_per_time_slice: list):
@@ -245,6 +253,8 @@ class SarsaAgent(object):
         # 还原 t,l
         t_unique = unique_idx // self.grid_num
         l_unique = unique_idx % self.grid_num
+
+        self.q_visit_count[t_unique, l_unique] += count.astype(np.int64)
 
         # 更新
         self.q_value_table[t_unique, l_unique] = \

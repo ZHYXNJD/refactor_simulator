@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -50,7 +51,6 @@ from dynamic_matching.marl_stage2_common import (
 )
 from src.agents.sarsa import SarsaAgent
 from src.env.simulator_env import Simulator
-from src.env.simulator_trainer import SimulatorTrainer
 
 
 DEFAULT_GRID_NUM = 8
@@ -93,6 +93,43 @@ def _structured_spatial_episode_count(episode_count: int) -> int:
     return 2 * full_cycles + max(0, remainder - 2)
 
 
+def _default_output_directory_name(
+    *, stage_name: str, grid_num: int, scope: str, decision_freq: int,
+    training_episodes: int, algorithm_fragment: str,
+    dynamic_edge_weight_mode: str, model_seed_count: int, qtable_checkpoint: str,
+) -> str:
+    """Return a short, stable Windows-safe run directory name.
+
+    The full, human-readable comparison description remains in
+    ``experiment_manifest.json``.  This name deliberately avoids embedding
+    every hyperparameter, which previously caused path-length failures once
+    TensorBoard/checkpoint subdirectories were appended.
+    """
+    scope_tag = {"sample030": "s30", "sample050": "s50", "full": "full"}[scope]
+    algorithm_tag = {
+        "action2_anchored_residual_coma": "res",
+        "random_coma_entropy_floor": "entf",
+        "random_coma_spatiotemporal_warmup": "warm",
+        "random_coma_spatiotemporal_warmup_advnorm": "wadv",
+        "random_coma_critic_warmup": "crit",
+        "random_coma_advnorm": "advn",
+        "random_coma": "rnd",
+    }[algorithm_fragment]
+    edge_tag = {
+        "raw": "raw",
+        "rank": "rank",
+        "rank_only": "ronly",
+        "conflict_only_rank": "co",
+        "raw_cardinality": "card",
+    }[dynamic_edge_weight_mode]
+    checkpoint_tag = "" if qtable_checkpoint == "best" else "_qf"
+    return (
+        f"{stage_name.replace('stage', 's')}_g{grid_num}_{scope_tag}_"
+        f"f{decision_freq}_e{training_episodes}_{algorithm_tag}_{edge_tag}_"
+        f"n{model_seed_count}{checkpoint_tag}"
+    )
+
+
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=(
@@ -106,6 +143,15 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--decision-freq", type=int, choices=SUPPORTED_FREQUENCIES, required=True
+    )
+    parser.add_argument(
+        "--qtable-checkpoint",
+        choices=("best", "final"),
+        default="best",
+        help=(
+            "frozen action2 Q-table checkpoint from the matching training run; "
+            "default best preserves the production baseline"
+        ),
     )
     parser.add_argument("--gpu-id", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=3)
@@ -149,6 +195,44 @@ def parse_args(argv=None):
         ),
     )
     parser.add_argument(
+        "--entropy-floor-regularization",
+        action="store_true",
+        help=(
+            "add a one-sided, time-decayed raw-policy entropy-floor loss to "
+            "standard three-action COMA"
+        ),
+    )
+    parser.add_argument(
+        "--entropy-floor-start", type=float, default=0.8 * math.log(3.0),
+        help="raw-policy entropy target at the first actor update",
+    )
+    parser.add_argument(
+        "--entropy-floor-min", type=float, default=0.35,
+        help="non-zero raw-policy entropy target after annealing",
+    )
+    parser.add_argument(
+        "--entropy-floor-anneal-updates", type=int,
+        help="actor updates over which the entropy target anneals; defaults to epsilon annealing",
+    )
+    parser.add_argument(
+        "--entropy-floor-penalty", type=float, default=1.0,
+        help="coefficient of the one-sided raw-policy entropy-floor penalty",
+    )
+    parser.add_argument(
+        "--residual-action2-anchor",
+        action="store_true",
+        help=(
+            "learn a constrained action-0/1 override policy around frozen "
+            "action2/Q-table, rather than a free three-action COMA policy"
+        ),
+    )
+    parser.add_argument("--residual-initial-override-prob", type=float, default=0.05)
+    parser.add_argument("--residual-exploration-start", type=float, default=0.10)
+    parser.add_argument("--residual-exploration-end", type=float, default=0.02)
+    parser.add_argument("--residual-override-budget", type=float, default=0.10)
+    parser.add_argument("--residual-override-penalty", type=float, default=1.0)
+    parser.add_argument("--residual-deterministic-margin", type=float, default=0.0)
+    parser.add_argument(
         "--dynamic-edge-weight-mode",
         choices=DYNAMIC_EDGE_WEIGHT_MODES,
         default="raw",
@@ -186,8 +270,8 @@ def parse_args(argv=None):
         "--run-id",
         type=_parse_run_id,
         help=(
-            "optional short output directory name; the full comparison name "
-            "remains recorded in the manifest"
+            "optional short output directory name; otherwise use the compact "
+            "stable default.  The full comparison name remains in the manifest"
         ),
     )
     parser.add_argument(
@@ -226,6 +310,33 @@ def parse_args(argv=None):
         parser.error(
             "--structured-spatiotemporal-warmup requires --adaptive-actor-warmup"
         )
+    if args.residual_action2_anchor:
+        if not 0.0 < args.residual_initial_override_prob < 1.0:
+            parser.error("--residual-initial-override-prob must lie in (0, 1)")
+        if not (
+            0.0 <= args.residual_exploration_end
+            <= args.residual_exploration_start < 1.0
+        ):
+            parser.error(
+                "residual exploration must satisfy 0 <= end <= start < 1"
+            )
+        if not 0.0 <= args.residual_override_budget <= 1.0:
+            parser.error("--residual-override-budget must lie in [0, 1]")
+        if args.residual_override_penalty < 0.0:
+            parser.error("--residual-override-penalty must be non-negative")
+    if args.entropy_floor_regularization:
+        if args.residual_action2_anchor:
+            parser.error(
+                "--entropy-floor-regularization is only defined for standard "
+                "three-action COMA, not --residual-action2-anchor"
+            )
+        max_entropy = math.log(3.0)
+        if not 0.0 <= args.entropy_floor_min <= args.entropy_floor_start <= max_entropy:
+            parser.error(
+                "entropy floor values must satisfy 0 <= min <= start <= log(3)"
+            )
+        if args.entropy_floor_penalty <= 0.0:
+            parser.error("--entropy-floor-penalty must be positive")
     if (
         args.structured_spatiotemporal_warmup
         and args.grid_num > 8
@@ -245,6 +356,10 @@ def parse_args(argv=None):
             "--epsilon-anneal-episodes must be positive and no larger than "
             "--training-episodes"
         )
+    if args.entropy_floor_anneal_updates is None:
+        args.entropy_floor_anneal_updates = args.epsilon_anneal_episodes
+    if args.entropy_floor_anneal_updates <= 0:
+        parser.error("--entropy-floor-anneal-updates must be positive")
     if args.checkpoint_interval_macro_epochs <= 0:
         parser.error("--checkpoint-interval-macro-epochs must be positive")
     if args.num_workers <= 0:
@@ -266,7 +381,10 @@ def build_experiment(args):
     sample_ratio = SCOPE_TO_RATIO[args.sample_scope]
     scope = sample_scope_name(sample_ratio)
     qtable_path = qtable_path_for_sample_ratio(
-        args.grid_num, args.decision_freq, sample_ratio=sample_ratio
+        args.grid_num,
+        args.decision_freq,
+        sample_ratio=sample_ratio,
+        checkpoint=args.qtable_checkpoint,
     )
     driver_metadata = load_driver_service_metadata()
     environment_seeds = environment_seed_sequence(
@@ -279,12 +397,22 @@ def build_experiment(args):
         or args.epsilon_anneal_after_actor_start
     )
     stage_name = (
-        "stage08" if stabilized_warmup
+        "stage09" if args.residual_action2_anchor
+        else "stage10" if args.entropy_floor_regularization
+        else "stage08" if stabilized_warmup
         else "stage07" if args.normalize_coma_advantages
         else "stage06"
     )
     algorithm_fragment = (
-        "random_coma_spatiotemporal_warmup"
+        "action2_anchored_residual_coma"
+        if args.residual_action2_anchor
+        else "random_coma_entropy_floor"
+        if args.entropy_floor_regularization
+        else "random_coma_spatiotemporal_warmup_advnorm"
+        if args.structured_spatiotemporal_warmup and args.normalize_coma_advantages
+        else "random_coma_spatiotemporal_warmup"
+        if args.structured_spatiotemporal_warmup
+        else "random_coma_critic_warmup"
         if stabilized_warmup
         else "random_coma_advnorm" if args.normalize_coma_advantages
         else "random_coma"
@@ -303,28 +431,61 @@ def build_experiment(args):
         f"to{args.actor_warmup_max_episodes if args.adaptive_actor_warmup else args.actor_warmup_episodes}_"
         f"seed{len(args.model_seeds)}"
     )
-    output_path = args.output_root / (args.run_id or comparison_name)
+    default_output_directory_name = _default_output_directory_name(
+        stage_name=stage_name,
+        grid_num=args.grid_num,
+        scope=scope,
+        decision_freq=args.decision_freq,
+        training_episodes=args.training_episodes,
+        algorithm_fragment=algorithm_fragment,
+        dynamic_edge_weight_mode=args.dynamic_edge_weight_mode,
+        model_seed_count=len(args.model_seeds),
+        qtable_checkpoint=args.qtable_checkpoint,
+    )
+    output_path = args.output_root / (args.run_id or default_output_directory_name)
     configs = []
     for replicate_id, model_seed in enumerate(args.model_seeds):
         config = stage2_task(
             args.grid_num,
             args.decision_freq,
             (
-                f"train_stage08_grid{args.grid_num}_coma_spatiotemporal_warmup"
+                f"train_stage09_grid{args.grid_num}_action2_anchored_residual_coma"
+                if args.residual_action2_anchor
+                else f"train_stage10_grid{args.grid_num}_coma_entropy_floor"
+                if args.entropy_floor_regularization
+                else f"train_stage08_grid{args.grid_num}_coma_spatiotemporal_warmup_advnorm"
+                if args.structured_spatiotemporal_warmup and args.normalize_coma_advantages
+                else f"train_stage08_grid{args.grid_num}_coma_spatiotemporal_warmup"
+                if args.structured_spatiotemporal_warmup
+                else f"train_stage08_grid{args.grid_num}_coma_critic_warmup"
                 if stabilized_warmup
                 else f"train_stage07_grid{args.grid_num}_coma_advnorm"
                 if args.normalize_coma_advantages
                 else f"train_stage06_grid{args.grid_num}_coma_warmup"
             ),
             sample_ratio=sample_ratio,
+            qtable_checkpoint=args.qtable_checkpoint,
         )
         config.update(
             {
                 "model_seed": model_seed,
                 "pair_id": replicate_id,
                 "replicate_id": replicate_id,
-                "initialization_variant": "random_init",
+                "initialization_variant": (
+                    "action2_anchored_residual"
+                    if args.residual_action2_anchor else "random_init"
+                ),
+                "output_variant": (
+                    "residual" if args.residual_action2_anchor else "random"
+                ),
                 "initial_action2_logit_bias": 0.0,
+                "residual_action2_anchor": args.residual_action2_anchor,
+                "residual_initial_override_prob": args.residual_initial_override_prob,
+                "residual_exploration_start": args.residual_exploration_start,
+                "residual_exploration_end": args.residual_exploration_end,
+                "residual_override_budget": args.residual_override_budget,
+                "residual_override_penalty": args.residual_override_penalty,
+                "residual_deterministic_margin": args.residual_deterministic_margin,
                 "normalize_states": True,
                 "state_normalizer_warmup_episodes": len(TRAIN_DATES),
                 "actor_warmup_episodes": args.actor_warmup_episodes,
@@ -349,6 +510,11 @@ def build_experiment(args):
                 "normalize_coma_advantages": (
                     args.normalize_coma_advantages
                 ),
+                "entropy_floor_regularization": args.entropy_floor_regularization,
+                "entropy_floor_start": args.entropy_floor_start,
+                "entropy_floor_min": args.entropy_floor_min,
+                "entropy_floor_anneal_updates": args.entropy_floor_anneal_updates,
+                "entropy_floor_penalty": args.entropy_floor_penalty,
                 "dynamic_edge_weight_mode": args.dynamic_edge_weight_mode,
                 "coma_advantage_normalization_epsilon": 1e-6,
                 "coma_epsilon_start": 0.5,
@@ -361,6 +527,7 @@ def build_experiment(args):
                 "training_episodes": args.training_episodes,
                 "num_macro_epochs": num_macro_epochs,
                 "comparison_name": comparison_name,
+                "qtable_checkpoint": args.qtable_checkpoint,
                 "environment_seed_base": int(environment_seeds[0]),
                 "environment_seed_last": int(environment_seeds[-1]),
                 "gpu_id": args.gpu_id,
@@ -375,6 +542,8 @@ def build_experiment(args):
     manifest = {
         "comparison_name": comparison_name,
         "run_id": args.run_id,
+        "output_directory_name": output_path.name,
+        "default_output_directory_name": default_output_directory_name,
         "grid_num": args.grid_num,
         "decision_freq": args.decision_freq,
         "sample_scope": scope,
@@ -417,6 +586,16 @@ def build_experiment(args):
             ] if args.structured_spatiotemporal_warmup else []
         ),
         "normalize_coma_advantages": args.normalize_coma_advantages,
+        "entropy_floor_regularization": (
+            {
+                "raw_policy_only": True,
+                "start": args.entropy_floor_start,
+                "minimum": args.entropy_floor_min,
+                "anneal_updates": args.entropy_floor_anneal_updates,
+                "penalty": args.entropy_floor_penalty,
+                "loss": "penalty * relu(target - mean_raw_policy_entropy)^2",
+            } if args.entropy_floor_regularization else None
+        ),
         "dynamic_edge_weight_mode": args.dynamic_edge_weight_mode,
         "coma_advantage_normalization_scope": (
             "per_agent_on_policy_rollout"
@@ -429,14 +608,32 @@ def build_experiment(args):
             "critic_explained_variance": True,
             "actor_critic_gradient_norms": True,
             "gradient_clipped_fraction": True,
+            "raw_and_behaviour_policy_entropy": True,
         },
         "coma_epsilon_anneal_episodes": args.epsilon_anneal_episodes,
         "epsilon_anneal_after_actor_start": (
             args.epsilon_anneal_after_actor_start
         ),
-        "initialization_variant": "random_init",
+        "initialization_variant": (
+            "action2_anchored_residual"
+            if args.residual_action2_anchor else "random_init"
+        ),
         "initial_action2_logit_bias": 0.0,
+        "residual_action2_anchor": args.residual_action2_anchor,
+        "residual_policy": (
+            {
+                "default_action": 2,
+                "initial_override_probability": args.residual_initial_override_prob,
+                "exploration_start": args.residual_exploration_start,
+                "exploration_end": args.residual_exploration_end,
+                "override_budget": args.residual_override_budget,
+                "override_penalty": args.residual_override_penalty,
+                "deterministic_delta_margin": args.residual_deterministic_margin,
+                "actor_advantage_baseline": "Q_i(s,u_-i,action2)",
+            } if args.residual_action2_anchor else None
+        ),
         "qtable_path": str(qtable_path),
+        "qtable_checkpoint": args.qtable_checkpoint,
         "qtable_sha256": _sha256(qtable_path),
         **driver_metadata,
         "gpu_id": args.gpu_id,
@@ -457,6 +654,11 @@ def run_task(
     road_network,
     driver_info_dict,
 ):
+    # Keep configuration-only --dry-run usable in lightweight environments
+    # where the optional TensorBoard dependency is not installed.  Actual
+    # training still imports the same trainer before the worker starts.
+    from src.env.simulator_trainer import SimulatorTrainer
+
     torch.set_num_threads(1)
     config = dict(config)
     model_seed = int(config["model_seed"])
@@ -507,7 +709,7 @@ def run_task(
             "environment_seed_sequence": environment_seeds,
             "driver_num": 1000,
             "output_path": str(
-                output_path / "random_init" / f"seed_{model_seed}"
+                output_path / config["output_variant"] / f"seed_{model_seed}"
             ),
             "flag_load": False,
             "parallel": True,
