@@ -2625,6 +2625,8 @@ normalizer修复同时针对根因和二次防线：`MADDPG`在fit/加载scaler�
 
 验证：相关五个Python文件`py_compile`和`git diff --check`通过。新增两项回归：临时25个带hash的请求工件验证五个macro顺序依次为“每macro一个seed×五日期”（`h1_date_rotation_regression_pass`）；模拟`~1e-13`近零scale且后续出现极端有效值的normalizer用例验证scale被floor、结果有限并裁剪到10（`normalizer_near_zero_scale_regression_pass`）。完整pytest在本机现有pytest环境持续无输出而被中止；其SciPy提示NumPy版本不兼容，故未把整套pytest标记为通过。以上均非服务器真实完整日或held-out结果。
 
+版本控制：2026-08-25 已将本轮源码、测试、启动脚本和文档提交为`5dd767c`（`Implement H1 COMA stabilization and scenario tooling`）并推送至`origin/main`。明确未提交/未推送`dynamic_matching/qtable_*`、`queens_local_smoke_results/`及`c35_paired_intervention_candidates.json`等数据、模型和实验结果工件；它们仍仅保留在本地未跟踪状态。
+
 下一步：上传`dynamic_matching/train_h1_shared_coma.py`、`dynamic_matching/dynamic_matching_agent/maddpd_discreate.py`和`src/env/simulator_trainer.py`（及新增两项测试），先以1 seed、至少2个macro/10个完整日的H1 smoke运行。验收应包括：前5集日期依次为05-05/06/07/08/11且sampling seed相同；日志显示第6集已有critic/actor update；normalizer floor计数/clip指标合理；全程不存在`inf`、target/Q超过门禁或RuntimeError。通过后才重新启动direct/residual的配对多seed实验；旧`h1_compact_coma_run1_gpu1`不能用于选择任何臂或checkpoint。
 
 ## 12. 跨会话维护约定
